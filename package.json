@@ -6,6 +6,7 @@
   "scripts": {
     "start": "node server.js",
     "dev": "node --watch server.js",
+    "build": "npm --prefix frontend ci && npm --prefix frontend run build",
     "test": "echo \"No tests configured\""
   },
   "keywords": [],
