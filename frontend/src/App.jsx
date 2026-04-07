@@ -28,46 +28,6 @@ function getTypeFromUrl(url = "") {
   return "image";
 }
 
-function extractGalleryImages(post) {
-  const galleryItems = post?.gallery_data?.items;
-  const metadata = post?.media_metadata;
-  if (!Array.isArray(galleryItems) || !metadata) return [];
-
-  const images = [];
-  for (const item of galleryItems) {
-    const media = metadata[item.media_id];
-    const candidate = media?.s?.u || media?.s?.gif || "";
-    if (!candidate) continue;
-    images.push(candidate.replace(/&amp;/g, "&"));
-  }
-  return images;
-}
-
-function buildMediaPost(post) {
-  const url = post?.url_overridden_by_dest || post?.url || "";
-  const lowerUrl = String(url).toLowerCase();
-  const domain = String(post?.domain || "").toLowerCase();
-  const galleryImages = extractGalleryImages(post);
-
-  if (galleryImages.length) {
-    return { id: post.id, title: post.title, subreddit: post.subreddit, url: galleryImages[0], images: galleryImages, type: "image", isNsfw: Boolean(post.over_18) };
-  }
-  if (lowerUrl.includes("redgifs.com/watch/") || domain.includes("redgifs.com")) {
-    return { id: post.id, title: post.title, subreddit: post.subreddit, url, type: "redgifs", isNsfw: Boolean(post.over_18) };
-  }
-  if (lowerUrl.includes("v.redd.it")) {
-    return { id: post.id, title: post.title, subreddit: post.subreddit, url, type: "video", isNsfw: Boolean(post.over_18) };
-  }
-  if (lowerUrl.includes("i.redd.it") || lowerUrl.match(/\.(jpg|jpeg|png|gif|webp)(\?.*)?$/)) {
-    return { id: post.id, title: post.title, subreddit: post.subreddit, url, type: "image", images: [url], isNsfw: Boolean(post.over_18) };
-  }
-  if (domain.includes("imgur.com")) {
-    const isVideo = lowerUrl.match(/\.(mp4|webm)(\?.*)?$/);
-    return { id: post.id, title: post.title, subreddit: post.subreddit, url, type: isVideo ? "video" : "image", images: isVideo ? undefined : [url], isNsfw: Boolean(post.over_18) };
-  }
-  return null;
-}
-
 async function fetchPostsApi({ subs, includeNsfw, afterToken = "", signal } = {}) {
   const cacheKey = `${subs}::${includeNsfw ? "1" : "0"}::${afterToken || ""}`;
   const cached = postsCache.get(cacheKey);
@@ -78,29 +38,35 @@ async function fetchPostsApi({ subs, includeNsfw, afterToken = "", signal } = {}
     nsfw: includeNsfw ? "true" : "false",
   });
   if (afterToken) params.set("after", afterToken);
-  let rawText = "";
-  let payload = {};
-  
-  try {
-    const response = await fetch(`https://api.reddit.com/r/${subs}.json?raw_json=1&limit=50${afterToken ? `&after=${afterToken}` : ''}`, { signal });
-    rawText = await response.text();
-    payload = rawText ? JSON.parse(rawText) : {};
-    
-    if (!response.ok) {
-      throw new Error(`Reddit error (${response.status})`);
+  const response = await fetch(`${API_BASE}/api/posts?${params.toString()}`, { signal });
+  const rawText = await response.text();
+  const payload = (() => {
+    try {
+      return rawText ? JSON.parse(rawText) : {};
+    } catch {
+      return {};
     }
-  } catch (err) {
-    if (err.name === "AbortError") throw err;
-    throw new Error("Failed to fetch from Reddit. It might be blocking your browser. Try running locally!");
+  })();
+  if (!response.ok) {
+    let detail = "";
+    if (payload.details) {
+      if (typeof payload.details === "string") detail = payload.details;
+      else {
+        try {
+          detail = JSON.stringify(payload.details);
+        } catch {
+          detail = String(payload.details);
+        }
+      }
+    }
+    const base = payload.error || payload.message || `Request failed (${response.status})`;
+    const fallback = !detail && rawText && rawText.length < 300 ? ` (${rawText})` : "";
+    throw new Error(base + (detail ? ` (${detail})` : "") + fallback);
   }
-
-  const rawPosts = payload?.data?.children?.map((c) => c.data) || [];
-  let posts = rawPosts
-    .filter((post) => (includeNsfw ? true : !post.over_18))
-    .map(buildMediaPost)
-    .filter(Boolean);
-
-  payload.after = payload?.data?.after || null;
+  const posts = (payload.posts || []).map((post) => ({
+    ...post,
+    type: post.type || getTypeFromUrl(post.url),
+  }));
   const data = { posts, after: payload.after || null };
   postsCache.set(cacheKey, { ts: Date.now(), data });
   return data;
