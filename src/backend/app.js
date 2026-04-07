@@ -6,7 +6,9 @@ const REDDIT_API_BASE = "https://www.reddit.com";
 const REDGIFS_AUTH_URL = "https://api.redgifs.com/v2/auth/temporary";
 const REDGIFS_GIF_URL_BASE = "https://api.redgifs.com/v2/gifs";
 const REDGIFS_TOKEN_KEY = "redgifs_token";
-
+const REDDIT_OAUTH_TOKEN_KEY = "reddit_oauth_token";
+const REDDIT_OAUTH_URL = "https://www.reddit.com/api/v1/access_token";
+const REDDIT_OAUTH_API_BASE = "https://oauth.reddit.com";
 function parseSubreddits(subs = "") {
   return String(subs)
     .split(",")
@@ -128,10 +130,46 @@ function createApp() {
     stdTTL: Number(process.env.REDGIFS_TOKEN_CACHE_TTL_SECONDS || 3600),
     useClones: false,
   });
+  const authCache = new NodeCache({
+    stdTTL: 3500,
+    useClones: false,
+  });
 
   const redditInflight = new Map(); // cacheKey -> Promise
   const REDDIT_FRESH_TTL_MS = Number(process.env.REDDIT_FRESH_TTL_MS || 3 * 60 * 1000);
   const REDDIT_STALE_OK_MS = Number(process.env.REDDIT_STALE_OK_MS || 10 * 60 * 1000);
+
+  async function getRedditAccessToken(forceRefresh = false) {
+    const clientId = process.env.REDDIT_CLIENT_ID;
+    const clientSecret = process.env.REDDIT_CLIENT_SECRET;
+    if (!clientId || !clientSecret) return null;
+
+    if (!forceRefresh) {
+      const cached = authCache.get(REDDIT_OAUTH_TOKEN_KEY);
+      if (cached) return cached;
+    }
+
+    const authString = Buffer.from(`${clientId}:${clientSecret}`).toString("base64");
+    const response = await axios.post(
+      REDDIT_OAUTH_URL,
+      "grant_type=client_credentials",
+      {
+        headers: {
+          Authorization: `Basic ${authString}`,
+          "Content-Type": "application/x-www-form-urlencoded",
+          "User-Agent": "web:reddit-slideshow-app:v1.0.0 (by /u/Parag1337)",
+        },
+        timeout: 10000,
+      }
+    );
+
+    const token = response.data?.access_token;
+    if (token) {
+      const expiresIn = response.data?.expires_in || 3600;
+      authCache.set(REDDIT_OAUTH_TOKEN_KEY, token, Math.max(60, expiresIn - 60));
+    }
+    return token;
+  }
 
   async function fetchRedditPosts({ subs, after }) {
     const subredditPath = subs.join("+");
@@ -146,14 +184,30 @@ function createApp() {
 
     const promise = (async () => {
       try {
-        const response = await axios.get(`${REDDIT_API_BASE}/r/${subredditPath}.json`, {
+        let token = await getRedditAccessToken(false);
+        let baseUrl = token ? REDDIT_OAUTH_API_BASE : REDDIT_API_BASE;
+
+        const makeRequest = (t, base) => axios.get(`${base}/r/${subredditPath}.json`, {
           params: after ? { after, raw_json: 1 } : { raw_json: 1 },
           timeout: 10000,
           headers: {
             "User-Agent": "web:reddit-slideshow-app:v1.0.0 (by /u/Parag1337)",
             Accept: "application/json",
+            ...(t ? { Authorization: `Bearer ${t}` } : {}),
           },
         });
+
+        let response;
+        try {
+          response = await makeRequest(token, baseUrl);
+        } catch (initialErr) {
+          if (initialErr?.response?.status === 401 && token) {
+            token = await getRedditAccessToken(true);
+            response = await makeRequest(token, baseUrl);
+          } else {
+            throw initialErr;
+          }
+        }
 
         const payload = {
           posts: response.data?.data?.children?.map((c) => c.data) || [],
