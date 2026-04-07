@@ -150,7 +150,7 @@ function createApp() {
           params: after ? { after, raw_json: 1 } : { raw_json: 1 },
           timeout: 10000,
           headers: {
-            "User-Agent": "reddslide/1.0",
+            "User-Agent": "web:reddit-slideshow-app:v1.0.0 (by /u/Parag1337)",
             Accept: "application/json",
           },
         });
