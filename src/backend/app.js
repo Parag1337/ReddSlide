@@ -69,12 +69,22 @@ function buildMediaPost(post) {
     };
   }
 
-  if (lowerUrl.includes("v.redd.it")) {
+  if (lowerUrl.includes("v.redd.it") || post.is_video) {
+    // Reddit natively hosts this video.
+    // The raw url causes browser redirects and slow HLS decoding latency.
+    // Instead, extract the direct mp4 fallback url format:
+    let directVideoUrl = url;
+    if (post?.secure_media?.reddit_video?.fallback_url) {
+      directVideoUrl = post.secure_media.reddit_video.fallback_url.split("?")[0];
+    } else if (post?.media?.reddit_video?.fallback_url) {
+      directVideoUrl = post.media.reddit_video.fallback_url.split("?")[0];
+    }
+
     return {
       id: post.id,
       title: post.title,
       subreddit: post.subreddit,
-      url,
+      url: directVideoUrl,
       type: "video",
       isNsfw: Boolean(post.over_18),
       content,
