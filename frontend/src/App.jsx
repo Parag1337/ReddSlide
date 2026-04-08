@@ -413,8 +413,9 @@ function ViewerPage() {
   ]);
 
   useEffect(() => {
+    // Eagerly load more posts when we get within 15 posts of the end of the buffer
     const shouldLoadMore =
-      visiblePosts.length > 0 && index >= visiblePosts.length - 3 && after && !loading;
+      visiblePosts.length > 0 && index >= visiblePosts.length - 15 && after && !loading;
     if (shouldLoadMore) fetchPosts({ append: true, afterToken: after });
   }, [index, visiblePosts.length, after, loading, fetchPosts]);
 

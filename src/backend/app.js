@@ -440,33 +440,38 @@ function createApp() {
       const MAX_RESULTS = Number(process.env.REDDIT_SEARCH_MAX_RESULTS || 2000);
       const PER_SUB_PAGES = Number(process.env.REDDIT_SEARCH_PER_SUB_PAGES || 80);
 
-      // Query strategy: RedditPX-like per-subreddit search IN PARALLEL (relevance + all time),
-      // then local strict contains check and merge newest-first.
+      // Query strategy: Search exactly 1 page per subreddit simultaneously,
+      // and encode their individual pagination cursors into a single base64 'after' token.
       if (qLower) {
+        let afterMap = {};
+        if (after) {
+          try {
+            afterMap = JSON.parse(Buffer.from(after, 'base64').toString('utf-8'));
+          } catch (e) {
+            afterMap = {}; // ignore and start fresh if invalid
+          }
+        }
+
+        const nextAfterMap = {};
         const searchOneSub = async (sub) => {
+          let subAfter = afterMap[sub] || "";
+          
+          const subData = await fetchSubredditSearchPosts({ sub, q: qLower, after: subAfter });
+          nextAfterMap[sub] = subData.after || "";
+          
+          const candidates = subData.posts.filter((post) => (includeNsfw ? true : !post.over_18));
+          const searched = candidates.filter((post) => postMatchesQuery(post, qLower));
+          
           const subResults = [];
-          let subAfter = "";
-          let subPages = 0;
-          while (subPages < PER_SUB_PAGES && subResults.length < MAX_RESULTS) {
-            const subData = await fetchSubredditSearchPosts({ sub, q: qLower, after: subAfter });
-            const candidates = subData.posts.filter((post) => (includeNsfw ? true : !post.over_18));
-            const searched = candidates.filter((post) => postMatchesQuery(post, qLower));
-            for (const post of searched) {
-              const media = buildMediaPost(post);
-              if (media) subResults.push(media);
-              if (subResults.length >= MAX_RESULTS) break;
-            }
-            subAfter = subData.after || "";
-            subPages += 1;
-            if (!subAfter) break;
+          for (const post of searched) {
+            const media = buildMediaPost(post);
+            if (media) subResults.push(media);
           }
           return subResults;
         };
 
-        // Fan out all subreddit searches in parallel
         const allResults = await Promise.all(subs.map(searchOneSub));
 
-        // Merge, deduplicate, sort newest first
         const seen = new Set();
         const merged = [];
         for (const batch of allResults) {
@@ -477,14 +482,21 @@ function createApp() {
             }
           }
         }
+        
         const strictMerged = merged.filter((p) => postMatchesQuery(
           { title: p.title, selftext: p.content || "" },
           qLower
         ));
         strictMerged.sort((a, b) => (b.createdUtc || 0) - (a.createdUtc || 0));
+        
+        let returnedAfter = null;
+        if (Object.values(nextAfterMap).some(Boolean)) {
+          returnedAfter = Buffer.from(JSON.stringify(nextAfterMap)).toString('base64');
+        }
+
         return res.json({
           posts: strictMerged.slice(0, MAX_RESULTS),
-          after: null,
+          after: returnedAfter,
         });
       }
 
