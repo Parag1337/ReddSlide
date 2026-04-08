@@ -459,7 +459,6 @@ function ViewerPage() {
     setAfter(null);
     setShowSearch(false);
     setLoading(true);
-    setPosts([]); // Instantly clear old posts from the screen
 
     try {
       if (inflight.current) inflight.current.abort();
