@@ -342,7 +342,7 @@ function createApp() {
           params: {
             q,
             restrict_sr: "1",
-            sort: "new",
+            sort: "relevance",
             t: "all",
             limit: 100,
             raw_json: 1,
@@ -436,19 +436,18 @@ function createApp() {
     try {
       const qLower = q ? q.toLowerCase() : "";
       const MAX_RESULTS = Number(process.env.REDDIT_SEARCH_MAX_RESULTS || 2000);
-      const PER_SUB_PAGES = Number(process.env.REDDIT_SEARCH_PER_SUB_PAGES || 5); // Reduced from 80 to avoid rate limits
+      const PER_SUB_PAGES = Number(process.env.REDDIT_SEARCH_PER_SUB_PAGES || 80);
 
-      // Query strategy: scan each subreddit feed IN PARALLEL using Reddit's search API
+      // Query strategy: RedditPX-like per-subreddit search IN PARALLEL (relevance + all time),
+      // then local strict contains check and merge newest-first.
       if (qLower) {
         const searchOneSub = async (sub) => {
           const subResults = [];
           let subAfter = "";
           let subPages = 0;
           while (subPages < PER_SUB_PAGES && subResults.length < MAX_RESULTS) {
-            // Use actual reddit search to be 100x faster and not get rate-limited aggressively
             const subData = await fetchSubredditSearchPosts({ sub, q: qLower, after: subAfter });
             const candidates = subData.posts.filter((post) => (includeNsfw ? true : !post.over_18));
-            // Apply our custom substring logic just to be safe
             const searched = candidates.filter((post) => postMatchesQuery(post, qLower));
             for (const post of searched) {
               const media = buildMediaPost(post);
