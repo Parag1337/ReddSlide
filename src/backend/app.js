@@ -40,6 +40,7 @@ function buildMediaPost(post) {
   const lowerUrl = String(url).toLowerCase();
   const domain = String(post?.domain || "").toLowerCase();
   const galleryImages = extractGalleryImages(post);
+  const content = typeof post?.selftext === "string" ? post.selftext : "";
 
   if (galleryImages.length) {
     return {
@@ -50,6 +51,8 @@ function buildMediaPost(post) {
       images: galleryImages,
       type: "image",
       isNsfw: Boolean(post.over_18),
+      content,
+      createdUtc: Number(post?.created_utc || 0),
     };
   }
 
@@ -61,6 +64,8 @@ function buildMediaPost(post) {
       url,
       type: "redgifs",
       isNsfw: Boolean(post.over_18),
+      content,
+      createdUtc: Number(post?.created_utc || 0),
     };
   }
 
@@ -72,6 +77,8 @@ function buildMediaPost(post) {
       url,
       type: "video",
       isNsfw: Boolean(post.over_18),
+      content,
+      createdUtc: Number(post?.created_utc || 0),
     };
   }
 
@@ -84,6 +91,8 @@ function buildMediaPost(post) {
       type: "image",
       images: [url],
       isNsfw: Boolean(post.over_18),
+      content,
+      createdUtc: Number(post?.created_utc || 0),
     };
   }
 
@@ -97,10 +106,36 @@ function buildMediaPost(post) {
       type: isVideo ? "video" : "image",
       images: isVideo ? undefined : [url],
       isNsfw: Boolean(post.over_18),
+      content,
+      createdUtc: Number(post?.created_utc || 0),
     };
   }
 
   return null;
+}
+
+function postMatchesQuery(post, qLower) {
+  if (!qLower) return true;
+
+  const normalize = (s) =>
+    String(s || "")
+      .toLowerCase()
+      .normalize("NFKD")
+      .replace(/[\u0300-\u036f]/g, "");
+
+  const title = normalize(post?.title);
+  const content = normalize(post?.selftext);
+  const haystack = `${title} ${content}`.trim();
+  if (!haystack) return false;
+
+  // First, exact phrase check.
+  const phrase = normalize(qLower).trim();
+  if (phrase && haystack.includes(phrase)) return true;
+
+  // Then, token-based check (all tokens must appear somewhere).
+  const tokens = phrase.split(/\s+/).filter(Boolean);
+  if (!tokens.length) return true;
+  return tokens.every((t) => haystack.includes(t));
 }
 
 function extractRedgifsId(input = "") {
@@ -187,7 +222,7 @@ function createApp() {
         let token = await getRedditAccessToken(false);
         let baseUrl = token ? REDDIT_OAUTH_API_BASE : REDDIT_API_BASE;
 
-        const makeRequest = (t, base) => axios.get(`${base}/r/${subredditPath}.json`, {
+        const makeRequest = (t, base) => axios.get(`${base}/r/${subredditPath}/new.json`, {
           params: after ? { after, raw_json: 1 } : { raw_json: 1 },
           timeout: 10000,
           headers: {
@@ -235,6 +270,127 @@ function createApp() {
     return promise;
   }
 
+  async function fetchRedditSearchPage({ subs, q, after }) {
+    const subredditPath = subs.join("+");
+    const cacheKey = `reddit-search:${subredditPath}:${q}:${after || ""}`;
+    const cached = redditCache.get(cacheKey);
+    if (cached && typeof cached.fetchedAt === "number") {
+      if (Date.now() - cached.fetchedAt <= REDDIT_FRESH_TTL_MS) return cached;
+    }
+
+    const inflight = redditInflight.get(cacheKey);
+    if (inflight) return inflight;
+
+    const promise = (async () => {
+      try {
+        const response = await axios.get(`${REDDIT_API_BASE}/r/${subredditPath}/search.json`, {
+          params: {
+            q,
+            restrict_sr: "1",
+            sort: "relevance",
+            t: "all",
+            limit: 100,
+            raw_json: 1,
+            ...(after ? { after } : {}),
+          },
+          timeout: 10000,
+          headers: {
+            "User-Agent": "reddslide/1.0",
+            Accept: "application/json",
+          },
+        });
+
+        const payload = {
+          posts: response.data?.data?.children?.map((c) => c.data) || [],
+          after: response.data?.data?.after || null,
+          fetchedAt: Date.now(),
+        };
+        redditCache.set(cacheKey, payload);
+        return payload;
+      } catch (err) {
+        const status = err?.response?.status;
+        if (status === 429) {
+          const stale = redditCache.get(cacheKey);
+          if (stale && typeof stale.fetchedAt === "number") return stale;
+        }
+        throw err;
+      } finally {
+        redditInflight.delete(cacheKey);
+      }
+    })();
+
+    redditInflight.set(cacheKey, promise);
+    return promise;
+  }
+
+  async function fetchSubredditSearchPosts({ sub, q, after }) {
+    const cacheKey = `reddit-sub-search:${sub}:${q}:${after || ""}`;
+    const cached = redditCache.get(cacheKey);
+    if (cached && typeof cached.fetchedAt === "number") {
+      if (Date.now() - cached.fetchedAt <= REDDIT_FRESH_TTL_MS) return cached;
+    }
+
+    const inflight = redditInflight.get(cacheKey);
+    if (inflight) return inflight;
+
+    const promise = (async () => {
+      try {
+        let token = await getRedditAccessToken(false);
+        let baseUrl = token ? REDDIT_OAUTH_API_BASE : REDDIT_API_BASE;
+
+        const makeRequest = (t, base) => axios.get(`${base}/r/${sub}/search.json`, {
+          params: {
+            q,
+            restrict_sr: "1",
+            sort: "new",
+            t: "all",
+            limit: 100,
+            raw_json: 1,
+            ...(after ? { after } : {}),
+          },
+          timeout: 15000,
+          headers: {
+            "User-Agent": "web:reddit-slideshow-app:v1.0.0 (by /u/Parag1337)",
+            Accept: "application/json",
+            ...(t ? { Authorization: `Bearer ${t}` } : {}),
+          },
+        });
+
+        let response;
+        try {
+          response = await makeRequest(token, baseUrl);
+        } catch (initialErr) {
+          if (initialErr?.response?.status === 401 && token) {
+            token = await getRedditAccessToken(true);
+            response = await makeRequest(token, baseUrl);
+          } else {
+            throw initialErr;
+          }
+        }
+
+        const payload = {
+          posts: response.data?.data?.children?.map((c) => c.data) || [],
+          after: response.data?.data?.after || null,
+          fetchedAt: Date.now(),
+        };
+        redditCache.set(cacheKey, payload);
+        return payload;
+      } catch (err) {
+        const status = err?.response?.status;
+        if (status === 429) {
+          const stale = redditCache.get(cacheKey);
+          if (stale && typeof stale.fetchedAt === "number") return stale;
+        }
+        throw err;
+      } finally {
+        redditInflight.delete(cacheKey);
+      }
+    })();
+
+    redditInflight.set(cacheKey, promise);
+    return promise;
+  }
+
   async function getRedgifsToken(forceRefresh = false) {
     if (!forceRefresh) {
       const cached = redgifsCache.get(REDGIFS_TOKEN_KEY);
@@ -269,6 +425,7 @@ function createApp() {
     const subs = parseSubreddits(req.query.subs);
     const includeNsfw = isTrue(req.query.nsfw);
     const after = req.query.after ? String(req.query.after) : "";
+    const q = req.query.q ? String(req.query.q).trim() : "";
 
     if (!subs.length) {
       return res.status(400).json({
@@ -277,15 +434,66 @@ function createApp() {
     }
 
     try {
-      const redditData = await fetchRedditPosts({ subs, after });
-      const filtered = redditData.posts
-        .filter((post) => (includeNsfw ? true : !post.over_18))
-        .map(buildMediaPost)
-        .filter(Boolean);
+      const qLower = q ? q.toLowerCase() : "";
+      const MAX_RESULTS = Number(process.env.REDDIT_SEARCH_MAX_RESULTS || 2000);
+      const PER_SUB_PAGES = Number(process.env.REDDIT_SEARCH_PER_SUB_PAGES || 5); // Reduced from 80 to avoid rate limits
 
+      // Query strategy: scan each subreddit feed IN PARALLEL using Reddit's search API
+      if (qLower) {
+        const searchOneSub = async (sub) => {
+          const subResults = [];
+          let subAfter = "";
+          let subPages = 0;
+          while (subPages < PER_SUB_PAGES && subResults.length < MAX_RESULTS) {
+            // Use actual reddit search to be 100x faster and not get rate-limited aggressively
+            const subData = await fetchSubredditSearchPosts({ sub, q: qLower, after: subAfter });
+            const candidates = subData.posts.filter((post) => (includeNsfw ? true : !post.over_18));
+            // Apply our custom substring logic just to be safe
+            const searched = candidates.filter((post) => postMatchesQuery(post, qLower));
+            for (const post of searched) {
+              const media = buildMediaPost(post);
+              if (media) subResults.push(media);
+              if (subResults.length >= MAX_RESULTS) break;
+            }
+            subAfter = subData.after || "";
+            subPages += 1;
+            if (!subAfter) break;
+          }
+          return subResults;
+        };
+
+        // Fan out all subreddit searches in parallel
+        const allResults = await Promise.all(subs.map(searchOneSub));
+
+        // Merge, deduplicate, sort newest first
+        const seen = new Set();
+        const merged = [];
+        for (const batch of allResults) {
+          for (const post of batch) {
+            if (!seen.has(post.id)) {
+              seen.add(post.id);
+              merged.push(post);
+            }
+          }
+        }
+        const strictMerged = merged.filter((p) => postMatchesQuery(
+          { title: p.title, selftext: p.content || "" },
+          qLower
+        ));
+        strictMerged.sort((a, b) => (b.createdUtc || 0) - (a.createdUtc || 0));
+        return res.json({
+          posts: strictMerged.slice(0, MAX_RESULTS),
+          after: null,
+        });
+      }
+
+      // Non-search strategy: regular multi-subreddit listing page.
+      const redditData = await fetchRedditPosts({ subs, after });
+      const candidates = redditData.posts.filter((post) => (includeNsfw ? true : !post.over_18));
+      const results = candidates.map(buildMediaPost).filter(Boolean);
       return res.json({
-        posts: filtered,
-        after: redditData.after,
+        posts: results,
+        after: redditData.after || null,
       });
     } catch (error) {
       let status = error?.response?.status || 500;

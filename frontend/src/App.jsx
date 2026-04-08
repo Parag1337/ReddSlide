@@ -9,7 +9,6 @@ import {
   Search,
   Maximize,
 } from "lucide-react";
-import { searchPosts } from "./utils/searchPosts";
 
 const DEFAULT_AUTOPLAY_MS = 5000;
 const API_BASE = import.meta.env.VITE_API_BASE || "";
@@ -28,8 +27,8 @@ function getTypeFromUrl(url = "") {
   return "image";
 }
 
-async function fetchPostsApi({ subs, includeNsfw, afterToken = "", signal } = {}) {
-  const cacheKey = `${subs}::${includeNsfw ? "1" : "0"}::${afterToken || ""}`;
+async function fetchPostsApi({ subs, includeNsfw, afterToken = "", q = "", signal } = {}) {
+  const cacheKey = `${subs}::${includeNsfw ? "1" : "0"}::${afterToken || ""}::${q || ""}`;
   const cached = postsCache.get(cacheKey);
   if (cached && Date.now() - cached.ts < POSTS_CACHE_TTL_MS) return cached.data;
 
@@ -38,6 +37,7 @@ async function fetchPostsApi({ subs, includeNsfw, afterToken = "", signal } = {}
     nsfw: includeNsfw ? "true" : "false",
   });
   if (afterToken) params.set("after", afterToken);
+  if (q) params.set("q", q);
   const response = await fetch(`${API_BASE}/api/posts?${params.toString()}`, { signal });
   const rawText = await response.text();
   const payload = (() => {
@@ -75,6 +75,7 @@ async function fetchPostsApi({ subs, includeNsfw, afterToken = "", signal } = {}
 function HomePage() {
   const navigate = useNavigate();
   const [subs, setSubs] = useState(localStorage.getItem(LAST_SUBS_KEY) || "pics,wallpapers,memes");
+  const [search, setSearch] = useState("");
   const includeNsfw = true;
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
@@ -87,6 +88,7 @@ function HomePage() {
       .map((item) => item.trim())
       .filter(Boolean)
       .join(",");
+    const q = search.trim();
     if (!sanitized) {
       setError("Enter at least one subreddit name.");
       return;
@@ -102,12 +104,14 @@ function HomePage() {
       const initialData = await fetchPostsApi({
         subs: sanitized,
         includeNsfw,
+        q,
         signal: inflight.current.signal,
       });
       if (!initialData.posts.length) {
-        throw new Error("No media found for the selected subreddit(s).");
+        throw new Error(q ? "No matching posts found." : "No media found for the selected subreddit(s).");
       }
       const params = new URLSearchParams({ subs: sanitized, nsfw: "true" });
+      if (q) params.set("q", q);
       navigate(`/viewer?${params.toString()}`, { state: { initialData } });
     } catch (err) {
       if (err?.name === "AbortError") return;
@@ -137,6 +141,15 @@ function HomePage() {
           autoComplete="off"
         />
 
+        <label htmlFor="home-search-input">Search (optional)</label>
+        <input
+          id="home-search-input"
+          value={search}
+          onChange={(event) => setSearch(event.target.value)}
+          placeholder="e.g. car, beach, sunset"
+          autoComplete="off"
+        />
+
         {error ? <div className="form-error">{error}</div> : null}
 
         <button type="submit" className="start-btn" disabled={loading}>
@@ -153,8 +166,9 @@ function ViewerPage() {
   const query = new URLSearchParams(location.search);
   const subs = query.get("subs") || "";
   const includeNsfw = query.get("nsfw") !== "false";
+  const initialQuery = query.get("q") || "";
 
-  const [allPosts, setAllPosts] = useState(location.state?.initialData?.posts || []);
+  const [posts, setPosts] = useState(location.state?.initialData?.posts || []);
   const [index, setIndex] = useState(0);
   const [after, setAfter] = useState(location.state?.initialData?.after || null);
   const [loading, setLoading] = useState(false);
@@ -166,14 +180,15 @@ function ViewerPage() {
   const [autoplayEnabled, setAutoplayEnabled] = useState(true);
   const [autoplayMs, setAutoplayMs] = useState(DEFAULT_AUTOPLAY_MS);
   const [showSearch, setShowSearch] = useState(false);
-  const [searchValue, setSearchValue] = useState("");
+  const [searchValue, setSearchValue] = useState(initialQuery);
   const [searchError, setSearchError] = useState("");
+  const [activeQuery, setActiveQuery] = useState(initialQuery);
   const touchStartX = useRef(null);
   const inflight = useRef(null);
+  const activeQueryRef = useRef(initialQuery);
 
-  const filteredPosts = useMemo(() => searchPosts(allPosts, searchValue), [allPosts, searchValue]);
-  const hasPosts = filteredPosts.length > 0;
-  const currentPost = hasPosts ? filteredPosts[index] : null;
+  const hasPosts = posts.length > 0;
+  const currentPost = hasPosts ? posts[index] : null;
   const isPaused = Date.now() < pausedUntil;
   const currentImageIndex = currentPost ? imageIndexByPost[currentPost.id] || 0 : 0;
   const totalImages = currentPost?.images?.length || 1;
@@ -183,11 +198,12 @@ function ViewerPage() {
   }, []);
 
   const fetchPosts = useCallback(
-    async ({ append = false, afterToken = "" } = {}) => {
+    async ({ append = false, afterToken = "", q } = {}) => {
       if (loading || !subs) return;
       setLoading(true);
       setError("");
       try {
+        const effectiveQ = typeof q === "string" ? q : activeQueryRef.current;
         if (!append) {
           if (inflight.current) inflight.current.abort();
           inflight.current = new AbortController();
@@ -196,21 +212,24 @@ function ViewerPage() {
           subs,
           includeNsfw,
           afterToken,
+          q: effectiveQ,
           signal: inflight.current?.signal,
         });
-        setAllPosts((prev) => (append ? [...prev, ...data.posts] : data.posts));
+        setPosts((prev) => (append ? [...prev, ...data.posts] : data.posts));
         setAfter(data.after);
-        if (!append && !data.posts.length) {
+        if (!append && !data.posts.length && !effectiveQ) {
           setError("No media found for the selected subreddit(s).");
         }
+        return data;
       } catch (err) {
         if (err?.name === "AbortError") return;
         setError(err.message || "Failed to load posts");
+        throw err;
       } finally {
         setLoading(false);
       }
     },
-    [loading, subs, includeNsfw]
+    [loading, subs, includeNsfw, activeQuery]
   );
 
   useEffect(() => {
@@ -218,10 +237,10 @@ function ViewerPage() {
   }, [subs, navigate]);
 
   useEffect(() => {
-    if (!allPosts.length && subs) {
+    if (!posts.length && subs) {
       fetchPosts();
     }
-  }, [allPosts.length, subs, fetchPosts]);
+  }, [posts.length, subs, fetchPosts]);
 
   const resolveRedgifs = useCallback(
     async (post) => {
@@ -252,14 +271,14 @@ function ViewerPage() {
 
   const setPostAndResetImage = useCallback(
     (nextIndex) => {
-      const bounded = Math.max(0, Math.min(nextIndex, filteredPosts.length - 1));
-      const nextPost = filteredPosts[bounded];
+      const bounded = Math.max(0, Math.min(nextIndex, posts.length - 1));
+      const nextPost = posts[bounded];
       setIndex(bounded);
       if (nextPost?.id) {
         setImageIndexByPost((prev) => ({ ...prev, [nextPost.id]: 0 }));
       }
     },
-    [filteredPosts]
+    [posts]
   );
 
   const goNext = useCallback(() => {
@@ -304,7 +323,7 @@ function ViewerPage() {
   );
 
   const visiblePostIndices = useMemo(() => {
-    const total = filteredPosts.length;
+    const total = posts.length;
     if (total <= 1) return [];
 
     const MAX_VISIBLE = 15; // keep row short
@@ -331,7 +350,7 @@ function ViewerPage() {
       pushIndex(total - 1);
     }
     return out;
-  }, [filteredPosts.length, index]);
+  }, [posts.length, index]);
 
   useEffect(() => {
     if (!currentPost || currentPost.type !== "redgifs") return;
@@ -362,9 +381,9 @@ function ViewerPage() {
 
   useEffect(() => {
     const shouldLoadMore =
-      filteredPosts.length > 0 && index >= filteredPosts.length - 3 && after && !loading;
+      posts.length > 0 && index >= posts.length - 3 && after && !loading;
     if (shouldLoadMore) fetchPosts({ append: true, afterToken: after });
-  }, [index, filteredPosts.length, after, loading, fetchPosts]);
+  }, [index, posts.length, after, loading, fetchPosts]);
 
   useEffect(() => {
     const onKeyDown = (event) => {
@@ -393,7 +412,7 @@ function ViewerPage() {
   }, [goNext, goPrev, cycleCurrentPostImage, prevCurrentPostImage]);
 
   useEffect(() => {
-    const nextPost = filteredPosts[index + 1];
+    const nextPost = posts[index + 1];
     if (!nextPost) return;
     const nextUrl = nextPost.type === "redgifs"
       ? resolvedRedgifs[nextPost.id]
@@ -407,7 +426,7 @@ function ViewerPage() {
       video.preload = "metadata";
       video.src = nextUrl;
     }
-  }, [index, filteredPosts, resolvedRedgifs]);
+  }, [index, posts, resolvedRedgifs]);
 
   const onTouchStart = (event) => {
     touchStartX.current = event.changedTouches[0]?.clientX ?? null;
@@ -431,16 +450,46 @@ function ViewerPage() {
   const submitSearch = async (event) => {
     event.preventDefault();
     const q = typeof searchValue === "string" ? searchValue.trim() : "";
-    if (!q) {
-      setSearchError("");
-      setIndex(0);
-      setShowSearch(false);
-      return;
-    }
-    const results = searchPosts(allPosts, q);
-    setSearchError(results.length ? "" : "No matching posts in current slideshow.");
+    activeQueryRef.current = q;
+    setActiveQuery(q);
+    setSearchError("");
+    setError("");
     setIndex(0);
+    setImageIndexByPost({});
+    setAfter(null);
     setShowSearch(false);
+    setLoading(true);
+    setPosts([]); // Instantly clear old posts from the screen
+
+    try {
+      if (inflight.current) inflight.current.abort();
+      inflight.current = new AbortController();
+
+      const params = new URLSearchParams({ subs, nsfw: String(includeNsfw) });
+      if (q) params.set("q", q);
+      navigate(`/viewer?${params.toString()}`, { replace: true });
+
+      // Single call — backend searches all subs in parallel and returns merged results
+      const data = await fetchPostsApi({
+        subs,
+        includeNsfw,
+        afterToken: "",
+        q: activeQueryRef.current,
+        signal: inflight.current.signal,
+      });
+
+      setPosts(data.posts);
+      setAfter(data.after);
+
+      if (q && !data.posts.length) {
+        setSearchError("No matching posts found.");
+      }
+    } catch (err) {
+      if (err?.name === "AbortError") return;
+      setSearchError(err?.message || "Failed to search.");
+    } finally {
+      setLoading(false);
+    }
   };
 
   return (
@@ -503,7 +552,7 @@ function ViewerPage() {
           </div>
           <div className="bottom-bar">
             <div className="meta">
-              <span>{hasPosts ? index + 1 : 0} / {filteredPosts.length}</span>
+              <span>{hasPosts ? index + 1 : 0} / {posts.length}</span>
               {currentPost ? <span>r/{currentPost.subreddit}</span> : null}
             </div>
             <div className="bottom-controls">
@@ -550,7 +599,7 @@ function ViewerPage() {
               </form>
             ) : null}
             {searchError ? <div className="search-error">{searchError}</div> : null}
-            {filteredPosts.length > 1 ? (
+            {posts.length > 1 ? (
               <div className="post-strip" aria-label="Posts in slideshow">
                 {visiblePostIndices.map((item) =>
                   item.kind === "ellipsis" ? (
@@ -563,8 +612,8 @@ function ViewerPage() {
                       type="button"
                       className={`strip-num ${item.i === index ? "active" : ""}`}
                       onClick={() => setPostAndResetImage(item.i)}
-                      aria-label={`Open post ${item.i + 1} of ${filteredPosts.length}`}
-                      title={`${item.i + 1}/${filteredPosts.length}`}
+                      aria-label={`Open post ${item.i + 1} of ${posts.length}`}
+                      title={`${item.i + 1}/${posts.length}`}
                     >
                       {item.i + 1}
                     </button>
