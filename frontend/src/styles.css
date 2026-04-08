@@ -51,12 +51,13 @@ body,
 
 .home-card {
   width: min(640px, 100%);
-  background: rgba(10, 10, 10, 0.8);
+  background: linear-gradient(180deg, rgba(12, 12, 12, 0.9) 0%, rgba(8, 8, 8, 0.82) 100%);
   border: 1px solid rgba(255, 255, 255, 0.15);
   border-radius: 16px;
   padding: 20px;
   display: grid;
   gap: 12px;
+  box-shadow: 0 20px 70px rgba(0, 0, 0, 0.45);
 }
 
 .home-card h1 {
@@ -68,6 +69,13 @@ body,
   margin: 0;
   opacity: 0.8;
   font-size: 14px;
+}
+
+.home-help {
+  display: grid;
+  gap: 4px;
+  font-size: 12px;
+  opacity: 0.75;
 }
 
 .home-card label {
@@ -223,6 +231,7 @@ body,
   gap: 8px;
   align-items: center;
   margin-bottom: 10px;
+  flex-wrap: wrap;
 }
 
 .timer-input {
@@ -233,6 +242,13 @@ body,
   border-radius: 10px;
   padding: 8px 10px;
   text-align: center;
+}
+
+.media-mode-btn {
+  min-height: 38px;
+  font-size: 12px;
+  padding: 8px 10px;
+  white-space: nowrap;
 }
 
 .search-inline {

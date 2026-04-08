@@ -15,6 +15,12 @@ const API_BASE = import.meta.env.VITE_API_BASE || "";
 const SWIPE_THRESHOLD = 50;
 const RESUME_DELAY_MS = 5000;
 const LAST_SUBS_KEY = "reddit_slideshow_last_subs";
+const MEDIA_MODE_SEQUENCE = ["both", "video", "image"];
+const MEDIA_MODE_LABEL = {
+  both: "Video + Image",
+  video: "Video only",
+  image: "Image only",
+};
 
 const postsCache = new Map();
 const POSTS_CACHE_TTL_MS = 30_000;
@@ -130,7 +136,7 @@ function HomePage() {
     <div className="home-page">
       <form className="home-card fade-in" onSubmit={onSubmit}>
         <h1>Reddit Slideshow</h1>
-        <p>Enter subreddits to start a fullscreen media slideshow.</p>
+        <p>Fullscreen media viewer for multiple subreddits with search, autoplay, and gestures.</p>
 
         <label htmlFor="subs-input">Subreddits (comma-separated)</label>
         <input
@@ -149,6 +155,11 @@ function HomePage() {
           placeholder="e.g. car, beach, sunset"
           autoComplete="off"
         />
+
+        <div className="home-help">
+          <span>Examples: `pics, wallpapers, memes`</span>
+          <span>Tip: add a search term to pre-filter before entering viewer</span>
+        </div>
 
         {error ? <div className="form-error">{error}</div> : null}
 
@@ -179,6 +190,7 @@ function ViewerPage() {
   const [imageIndexByPost, setImageIndexByPost] = useState({});
   const [autoplayEnabled, setAutoplayEnabled] = useState(true);
   const [autoplayMs, setAutoplayMs] = useState(DEFAULT_AUTOPLAY_MS);
+  const [mediaMode, setMediaMode] = useState("both");
   const [showSearch, setShowSearch] = useState(false);
   const [searchValue, setSearchValue] = useState(initialQuery);
   const [searchError, setSearchError] = useState("");
@@ -187,8 +199,16 @@ function ViewerPage() {
   const inflight = useRef(null);
   const activeQueryRef = useRef(initialQuery);
 
-  const hasPosts = posts.length > 0;
-  const currentPost = hasPosts ? posts[index] : null;
+  const visiblePosts = useMemo(() => {
+    if (mediaMode === "both") return posts;
+    if (mediaMode === "video") {
+      return posts.filter((p) => p.type === "video" || p.type === "redgifs");
+    }
+    return posts.filter((p) => p.type === "image");
+  }, [posts, mediaMode]);
+
+  const hasPosts = visiblePosts.length > 0;
+  const currentPost = hasPosts ? visiblePosts[index] : null;
   const isPaused = Date.now() < pausedUntil;
   const currentImageIndex = currentPost ? imageIndexByPost[currentPost.id] || 0 : 0;
   const totalImages = currentPost?.images?.length || 1;
@@ -242,6 +262,16 @@ function ViewerPage() {
     }
   }, [posts.length, subs, fetchPosts]);
 
+  useEffect(() => {
+    if (!visiblePosts.length) {
+      setIndex(0);
+      return;
+    }
+    if (index > visiblePosts.length - 1) {
+      setIndex(0);
+    }
+  }, [visiblePosts.length, index]);
+
   const resolveRedgifs = useCallback(
     async (post) => {
       if (!post || post.type !== "redgifs") return null;
@@ -271,14 +301,14 @@ function ViewerPage() {
 
   const setPostAndResetImage = useCallback(
     (nextIndex) => {
-      const bounded = Math.max(0, Math.min(nextIndex, posts.length - 1));
-      const nextPost = posts[bounded];
+      const bounded = Math.max(0, Math.min(nextIndex, visiblePosts.length - 1));
+      const nextPost = visiblePosts[bounded];
       setIndex(bounded);
       if (nextPost?.id) {
         setImageIndexByPost((prev) => ({ ...prev, [nextPost.id]: 0 }));
       }
     },
-    [posts]
+    [visiblePosts]
   );
 
   const goNext = useCallback(() => {
@@ -323,7 +353,7 @@ function ViewerPage() {
   );
 
   const visiblePostIndices = useMemo(() => {
-    const total = posts.length;
+    const total = visiblePosts.length;
     if (total <= 1) return [];
 
     const MAX_VISIBLE = 15; // keep row short
@@ -350,12 +380,15 @@ function ViewerPage() {
       pushIndex(total - 1);
     }
     return out;
-  }, [posts.length, index]);
+  }, [visiblePosts.length, index]);
 
   useEffect(() => {
-    if (!currentPost || currentPost.type !== "redgifs") return;
-    resolveRedgifs(currentPost);
-  }, [currentPost, resolveRedgifs]);
+    // Resolve redgifs for current and next 3 posts in advance
+    for (let i = 0; i <= 3; i++) {
+      const p = visiblePosts[index + i];
+      if (p && p.type === "redgifs") resolveRedgifs(p);
+    }
+  }, [index, visiblePosts, resolveRedgifs]);
 
   useEffect(() => {
     if (!hasPosts || isPaused || !autoplayEnabled) return;
@@ -381,9 +414,9 @@ function ViewerPage() {
 
   useEffect(() => {
     const shouldLoadMore =
-      posts.length > 0 && index >= posts.length - 3 && after && !loading;
+      visiblePosts.length > 0 && index >= visiblePosts.length - 3 && after && !loading;
     if (shouldLoadMore) fetchPosts({ append: true, afterToken: after });
-  }, [index, posts.length, after, loading, fetchPosts]);
+  }, [index, visiblePosts.length, after, loading, fetchPosts]);
 
   useEffect(() => {
     const onKeyDown = (event) => {
@@ -411,22 +444,29 @@ function ViewerPage() {
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [goNext, goPrev, cycleCurrentPostImage, prevCurrentPostImage]);
 
-  useEffect(() => {
-    const nextPost = posts[index + 1];
-    if (!nextPost) return;
-    const nextUrl = nextPost.type === "redgifs"
-      ? resolvedRedgifs[nextPost.id]
-      : (nextPost.images?.[0] || nextPost.url);
-    if (!nextUrl) return;
-    if (nextPost.type === "image") {
-      const image = new Image();
-      image.src = nextUrl;
-    } else {
-      const video = document.createElement("video");
-      video.preload = "metadata";
-      video.src = nextUrl;
+  const preloadMediaUrls = useMemo(() => {
+    const urls = [];
+    if (!currentPost) return urls;
+
+    // Preload the next image of the current gallery post
+    if (totalImages > 1 && currentImageIndex < totalImages - 1) {
+      urls.push({ url: currentPost.images[currentImageIndex + 1], type: "image", key: "preload_gallery" });
     }
-  }, [index, posts, resolvedRedgifs]);
+
+    // Preload the next 3 posts' primary media
+    for (let i = 1; i <= 3; i++) {
+      const nextPost = visiblePosts[index + i];
+      if (nextPost) {
+        let url = nextPost.type === "redgifs"
+          ? resolvedRedgifs[nextPost.id]
+          : (nextPost.images?.[0] || nextPost.url);
+        if (url) {
+          urls.push({ url, type: nextPost.type === "image" ? "image" : "video", key: `preload_${nextPost.id}` });
+        }
+      }
+    }
+    return urls;
+  }, [currentPost, totalImages, currentImageIndex, visiblePosts, index, resolvedRedgifs]);
 
   const onTouchStart = (event) => {
     touchStartX.current = event.changedTouches[0]?.clientX ?? null;
@@ -491,6 +531,14 @@ function ViewerPage() {
     }
   };
 
+  const cycleMediaMode = () => {
+    setIndex(0);
+    setMediaMode((prev) => {
+      const i = MEDIA_MODE_SEQUENCE.indexOf(prev);
+      return MEDIA_MODE_SEQUENCE[(i + 1) % MEDIA_MODE_SEQUENCE.length];
+    });
+  };
+
   return (
     <div className="app fade-in" onTouchStart={onTouchStart} onTouchEnd={onTouchEnd}>
       <div className="tap-zone left" onClick={goPrev} aria-label="Previous post" />
@@ -509,6 +557,17 @@ function ViewerPage() {
             )}
           </>
         ) : null}
+
+        {/* Invisible DOM preloader for upcoming images/videos */}
+        <div style={{ display: "none" }}>
+          {preloadMediaUrls.map((media) =>
+            media.type === "image" ? (
+              <img key={media.key} src={media.url} alt="" />
+            ) : (
+              <video key={media.key} src={media.url} preload="auto" />
+            )
+          )}
+        </div>
       </main>
 
       {uiVisible ? (
@@ -551,7 +610,7 @@ function ViewerPage() {
           </div>
           <div className="bottom-bar">
             <div className="meta">
-              <span>{hasPosts ? index + 1 : 0} / {posts.length}</span>
+              <span>{hasPosts ? index + 1 : 0} / {visiblePosts.length}</span>
               {currentPost ? <span>r/{currentPost.subreddit}</span> : null}
             </div>
             <div className="bottom-controls">
@@ -577,6 +636,15 @@ function ViewerPage() {
               />
               <button
                 type="button"
+                className="overlay-btn media-mode-btn"
+                title="Cycle media mode"
+                aria-label="Cycle media mode"
+                onClick={cycleMediaMode}
+              >
+                {MEDIA_MODE_LABEL[mediaMode]}
+              </button>
+              <button
+                type="button"
                 className="overlay-btn icon-btn"
                 title="Search subreddit"
                 aria-label="Search subreddit"
@@ -598,7 +666,7 @@ function ViewerPage() {
               </form>
             ) : null}
             {searchError ? <div className="search-error">{searchError}</div> : null}
-            {posts.length > 1 ? (
+            {visiblePosts.length > 1 ? (
               <div className="post-strip" aria-label="Posts in slideshow">
                 {visiblePostIndices.map((item) =>
                   item.kind === "ellipsis" ? (
@@ -611,8 +679,8 @@ function ViewerPage() {
                       type="button"
                       className={`strip-num ${item.i === index ? "active" : ""}`}
                       onClick={() => setPostAndResetImage(item.i)}
-                      aria-label={`Open post ${item.i + 1} of ${posts.length}`}
-                      title={`${item.i + 1}/${posts.length}`}
+                      aria-label={`Open post ${item.i + 1} of ${visiblePosts.length}`}
+                      title={`${item.i + 1}/${visiblePosts.length}`}
                     >
                       {item.i + 1}
                     </button>
