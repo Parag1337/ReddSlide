@@ -28,9 +28,25 @@ function extractGalleryImages(post) {
   const images = [];
   for (const item of galleryItems) {
     const media = metadata[item.media_id];
-    const candidate = media?.s?.u || media?.s?.gif || "";
+    let candidate = media?.s?.u || media?.s?.gif || "";
     if (!candidate) continue;
-    images.push(candidate.replace(/&amp;/g, "&"));
+    
+    // Unescape HTML entities
+    candidate = candidate.replace(/&amp;/g, "&")
+                        .replace(/&lt;/g, "<")
+                        .replace(/&gt;/g, ">")
+                        .replace(/&quot;/g, '"')
+                        .replace(/&#39;/g, "'");
+    
+    // Clean query parameters
+    candidate = candidate.split("?")[0];
+    
+    // Ensure protocol
+    if (!candidate.startsWith("http")) {
+      candidate = "https:" + candidate;
+    }
+    
+    images.push(candidate);
   }
   return images;
 }
@@ -71,13 +87,29 @@ function buildMediaPost(post) {
 
   if (lowerUrl.includes("v.redd.it") || post.is_video) {
     // Reddit natively hosts this video.
-    // The raw url causes browser redirects and slow HLS decoding latency.
-    // Instead, extract the direct mp4 fallback url format:
+    // Extract direct mp4 fallback URL (avoids browser redirects and slow HLS decoding).
+    // Fallback chain: secure_media > media > preview image > original URL
     let directVideoUrl = url;
+    
     if (post?.secure_media?.reddit_video?.fallback_url) {
       directVideoUrl = post.secure_media.reddit_video.fallback_url.split("?")[0];
     } else if (post?.media?.reddit_video?.fallback_url) {
       directVideoUrl = post.media.reddit_video.fallback_url.split("?")[0];
+    } else if (post?.preview?.images?.[0]?.source?.url) {
+      // Last resort: use preview image if available
+      let previewUrl = post.preview.images[0].source.url.replace(/&amp;/g, "&");
+      // Clean query params from preview
+      previewUrl = previewUrl.split("?")[0];
+      // Ensure protocol
+      if (!previewUrl.startsWith("http")) {
+        previewUrl = "https:" + previewUrl;
+      }
+      directVideoUrl = previewUrl;
+    }
+    
+    // Ensure video URL has protocol
+    if (!directVideoUrl.startsWith("http")) {
+      directVideoUrl = "https:" + directVideoUrl;
     }
 
     return {
@@ -92,14 +124,22 @@ function buildMediaPost(post) {
     };
   }
 
-  if (lowerUrl.includes("i.redd.it") || lowerUrl.match(/\.(jpg|jpeg|png|gif|webp)(\?.*)?$/)) {
+  if (lowerUrl.includes("i.redd.it") || lowerUrl.match(/\.(jpg|jpeg|png|gif|webp)(\.?.*)?$/)) {
+    // Clean up image URL: remove query parameters that might cause issues
+    let cleanUrl = url.split("?")[0];
+    
+    // Ensure protocol
+    if (!cleanUrl.startsWith("http")) {
+      cleanUrl = "https:" + cleanUrl;
+    }
+    
     return {
       id: post.id,
       title: post.title,
       subreddit: post.subreddit,
-      url,
+      url: cleanUrl,
       type: "image",
-      images: [url],
+      images: [cleanUrl],
       isNsfw: Boolean(post.over_18),
       content,
       createdUtc: Number(post?.created_utc || 0),
@@ -108,13 +148,64 @@ function buildMediaPost(post) {
 
   if (domain.includes("imgur.com")) {
     const isVideo = lowerUrl.match(/\.(mp4|webm)(\?.*)?$/);
+    let finalUrl = url;
+    
+    // Clean up query params first before adding extension
+    const cleanedUrl = url.split("?")[0];
+    const cleanedLower = cleanedUrl.toLowerCase();
+    
+    // Check if it's a gallery/page link (no extension)
+    const hasExtension = cleanedLower.match(/\.(jpg|jpeg|png|gif|webp|gifv|mp4|webm)$/i);
+    
+    if (isVideo) {
+      finalUrl = cleanedUrl;
+    } else if (!hasExtension) {
+      // Gallery/bare link - append .jpg
+      finalUrl = cleanedUrl + ".jpg";
+    } else if (cleanedLower.endsWith(".gifv")) {
+      // Convert .gifv to .mp4 (imgur's video format)
+      finalUrl = cleanedUrl.replace(/\.gifv$/, ".mp4");
+    } else {
+      finalUrl = cleanedUrl;
+    }
+
     return {
       id: post.id,
       title: post.title,
       subreddit: post.subreddit,
-      url,
+      url: finalUrl,
       type: isVideo ? "video" : "image",
-      images: isVideo ? undefined : [url],
+      images: isVideo ? undefined : [finalUrl],
+      isNsfw: Boolean(post.over_18),
+      content,
+      createdUtc: Number(post?.created_utc || 0),
+    };
+  }
+
+  // Fallback: If it's an unrecognized domain but Reddit generated a preview image, use that.
+  const previewUrl = post?.preview?.images?.[0]?.source?.url;
+  if (previewUrl) {
+    let unescapedUrl = previewUrl.replace(/&amp;/g, "&")
+                                 .replace(/&lt;/g, "<")
+                                 .replace(/&gt;/g, ">")
+                                 .replace(/&quot;/g, '"')
+                                 .replace(/&#39;/g, "'");
+    
+    // Clean query parameters
+    unescapedUrl = unescapedUrl.split("?")[0];
+    
+    // Ensure preview URL has protocol
+    if (!unescapedUrl.startsWith("http")) {
+      unescapedUrl = "https:" + unescapedUrl;
+    }
+    
+    return {
+      id: post.id,
+      title: post.title,
+      subreddit: post.subreddit,
+      url: unescapedUrl,
+      type: "image",
+      images: [unescapedUrl],
       isNsfw: Boolean(post.over_18),
       content,
       createdUtc: Number(post?.created_utc || 0),
@@ -416,10 +507,10 @@ function createApp() {
     return token;
   }
 
-  async function fetchRedgifsGif(gifId) {
+  async function fetchRedgifsGif(gifId, retryCount = 0) {
     const requestWithToken = async (token) =>
       axios.get(`${REDGIFS_GIF_URL_BASE}/${gifId}`, {
-        timeout: 10000,
+        timeout: 8000,
         headers: { Authorization: `Bearer ${token}` },
       });
 
@@ -427,9 +518,22 @@ function createApp() {
     try {
       return await requestWithToken(token);
     } catch (error) {
-      if (error?.response?.status !== 401) throw error;
-      token = await getRedgifsToken(true);
-      return requestWithToken(token);
+      const status = error?.response?.status;
+      
+      // Retry on token auth failure
+      if (status === 401) {
+        token = await getRedgifsToken(true);
+        return requestWithToken(token);
+      }
+      
+      // Retry on timeout or 5xx errors (max 2 retries)
+      if ((status >= 500 || error.code === 'ECONNABORTED') && retryCount < 2) {
+        const delay = Math.pow(2, retryCount) * 500;
+        await new Promise(resolve => setTimeout(resolve, delay));
+        return fetchRedgifsGif(gifId, retryCount + 1);
+      }
+      
+      throw error;
     }
   }
 
@@ -557,19 +661,64 @@ function createApp() {
     try {
       const response = await fetchRedgifsGif(gifId);
       const urls = response.data?.gif?.urls || {};
-      const videoUrl = urls.hd || urls.sd || urls.fhd || null;
-      if (!videoUrl) return res.status(404).json({ error: "No playable video URL found for this Redgifs id" });
+      // Try to get the best quality available (highest to lowest)
+      const videoUrl = urls.fhd || urls.hd || urls.sd || urls.gif || null;
+      if (!videoUrl) return res.status(404).json({ error: "No playable video URL found for this Redgifs id", details: "Empty URLs object" });
       return res.json({ id: gifId, url: videoUrl });
     } catch (error) {
       const status = error?.response?.status || 500;
+      let errorMsg = "Failed to fetch Redgifs video URL";
+      
+      if (status === 404) {
+        errorMsg = "Redgifs video not found";
+      } else if (status === 401) {
+        errorMsg = "Redgifs authentication failed";
+      } else if (status >= 500) {
+        errorMsg = "Redgifs server error";
+      }
+      
       return res.status(status).json({
-        error: "Failed to fetch Redgifs video URL",
-        details: error?.response?.data || error.message,
+        error: errorMsg,
+        details: error?.response?.data?.error || error.message,
       });
     }
   });
 
   app.get("/health", (req, res) => res.json({ ok: true }));
+
+  // Debug endpoint to validate image URLs
+  app.get("/api/validate-url", async (req, res) => {
+    const url = req.query.url ? String(req.query.url).trim() : "";
+    if (!url) {
+      return res.status(400).json({ error: "Missing url query parameter" });
+    }
+
+    try {
+      const response = await axios.head(url, {
+        timeout: 5000,
+        maxRedirects: 5,
+        headers: {
+          "User-Agent": "web:reddit-slideshow-app:v1.0.0 (by /u/Parag1337)",
+        },
+      });
+
+      return res.json({
+        valid: true,
+        url,
+        status: response.status,
+        contentType: response.headers["content-type"] || "unknown",
+        contentLength: response.headers["content-length"] || "unknown",
+      });
+    } catch (error) {
+      return res.status(400).json({
+        valid: false,
+        url,
+        error: error.message,
+        status: error?.response?.status || "unknown",
+      });
+    }
+  });
+
   return app;
 }
 

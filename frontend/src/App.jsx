@@ -187,6 +187,8 @@ function ViewerPage() {
   const [uiVisible, setUiVisible] = useState(true);
   const [pausedUntil, setPausedUntil] = useState(0);
   const [resolvedRedgifs, setResolvedRedgifs] = useState({});
+  const [failedMedia, setFailedMedia] = useState(new Set());
+  const [redgifsRetry, setRedgifsRetry] = useState({});
   const [imageIndexByPost, setImageIndexByPost] = useState({});
   const [autoplayEnabled, setAutoplayEnabled] = useState(true);
   const [autoplayMs, setAutoplayMs] = useState(DEFAULT_AUTOPLAY_MS);
@@ -195,7 +197,10 @@ function ViewerPage() {
   const [searchValue, setSearchValue] = useState(initialQuery);
   const [searchError, setSearchError] = useState("");
   const [activeQuery, setActiveQuery] = useState(initialQuery);
+  const [videoReady, setVideoReady] = useState(false);
   const touchStartX = useRef(null);
+  const [imageLoaded, setImageLoaded] = useState(true);
+  const videoRef = useRef(null);
   const inflight = useRef(null);
   const activeQueryRef = useRef(initialQuery);
 
@@ -273,21 +278,44 @@ function ViewerPage() {
   }, [visiblePosts.length, index]);
 
   const resolveRedgifs = useCallback(
-    async (post) => {
+    async (post, retryCount = 0) => {
       if (!post || post.type !== "redgifs") return null;
       if (resolvedRedgifs[post.id]) return resolvedRedgifs[post.id];
+      if (failedMedia.has(post.id) && retryCount === 0) return null;
+      
       try {
         const params = new URLSearchParams({ id: post.url || post.id });
         const response = await fetch(`${API_BASE}/api/redgifs?${params.toString()}`);
-        if (!response.ok) throw new Error("Redgifs fetch failed");
+        if (!response.ok) {
+          if (retryCount < 2) {
+            // Retry with exponential backoff: 1s, 2s
+            const delay = Math.pow(2, retryCount - 1) * 1000;
+            setTimeout(() => resolveRedgifs(post, retryCount + 1), delay);
+          } else {
+            setFailedMedia((prev) => new Set([...prev, post.id]));
+          }
+          throw new Error("Redgifs fetch failed");
+        }
         const data = await response.json();
         setResolvedRedgifs((prev) => ({ ...prev, [post.id]: data.url }));
+        setFailedMedia((prev) => {
+          const next = new Set(prev);
+          next.delete(post.id);
+          return next;
+        });
         return data.url;
-      } catch {
+      } catch (err) {
+        if (retryCount < 2) {
+          const delay = Math.pow(2, retryCount) * 1000;
+          setRedgifsRetry((prev) => ({ ...prev, [post.id]: retryCount + 1 }));
+          setTimeout(() => resolveRedgifs(post, retryCount + 1), delay);
+        } else {
+          setFailedMedia((prev) => new Set([...prev, post.id]));
+        }
         return null;
       }
     },
-    [resolvedRedgifs]
+    [resolvedRedgifs, failedMedia]
   );
 
   const mediaUrl = useMemo(() => {
@@ -314,18 +342,31 @@ function ViewerPage() {
   const goNext = useCallback(() => {
     if (!hasPosts) return;
     pauseAutoplay();
+    setImageLoaded(false);
+    // Preload next image immediately
+    const nextPost = visiblePosts[Math.min(index + 1, visiblePosts.length - 1)];
+    if (nextPost?.type === "redgifs") {
+      resolveRedgifs(nextPost);
+    }
     setPostAndResetImage(index + 1);
-  }, [hasPosts, pauseAutoplay, setPostAndResetImage, index]);
+  }, [hasPosts, pauseAutoplay, setPostAndResetImage, index, visiblePosts, resolveRedgifs]);
 
   const goPrev = useCallback(() => {
     if (!hasPosts) return;
     pauseAutoplay();
+    setImageLoaded(false);
+    // Preload previous image immediately
+    const prevPost = visiblePosts[Math.max(index - 1, 0)];
+    if (prevPost?.type === "redgifs") {
+      resolveRedgifs(prevPost);
+    }
     setPostAndResetImage(index - 1);
-  }, [hasPosts, pauseAutoplay, setPostAndResetImage, index]);
+  }, [hasPosts, pauseAutoplay, setPostAndResetImage, index, visiblePosts, resolveRedgifs]);
 
   const cycleCurrentPostImage = useCallback(() => {
     if (!currentPost || totalImages <= 1) return;
     pauseAutoplay();
+    setImageLoaded(false);
     setImageIndexByPost((prev) => {
       const current = prev[currentPost.id] || 0;
       return { ...prev, [currentPost.id]: (current + 1) % totalImages };
@@ -335,6 +376,7 @@ function ViewerPage() {
   const prevCurrentPostImage = useCallback(() => {
     if (!currentPost || totalImages <= 1) return;
     pauseAutoplay();
+    setImageLoaded(false);
     setImageIndexByPost((prev) => {
       const current = prev[currentPost.id] || 0;
       const next = (current - 1 + totalImages) % totalImages;
@@ -346,6 +388,7 @@ function ViewerPage() {
     (nextImageIndex) => {
       if (!currentPost || totalImages <= 1) return;
       pauseAutoplay();
+      setImageLoaded(false);
       const bounded = Math.max(0, Math.min(nextImageIndex, totalImages - 1));
       setImageIndexByPost((prev) => ({ ...prev, [currentPost.id]: bounded }));
     },
@@ -383,8 +426,21 @@ function ViewerPage() {
   }, [visiblePosts.length, index]);
 
   useEffect(() => {
-    // Resolve redgifs for current and next 3 posts in advance
-    for (let i = 0; i <= 3; i++) {
+    // Reset video ready state when media changes for smooth transition
+    setVideoReady(false);
+    if (currentPost?.id) {
+    setImageLoaded(false);
+      setFailedMedia((prev) => {
+        const next = new Set(prev);
+        next.delete(currentPost.id);
+        return next;
+      });
+    }
+  }, [mediaUrl, currentPost?.id]);
+
+  useEffect(() => {
+    // Resolve redgifs for current and next 2 posts (focused preload for performance)
+    for (let i = 0; i <= 2; i++) {
       const p = visiblePosts[index + i];
       if (p && p.type === "redgifs") resolveRedgifs(p);
     }
@@ -451,23 +507,25 @@ function ViewerPage() {
 
     // Preload the next image of the current gallery post
     if (totalImages > 1 && currentImageIndex < totalImages - 1) {
-      urls.push({ url: currentPost.images[currentImageIndex + 1], type: "image", key: "preload_gallery" });
+      urls.push({ url: currentPost.images[currentImageIndex + 1], type: "image", key: "preload_gallery", priority: "high" });
     }
 
-    // Preload the next 3 posts' primary media
+    // Preload next 3 posts with priority hints (reduced from 5 for better network efficiency)
     for (let i = 1; i <= 3; i++) {
       const nextPost = visiblePosts[index + i];
-      if (nextPost) {
+      if (nextPost && !failedMedia.has(nextPost.id)) {
         let url = nextPost.type === "redgifs"
           ? resolvedRedgifs[nextPost.id]
           : (nextPost.images?.[0] || nextPost.url);
         if (url) {
-          urls.push({ url, type: nextPost.type === "image" ? "image" : "video", key: `preload_${nextPost.id}` });
+          // Next post has higher priority for faster transitions
+          const priority = i === 1 ? "high" : "low";
+          urls.push({ url, type: nextPost.type === "image" ? "image" : "video", key: `preload_${nextPost.id}`, priority });
         }
       }
     }
     return urls;
-  }, [currentPost, totalImages, currentImageIndex, visiblePosts, index, resolvedRedgifs]);
+  }, [currentPost, totalImages, currentImageIndex, visiblePosts, index, resolvedRedgifs, failedMedia]);
 
   const onTouchStart = (event) => {
     touchStartX.current = event.changedTouches[0]?.clientX ?? null;
@@ -552,20 +610,71 @@ function ViewerPage() {
         {hasPosts && currentPost ? (
           <>
             {currentPost.type === "image" ? (
-              <img className="media" src={mediaUrl} alt={currentPost.title} loading="lazy" draggable="false" />
+              <>
+                <img 
+                  className="media" 
+                  src={mediaUrl} 
+                  alt={currentPost.title} 
+                  loading="eager" 
+                  draggable="false"
+                  onLoad={() => {
+                    console.log(`✅ Image loaded: ${mediaUrl}`);
+                    setImageLoaded(true);
+                  }}
+                  onError={(e) => {
+                    console.warn(`❌ Image failed to load: ${mediaUrl}`, e);
+                    setImageLoaded(true);
+                  }}
+                  style={{ opacity: imageLoaded ? 1 : 0.5, transition: 'opacity 0.15s ease' }}
+                />
+                {!imageLoaded && <div className="loading-spinner">Loading...</div>}
+              </>
             ) : (
-              <video className="media" key={mediaUrl} src={mediaUrl} muted autoPlay playsInline loop preload="metadata" />
+              <video 
+                ref={videoRef}
+                className="media" 
+                src={mediaUrl} 
+                muted 
+                autoPlay 
+                playsInline 
+                loop 
+                preload="auto"
+                crossOrigin="anonymous"
+                onCanPlay={() => {
+                  setVideoReady(true);
+                  setFailedMedia((prev) => {
+                    const next = new Set(prev);
+                    next.delete(currentPost.id);
+                    return next;
+                  });
+                }}
+                onError={() => setFailedMedia((prev) => new Set([...prev, currentPost.id]))}
+                style={{ opacity: videoReady ? 1 : 0.7, transition: 'opacity 0.2s' }}
+              />
             )}
           </>
         ) : null}
 
-        {/* Invisible DOM preloader for upcoming images/videos */}
+        {/* Invisible DOM preloader for upcoming images/videos - optimized buffering */}
         <div style={{ display: "none" }}>
           {preloadMediaUrls.map((media) =>
             media.type === "image" ? (
-              <img key={media.key} src={media.url} alt="" />
+              <img 
+                key={media.key} 
+                src={media.url} 
+                alt="" 
+                loading="eager"
+                fetchPriority={media.priority || "low"}
+              />
             ) : (
-              <video key={media.key} src={media.url} preload="auto" />
+              <video 
+                key={media.key} 
+                src={media.url} 
+                preload="auto"
+                crossOrigin="anonymous"
+                fetchPriority={media.priority || "low"}
+                onError={() => setFailedMedia((prev) => new Set([...prev, media.key]))}
+              />
             )
           )}
         </div>
