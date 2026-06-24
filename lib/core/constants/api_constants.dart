@@ -5,6 +5,7 @@ class ApiConstants {
   static const String feedQueue = '/api/feed/queue';
   static const String search = '/api/search';
   static const String searchDebug = '/api/search/debug';
+  static const String searchReddit = '/api/search/reddit';
   static const String health = '/api/health';
   static const String mediaStart = '/api/media/start';
   static const String media = '/api/media';

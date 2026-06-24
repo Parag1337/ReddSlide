@@ -1,3 +1,4 @@
+import 'package:flutter/foundation.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../domain/settings_model.dart';
 import '../data/settings_repository.dart';
@@ -77,6 +78,7 @@ class SettingsNotifier extends AsyncNotifier<SettingsModel> {
     final repo = ref.read(settingsRepositoryProvider);
     await repo.saveFull(updated);
     _syncSubredditsToBackend(updatedSubs);
+    debugPrint('[SETTINGS] subreddits=${updated.subreddits}');
   }
 
   Future<void> removeSubreddit(String name) async {
@@ -87,6 +89,7 @@ class SettingsNotifier extends AsyncNotifier<SettingsModel> {
     final repo = ref.read(settingsRepositoryProvider);
     await repo.saveFull(updated);
     _syncSubredditsToBackend(updatedSubs);
+    debugPrint('[SETTINGS] subreddits=${updated.subreddits}');
   }
 
   Future<void> updateSubreddit(String oldName, String newName) async {

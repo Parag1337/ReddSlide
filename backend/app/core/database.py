@@ -101,6 +101,33 @@ async def init_db():
             
             CREATE INDEX IF NOT EXISTS idx_enabled ON subreddit_configs(enabled);
             
+            CREATE TABLE IF NOT EXISTS search_results (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                search_query TEXT NOT NULL,
+                reddit_id TEXT NOT NULL,
+                title TEXT NOT NULL,
+                author TEXT NOT NULL,
+                subreddit TEXT NOT NULL,
+                media_url TEXT,
+                video_url TEXT,
+                thumbnail_url TEXT,
+                is_video BOOLEAN DEFAULT FALSE,
+                is_gallery BOOLEAN DEFAULT FALSE,
+                nsfw BOOLEAN DEFAULT FALSE,
+                width INTEGER,
+                height INTEGER,
+                duration INTEGER,
+                score INTEGER DEFAULT 0,
+                permalink TEXT,
+                created_utc INTEGER DEFAULT 0,
+                cached_at INTEGER NOT NULL,
+                hide_from_results BOOLEAN DEFAULT FALSE,
+                UNIQUE(reddit_id, search_query)
+            );
+            
+            CREATE INDEX IF NOT EXISTS idx_search_query ON search_results(search_query);
+            CREATE INDEX IF NOT EXISTS idx_search_cached ON search_results(cached_at);
+            
             CREATE VIRTUAL TABLE IF NOT EXISTS media_search
             USING fts5(
                 reddit_post_id,

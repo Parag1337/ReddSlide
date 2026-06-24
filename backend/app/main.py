@@ -6,7 +6,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from .core.database import init_db, DATABASE_PATH
-from .api import feed, debug
+from .api import feed, debug, search
 from .managers.oauth import OAuthManager
 from .services.background_service import BackgroundRefreshService
 
@@ -54,3 +54,4 @@ app = FastAPI(
 
 app.include_router(feed.router, prefix="/api")
 app.include_router(debug.router, prefix="/api")
+app.include_router(search.router, prefix="/api")

@@ -146,11 +146,29 @@ async def search(
     q: str = Query(..., min_length=1),
     limit: int = Query(default=20, le=100),
     page: int = Query(default=1, ge=1),
+    subreddits: Optional[str] = Query(default=None),
+    media_type: Optional[str] = Query(default=None),
+    sort: str = Query(default="relevance"),
     queue_manager: QueueManager = Depends(get_queue_manager)
 ):
-    """Search media assets."""
+    """Search media assets with optional filters.
+
+    Parameters:
+        q: Search query string
+        limit: Number of results per page
+        page: Page number (1-indexed)
+        subreddits: Optional comma-separated list of subreddits to filter by
+        media_type: Optional filter - "images", "galleries", "videos"
+        sort: Sort order - "relevance", "newest", "most_upvoted"
+    """
+    subreddit_list = _parse_subreddits(subreddits)
     offset = (page - 1) * limit
-    items, total = await queue_manager.search(q, limit, offset)
+    items, total = await queue_manager.search(
+        q, limit, offset,
+        subreddits=subreddit_list,
+        media_type=media_type,
+        sort=sort,
+    )
     enriched_items = await _enrich_with_gallery_urls(items, queue_manager)
     has_more = (offset + len(items)) < total
     next_after = str(offset + len(items)) if has_more else None

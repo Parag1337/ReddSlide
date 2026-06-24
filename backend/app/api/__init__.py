@@ -1,1 +1,1 @@
-from . import feed, debug
+from . import feed, debug, search

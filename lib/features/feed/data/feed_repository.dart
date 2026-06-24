@@ -88,11 +88,13 @@ class FeedResponse {
   final List<MediaAsset> items;
   final String? after;
   final bool hasMore;
+  final int totalResults;
 
   const FeedResponse({
     required this.items,
     this.after,
     required this.hasMore,
+    this.totalResults = 0,
   });
 
   factory FeedResponse.fromJson(Map<String, dynamic> json) {
@@ -103,6 +105,7 @@ class FeedResponse {
       items: itemsList,
       after: json['after'] as String?,
       hasMore: json['has_more'] as bool? ?? false,
+      totalResults: json['total_results'] as int? ?? json['total'] as int? ?? 0,
     );
   }
 }

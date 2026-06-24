@@ -187,32 +187,55 @@ class QueueManager:
             )
             await db.commit()
     
-    async def search(self, query: str, limit: int = 20, offset: int = 0) -> tuple[list[dict], int]:
-        """Search media using FTS5."""
+    async def search(
+        self,
+        query: str,
+        limit: int = 20,
+        offset: int = 0,
+        subreddits: Optional[list[str]] = None,
+        media_type: Optional[str] = None,
+        sort: str = "relevance",
+    ) -> tuple[list[dict], int]:
+        """Search media using FTS5 with optional filters."""
         async with get_db() as db:
-            # Use proper FTS5 syntax: the MATCH clause should be on the FTS table
+            base_where = "ma.reddit_id IN (SELECT reddit_post_id FROM media_search WHERE media_search MATCH ?)"
+            params: list = [query]
+
+            if subreddits:
+                placeholders = ",".join("?" * len(subreddits))
+                base_where += f" AND ma.subreddit IN ({placeholders})"
+                params.extend(subreddits)
+
+            if media_type == "images":
+                base_where += " AND ma.is_video = 0 AND ma.is_gallery = 0"
+            elif media_type == "galleries":
+                base_where += " AND ma.is_gallery = 1"
+            elif media_type == "videos":
+                base_where += " AND ma.is_video = 1"
+
+            order_clause = "ORDER BY ma.score DESC"
+            if sort == "newest":
+                order_clause = "ORDER BY ma.created_utc DESC"
+            elif sort == "relevance":
+                order_clause = "ORDER BY ma.quality_score DESC, ma.score DESC"
+
             cursor = await db.execute(
-                """SELECT ma.* FROM media_assets ma
-                   WHERE ma.reddit_id IN (
-                       SELECT reddit_post_id FROM media_search 
-                       WHERE media_search MATCH ?
-                   )
+                f"""SELECT ma.* FROM media_assets ma
+                   WHERE {base_where}
+                   {order_clause}
                    LIMIT ? OFFSET ?""",
-                (query, limit, offset)
+                [*params, limit, offset]
             )
             rows = await cursor.fetchall()
-            
+
             count_cursor = await db.execute(
-                """SELECT COUNT(*) as count FROM media_assets ma
-                   WHERE ma.reddit_id IN (
-                       SELECT reddit_post_id FROM media_search 
-                       WHERE media_search MATCH ?
-                   )""",
-                (query,)
+                f"""SELECT COUNT(*) as count FROM media_assets ma
+                   WHERE {base_where}""",
+                params
             )
             count_row = await count_cursor.fetchone()
             total = count_row["count"] if count_row else 0
-            
+
             return [dict(row) for row in rows], total
     
     async def get_gallery_urls(self, reddit_ids: list[str]) -> dict[str, list[str]]:

@@ -71,7 +71,7 @@ class SlideshowNotifier extends StateNotifier<SlideshowState> {
     state = state.copyWith(currentIndex: index);
   }
 
-  Future<Result<FeedResponse>> _fetchPage({String? cursor, int? page}) async {
+  Future<Result<FeedResponse>> _fetchPage({String? cursor}) async {
     return switch (state.source) {
       SubredditSource(:final subreddit, :final sortMode) =>
         _feedRepository.getFeed(
@@ -92,18 +92,14 @@ class SlideshowNotifier extends StateNotifier<SlideshowState> {
           limit: AppConstants.paginationPageSize,
           after: cursor,
         ),
-      SearchSource(:final query, :final debug) =>
-        debug
-            ? _searchRepository.searchDebug(
-                query: query,
-                limit: AppConstants.paginationPageSize,
-                page: page ?? 1,
-              )
-            : _searchRepository.search(
-                query: query,
-                limit: AppConstants.paginationPageSize,
-                page: page ?? 1,
-              ),
+      SearchSource(:final query, :final mode, :final subreddits) =>
+        _searchRepository.searchReddit(
+          query: query,
+          mode: mode,
+          limit: AppConstants.paginationPageSize,
+          after: cursor,
+          subreddits: subreddits,
+        ),
       GroupSource(:final subreddits) =>
         _feedRepository.getFeed(
           limit: AppConstants.paginationPageSize,
@@ -229,22 +225,20 @@ class SlideshowNotifier extends StateNotifier<SlideshowState> {
       log('[LOAD_MORE] SKIP — isLoadingMore already true');
       return;
     }
+    if (!state.hasMorePages) {
+      log('[LOAD_MORE] SKIP — no more pages');
+      return;
+    }
 
     state = state.copyWith(isLoadingMore: true);
     final beforeCount = state.items.length;
 
-    String? cursor;
-    int? page;
-    if (state.source is SearchSource) {
-      page = (state.items.length ~/ AppConstants.paginationPageSize) + 1;
-    } else {
-      cursor = state.paginationCursor;
-    }
+    final cursor = state.paginationCursor;
 
     log('[LOAD_MORE] beforeCount=$beforeCount '
         'hasMorePages=${state.hasMorePages} '
-        'cursor=$cursor page=$page');
-    final result = await _fetchPage(cursor: cursor, page: page);
+        'cursor=$cursor');
+    final result = await _fetchPage(cursor: cursor);
 
     result.when(
       (data) {

@@ -42,18 +42,34 @@ class GlobalFeedSource extends SlideshowSource {
   int get hashCode => runtimeType.hashCode;
 }
 
+enum SearchMode { local, global }
+
 class SearchSource extends SlideshowSource {
   final String query;
-  final bool debug;
-  const SearchSource({required this.query, this.debug = false});
+  final SearchMode mode;
+  final List<String>? subreddits;
+  final String? mediaType;
+  final String? sort;
+  const SearchSource({
+    required this.query,
+    this.mode = SearchMode.global,
+    this.subreddits,
+    this.mediaType,
+    this.sort,
+  });
 
   @override
   bool operator ==(Object other) =>
       identical(this, other) ||
-      other is SearchSource && query == other.query && debug == other.debug;
+      other is SearchSource &&
+          query == other.query &&
+          mode == other.mode &&
+          const ListEquality().equals(subreddits ?? [], other.subreddits ?? []) &&
+          mediaType == other.mediaType &&
+          sort == other.sort;
 
   @override
-  int get hashCode => Object.hash(query, debug);
+  int get hashCode => Object.hash(query, mode, Object.hashAll(subreddits ?? []), mediaType, sort);
 }
 
 class GroupSource extends SlideshowSource {
