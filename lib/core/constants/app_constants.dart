@@ -14,4 +14,17 @@ class AppConstants {
   static const int maxRetries = 3;
   static const int overlayAutoHideMs = 3000;
   static const int paginationPageSize = 50;
+  static const int mergeEngineBufferSize = 25;
+
+  /// ImageCache configuration
+  static const int imageCacheCapacity = 500;
+  static const int imageCacheSizeMb = 200;
+
+  /// Preload system
+  static const int maxConcurrentPreloads = 3;
+  static const int preloadedUrlSetMaxSize = 500;
+  static const int preloadCheckIntervalMs = 100;
+
+  /// Video pre-initialization window (how many videos ahead to prepare)
+  static const int videoPreloadWindow = 2;
 }

@@ -17,6 +17,7 @@ class MediaAsset {
   final int? height;
   final int? duration;
   final List<String>? galleryUrls;
+  final int? createdUtc;
 
   const MediaAsset({
     required this.id,
@@ -35,6 +36,7 @@ class MediaAsset {
     this.height,
     this.duration,
     this.galleryUrls,
+    this.createdUtc,
   });
 
   MediaAsset copyWith({
@@ -54,6 +56,7 @@ class MediaAsset {
     int? height,
     int? duration,
     List<String>? galleryUrls,
+    int? createdUtc,
   }) {
     return MediaAsset(
       id: id ?? this.id,
@@ -72,6 +75,7 @@ class MediaAsset {
       height: height ?? this.height,
       duration: duration ?? this.duration,
       galleryUrls: galleryUrls ?? this.galleryUrls,
+      createdUtc: createdUtc ?? this.createdUtc,
     );
   }
 
@@ -97,6 +101,7 @@ class MediaAsset {
               (json['gallery_urls'] as List<dynamic>).cast<String>(),
             )
           : null,
+      createdUtc: json['created_utc'] as int?,
     );
   }
 
@@ -117,5 +122,6 @@ class MediaAsset {
         'height': height,
         'duration': duration,
         'gallery_urls': galleryUrls,
+        'created_utc': createdUtc,
       };
 }

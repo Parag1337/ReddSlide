@@ -1,3 +1,4 @@
+import 'dart:collection';
 import 'dart:io';
 import 'dart:async' show unawaited;
 import 'package:flutter/material.dart';
@@ -19,10 +20,39 @@ import '../../feed/domain/media_asset.dart';
 import '../../settings/domain/settings_model.dart';
 import '../../settings/providers/settings_provider.dart';
 import '../domain/slideshow_source.dart';
-import '../domain/slideshow_state.dart';
 import '../providers/slideshow_provider.dart';
 import 'widgets/media_viewer.dart';
 import 'widgets/slideshow_overlay.dart';
+
+final _imageCache = PaintingBinding.instance.imageCache;
+
+class _LruSet {
+  final LinkedHashSet<String> _set = LinkedHashSet<String>();
+  final int maxSize;
+
+  _LruSet({required this.maxSize});
+
+  bool contains(String value) => _set.contains(value);
+
+  void add(String value) {
+    if (_set.length >= maxSize) {
+      _set.remove(_set.first);
+    }
+    _set.add(value);
+  }
+
+  void remove(String value) => _set.remove(value);
+  bool get isNotEmpty => _set.isNotEmpty;
+  int get length => _set.length;
+  void clear() => _set.clear();
+
+  void touch(String value) {
+    if (_set.contains(value)) {
+      _set.remove(value);
+      _set.add(value);
+    }
+  }
+}
 
 class SlideshowScreen extends ConsumerStatefulWidget {
   final SlideshowSource source;
@@ -131,14 +161,6 @@ class _SlideshowScreenState extends ConsumerState<SlideshowScreen> with WidgetsB
     }
   }
 
-  void _logAsset(MediaAsset asset) {
-    debugPrint('[Slideshow] asset id=${asset.id} title="${asset.title}" '
-        'subreddit=${asset.subreddit} '
-        'media_url=${asset.mediaUrl} '
-        'is_video=${asset.isVideo} '
-        'is_gallery=${asset.isGallery}');
-  }
-
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
@@ -155,10 +177,24 @@ class _SlideshowScreenState extends ConsumerState<SlideshowScreen> with WidgetsB
     }
   }
 
+  bool _isInImageCache(String url) {
+    try {
+      final key = CachedNetworkImageProvider(url).cacheKey;
+      if (key == null) return false;
+      return _imageCache.containsKey(key);
+    } catch (_) {
+      return false;
+    }
+  }
+
   void _enqueueUrl(String url, _PreloadPriority priority) {
     if (_preloadedUrls.contains(url)) return;
     if (_activeUrls.contains(url)) return;
     if (_queuedUrls.contains(url)) return;
+    if (_isInImageCache(url)) {
+      _preloadedUrls.add(url);
+      return;
+    }
     _queuedUrls.add(url);
     final task = _PreloadTask(url: url, priority: priority);
     int insertAt = _preloadQueue.length;
@@ -193,11 +229,13 @@ class _SlideshowScreenState extends ConsumerState<SlideshowScreen> with WidgetsB
     debugPrint('[PRELOAD_START] url=$url active=$_inFlightPreloads');
     final sw = Stopwatch()..start();
     try {
+      if (_isInImageCache(url)) {
+        _preloadedUrls.add(url);
+        debugPrint('[PRELOAD_SKIP] url=$url already in ImageCache');
+        return;
+      }
       await precacheImage(CachedNetworkImageProvider(url), context);
       _preloadedUrls.add(url);
-      if (_preloadedUrls.length > AppConstants.maxCacheMemoryItems) {
-        _preloadedUrls.clear();
-      }
       debugPrint('[PRELOAD_DONE] url=$url duration=${sw.elapsedMilliseconds}ms '
           'active=${_inFlightPreloads - 1}');
       _logNextReadyFromUrl(url);
@@ -215,8 +253,8 @@ class _SlideshowScreenState extends ConsumerState<SlideshowScreen> with WidgetsB
     // Session saved to local storage for resume
   }
 
-  static const int _maxConcurrentPreloads = 3;
-  final Set<String> _preloadedUrls = {};
+  static const int _maxConcurrentPreloads = AppConstants.maxConcurrentPreloads;
+  final _LruSet _preloadedUrls = _LruSet(maxSize: AppConstants.preloadedUrlSetMaxSize);
   final Set<String> _activeUrls = {};
   int _inFlightPreloads = 0;
   final List<_PreloadTask> _preloadQueue = [];
@@ -247,7 +285,7 @@ class _SlideshowScreenState extends ConsumerState<SlideshowScreen> with WidgetsB
 
   void _preloadForIndex(List<MediaAsset> items, int currentIndex) {
     if (items.isEmpty) return;
-
+    final preloadSw = Stopwatch()..start();
     final remaining = items.length - currentIndex;
     debugPrint('[PRELOAD_TRIGGER] currentIndex=$currentIndex remaining=$remaining '
         'active=$_inFlightPreloads '
@@ -320,134 +358,100 @@ class _SlideshowScreenState extends ConsumerState<SlideshowScreen> with WidgetsB
 
     _logNextReadyStatus(items, currentIndex);
     _processQueue();
+    debugPrint('[PRELOAD_DISPATCH_DONE] currentIndex=$currentIndex '
+        'scheduling=${preloadSw.elapsedMilliseconds}ms');
   }
 
   @override
   Widget build(BuildContext context) {
-    final state = ref.watch(slideshowProvider(widget.source));
-    final currentAsset = state.items.isNotEmpty && state.currentIndex < state.items.length
-        ? state.items[state.currentIndex]
-        : null;
-    final currentGalleryLength = currentAsset != null && currentAsset.isGallery && currentAsset.galleryUrls != null
-        ? currentAsset.galleryUrls!.length
-        : 0;
+    final buildSw = Stopwatch()..start();
+    final buildTs = DateTime.now().millisecondsSinceEpoch;
 
-    if (state.items.isNotEmpty && _lastPreloadIndex != state.currentIndex) {
-      _lastPreloadIndex = state.currentIndex;
-      _preloadForIndex(state.items, state.currentIndex);
+    // Watch only preload trigger fields
+    final currentIndex = ref.watch(
+      slideshowProvider(widget.source).select((s) => s.items.isNotEmpty ? s.currentIndex : -1),
+    );
+    final isLoading = ref.watch(slideshowProvider(widget.source).select((s) => s.isLoading));
+    final itemsEmpty = ref.watch(slideshowProvider(widget.source).select((s) => s.items.isEmpty));
+
+    if (currentIndex >= 0 && _lastPreloadIndex != currentIndex) {
+      _lastPreloadIndex = currentIndex;
+      final state = ref.read(slideshowProvider(widget.source));
+      _preloadForIndex(state.items, currentIndex);
     }
+
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      final totalBuild = buildSw.elapsedMilliseconds;
+      debugPrint('[WIDGET_BUILD] ts=$buildTs total=${totalBuild}ms');
+    });
 
     return Scaffold(
       backgroundColor: Colors.black,
       body: Stack(
         fit: StackFit.expand,
         children: [
-          // Media content
-          state.isLoading
-              ? const Center(child: CircularProgressIndicator(color: Colors.white))
-              : state.items.isEmpty
-                  ? const Center(
-                      child: EmptyStateWidget(
-                        icon: Icons.image_not_supported,
-                        title: 'No media yet',
-                        subtitle: 'Backend is currently loading content for this subreddit.\nTry refreshing in a few moments.',
-                      ),
-                    )
-                  : PageView.builder(
-                  controller: _pageController,
-                  itemCount: state.items.length,
-                  scrollDirection: Axis.horizontal,
-                  onPageChanged: (index) {
-                    debugPrint('[Slideshow] onPageChanged index=$index');
-                    ref.read(slideshowProvider(widget.source).notifier).jumpTo(index);
-                  },
-                  itemBuilder: (context, index) {
-                    if (index >= state.items.length) return const SizedBox();
-                    final asset = state.items[index];
-                    if (index == state.currentIndex) {
-                      _logAsset(asset);
-                    }
-                    return GestureDetector(
-                      onTapUp: (details) {
-                        final width = MediaQuery.of(context).size.width;
-                        if (details.localPosition.dx < width * 0.3) {
-                          ref.read(slideshowProvider(widget.source).notifier).galleryPrevious();
-                        } else if (details.localPosition.dx > width * 0.7) {
-                          ref.read(slideshowProvider(widget.source).notifier).galleryNext();
-                        } else {
-                          ref.read(slideshowProvider(widget.source).notifier).toggleOverlay();
-                        }
-                      },
-                      child: MediaViewer(
-                        key: ValueKey('${asset.id}_${state.gallerySubIndex}'),
-                        asset: asset,
-                        isMuted: state.isMuted,
-                        galleryIndex: state.gallerySubIndex,
-                        onMediaError: (errorType) => _onMediaError(errorType),
-                      ),
-                    );
-                  },
-                ),
-
-          // Loading more indicator
-          if (state.isLoadingMore)
-            Positioned(
-              top: 60,
-              left: 0,
-              right: 0,
-              child: Center(
-                child: Container(
-                  padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-                  decoration: BoxDecoration(
-                    color: Colors.black54,
-                    borderRadius: BorderRadius.circular(20),
-                  ),
-                  child: Row(
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      SizedBox(
-                        width: 16,
-                        height: 16,
-                        child: CircularProgressIndicator(
-                          strokeWidth: 2,
-                          color: Theme.of(context).colorScheme.primary,
-                        ),
-                      ),
-                      const SizedBox(width: 8),
-                      const Text('Loading more...', style: TextStyle(color: Colors.white, fontSize: 12)),
-                    ],
-                  ),
-                ),
-              ),
-            ),
-
-          // Overlay
-          SlideshowOverlay(
-            currentAsset: currentAsset,
-            currentIndex: state.currentIndex,
-            totalItems: state.items.length,
-            galleryIndex: state.gallerySubIndex,
-            galleryLength: currentGalleryLength,
-            isPlaying: state.isPlaying,
-            isMuted: state.isMuted,
-            isFullscreen: state.isFullscreen,
-            visible: state.overlayVisible,
+          // Media content (isolated rebuild via Consumer)
+          _SlideshowPageContent(
             source: widget.source,
-            onBack: () => context.pop(),
-            onPrevious: () => ref.read(slideshowProvider(widget.source).notifier).galleryPrevious(),
-            onPlayPause: () => ref.read(slideshowProvider(widget.source).notifier).togglePlay(),
-            onNext: () => ref.read(slideshowProvider(widget.source).notifier).galleryNext(),
-            onToggleMute: () => ref.read(slideshowProvider(widget.source).notifier).toggleMute(),
-            onToggleFullscreen: () => _toggleFullscreen(state),
-            onDownload: () => _downloadMedia(currentAsset),
-            onShare: () => _shareMedia(currentAsset),
-            onOpenReddit: () => _openOnReddit(currentAsset),
-            onChipTap: (index) => ref.read(slideshowProvider(widget.source).notifier).jumpTo(index),
+            pageController: _pageController,
+            onPageChanged: (index) {
+              debugPrint('[Slideshow] onPageChanged index=$index');
+              ref.read(slideshowProvider(widget.source).notifier).jumpTo(index);
+            },
+            isLoading: isLoading,
+            itemsEmpty: itemsEmpty,
+            onMediaError: _onMediaError,
+          ),
+
+          // Loading more indicator (isolated rebuild)
+          Consumer(
+            builder: (context, ref, _) {
+              final isLoadingMore = ref.watch(
+                slideshowProvider(widget.source).select((s) => s.isLoadingMore),
+              );
+              if (!isLoadingMore) return const SizedBox.shrink();
+              return Positioned(
+                top: 60,
+                left: 0,
+                right: 0,
+                child: Center(
+                  child: Container(
+                    padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+                    decoration: BoxDecoration(
+                      color: Colors.black54,
+                      borderRadius: BorderRadius.circular(20),
+                    ),
+                    child: Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        SizedBox(
+                          width: 16,
+                          height: 16,
+                          child: CircularProgressIndicator(
+                            strokeWidth: 2,
+                            color: Theme.of(context).colorScheme.primary,
+                          ),
+                        ),
+                        const SizedBox(width: 8),
+                        const Text('Loading more...', style: TextStyle(color: Colors.white, fontSize: 12)),
+                      ],
+                    ),
+                  ),
+                ),
+              );
+            },
+          ),
+
+          // Overlay (isolated rebuild)
+          _SlideshowOverlayContent(
+            source: widget.source,
+            pageController: _pageController,
           ),
         ],
       ),
     );
   }
+
 
   void _onMediaError(MediaErrorType errorType) {
     final state = ref.read(slideshowProvider(widget.source));
@@ -476,56 +480,171 @@ class _SlideshowScreenState extends ConsumerState<SlideshowScreen> with WidgetsB
     }
   }
 
-  void _toggleFullscreen(SlideshowState state) {
-    ref.read(slideshowProvider(widget.source).notifier).toggleFullscreen();
-    if (!state.isFullscreen) {
-      SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
-      SystemChrome.setSystemUIOverlayStyle(const SystemUiOverlayStyle(
-        statusBarColor: Colors.transparent,
-        systemNavigationBarColor: Colors.black,
-        statusBarIconBrightness: Brightness.light,
-      ));
-    } else {
-      SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
-      SystemChrome.setSystemUIOverlayStyle(SystemUiOverlayStyle(
-        statusBarColor: Colors.transparent,
-        systemNavigationBarColor: Colors.black,
-        statusBarIconBrightness: Brightness.light,
-      ));
-    }
-  }
+}
 
-  void _downloadMedia(MediaAsset? asset) async {
-    if (asset == null) return;
-    try {
-      final url = UrlSanitizer.sanitize(
-        asset.isVideo ? (asset.videoUrl ?? asset.mediaUrl) : asset.mediaUrl,
+class _SlideshowPageContent extends ConsumerWidget {
+  final SlideshowSource source;
+  final PageController pageController;
+  final ValueChanged<int> onPageChanged;
+  final bool isLoading;
+  final bool itemsEmpty;
+  final void Function(MediaErrorType) onMediaError;
+
+  const _SlideshowPageContent({
+    required this.source,
+    required this.pageController,
+    required this.onPageChanged,
+    required this.isLoading,
+    required this.itemsEmpty,
+    required this.onMediaError,
+  });
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    if (isLoading) {
+      return const Center(child: CircularProgressIndicator(color: Colors.white));
+    }
+    if (itemsEmpty) {
+      return const Center(
+        child: EmptyStateWidget(
+          icon: Icons.image_not_supported,
+          title: 'No media yet',
+          subtitle: 'Backend is currently loading content for this subreddit.\nTry refreshing in a few moments.',
+        ),
       );
-      final dir = await getTemporaryDirectory();
-      final ext = asset.isVideo ? '.mp4' : '.jpg';
-      final file = File('${dir.path}/${asset.id}$ext');
-      final dio = Dio();
-      await dio.download(url, file.path);
-      if (mounted) {
-        context.showSnackBar('Download completed');
-      }
-    } catch (e) {
-      if (mounted) {
-        context.showSnackBar('Download failed: $e', isError: true);
-      }
+    }
+
+    final items = ref.watch(slideshowProvider(source).select((s) => s.items));
+    final currentIndex = ref.watch(slideshowProvider(source).select((s) => s.currentIndex));
+    final gallerySubIndex = ref.watch(slideshowProvider(source).select((s) => s.gallerySubIndex));
+    final isMuted = ref.watch(slideshowProvider(source).select((s) => s.isMuted));
+
+    return PageView.builder(
+      controller: pageController,
+      itemCount: items.length,
+      scrollDirection: Axis.horizontal,
+      onPageChanged: onPageChanged,
+      itemBuilder: (context, index) {
+        if (index >= items.length) return const SizedBox();
+        final asset = items[index];
+        return GestureDetector(
+          onTapUp: (details) {
+            final width = MediaQuery.of(context).size.width;
+            if (details.localPosition.dx < width * 0.3) {
+              ref.read(slideshowProvider(source).notifier).galleryPrevious();
+            } else if (details.localPosition.dx > width * 0.7) {
+              ref.read(slideshowProvider(source).notifier).galleryNext();
+            } else {
+              ref.read(slideshowProvider(source).notifier).toggleOverlay();
+            }
+          },
+          child: MediaViewer(
+            asset: asset,
+            isMuted: isMuted,
+            galleryIndex: index == currentIndex ? gallerySubIndex : 0,
+            onMediaError: onMediaError,
+          ),
+        );
+      },
+    );
+  }
+}
+
+class _SlideshowOverlayContent extends ConsumerWidget {
+  final SlideshowSource source;
+  final PageController pageController;
+
+  const _SlideshowOverlayContent({
+    required this.source,
+    required this.pageController,
+  });
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final state = ref.watch(slideshowProvider(source));
+    final currentAsset = state.items.isNotEmpty && state.currentIndex < state.items.length
+        ? state.items[state.currentIndex]
+        : null;
+    final currentGalleryLength = currentAsset != null && currentAsset.isGallery && currentAsset.galleryUrls != null
+        ? currentAsset.galleryUrls!.length
+        : 0;
+
+    return SlideshowOverlay(
+      currentAsset: currentAsset,
+      currentIndex: state.currentIndex,
+      totalItems: state.items.length,
+      galleryIndex: state.gallerySubIndex,
+      galleryLength: currentGalleryLength,
+      isPlaying: state.isPlaying,
+      isMuted: state.isMuted,
+      isFullscreen: state.isFullscreen,
+      visible: state.overlayVisible,
+      source: source,
+      onBack: () => context.pop(),
+      onPrevious: () => ref.read(slideshowProvider(source).notifier).galleryPrevious(),
+      onPlayPause: () => ref.read(slideshowProvider(source).notifier).togglePlay(),
+      onNext: () => ref.read(slideshowProvider(source).notifier).galleryNext(),
+      onToggleMute: () => ref.read(slideshowProvider(source).notifier).toggleMute(),
+      onToggleFullscreen: () {
+        ref.read(slideshowProvider(source).notifier).toggleFullscreen();
+        _applyFullscreenMode(!state.isFullscreen);
+      },
+      onDownload: () => _downloadMedia(context, currentAsset),
+      onShare: () => _shareMedia(currentAsset),
+      onOpenReddit: () => _openOnReddit(currentAsset),
+      onChipTap: (index) => ref.read(slideshowProvider(source).notifier).jumpTo(index),
+    );
+  }
+}
+
+void _applyFullscreenMode(bool fullscreen) {
+  if (fullscreen) {
+    SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
+    SystemChrome.setSystemUIOverlayStyle(const SystemUiOverlayStyle(
+      statusBarColor: Colors.transparent,
+      systemNavigationBarColor: Colors.black,
+      statusBarIconBrightness: Brightness.light,
+    ));
+  } else {
+    SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
+    SystemChrome.setSystemUIOverlayStyle(SystemUiOverlayStyle(
+      statusBarColor: Colors.transparent,
+      systemNavigationBarColor: Colors.black,
+      statusBarIconBrightness: Brightness.light,
+    ));
+  }
+}
+
+Future<void> _downloadMedia(BuildContext context, MediaAsset? asset) async {
+  if (asset == null) return;
+  try {
+    final url = UrlSanitizer.sanitize(
+      asset.isVideo ? (asset.videoUrl ?? asset.mediaUrl) : asset.mediaUrl,
+    );
+    final dir = await getTemporaryDirectory();
+    final ext = asset.isVideo ? '.mp4' : '.jpg';
+    final file = File('${dir.path}/${asset.id}$ext');
+    final dio = Dio();
+    await dio.download(url, file.path);
+    if (context.mounted) {
+      context.showSnackBar('Download completed');
+    }
+  } catch (e) {
+    if (context.mounted) {
+      context.showSnackBar('Download failed: $e', isError: true);
     }
   }
+}
 
-  void _shareMedia(MediaAsset? asset) {
-    if (asset == null) return;
-    Share.share(UrlSanitizer.sanitize(asset.mediaUrl));
-  }
+void _shareMedia(MediaAsset? asset) {
+  if (asset == null) return;
+  Share.share(UrlSanitizer.sanitize(asset.mediaUrl));
+}
 
-  void _openOnReddit(MediaAsset? asset) async {
-    if (asset == null) return;
-    final url = 'https://reddit.com/r/${asset.subreddit}/comments/${asset.id}';
-    if (await canLaunchUrl(Uri.parse(url))) {
-      await launchUrl(Uri.parse(url));
-    }
+void _openOnReddit(MediaAsset? asset) async {
+  if (asset == null) return;
+  final url = 'https://reddit.com/r/${asset.subreddit}/comments/${asset.id}';
+  if (await canLaunchUrl(Uri.parse(url))) {
+    await launchUrl(Uri.parse(url));
   }
 }

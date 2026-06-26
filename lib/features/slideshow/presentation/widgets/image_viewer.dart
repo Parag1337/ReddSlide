@@ -19,8 +19,15 @@ class ImageViewer extends StatefulWidget {
 class _ImageViewerState extends State<ImageViewer> {
   final TransformationController _transformController = TransformationController();
   bool _zoomed = false;
-  int _buildFrame = 0;
-  int _frameCount = 0;
+  int? _widgetCreatedTs;
+  int? _imageReadyTs;
+  bool _loggedFirstBuild = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _widgetCreatedTs = DateTime.now().millisecondsSinceEpoch;
+  }
 
   @override
   void didUpdateWidget(ImageViewer oldWidget) {
@@ -28,7 +35,8 @@ class _ImageViewerState extends State<ImageViewer> {
     if (oldWidget.imageUrl != widget.imageUrl) {
       _zoomed = false;
       _transformController.value = Matrix4.identity();
-      _buildFrame = 0;
+      _imageReadyTs = null;
+      _widgetCreatedTs = DateTime.now().millisecondsSinceEpoch;
     }
   }
 
@@ -40,50 +48,58 @@ class _ImageViewerState extends State<ImageViewer> {
 
   @override
   Widget build(BuildContext context) {
-    if (_buildFrame == 0) _buildFrame = ++_frameCount;
-    final currentFrame = _frameCount;
-    return CachedNetworkImage(
-      imageUrl: widget.imageUrl,
-      imageBuilder: (context, imageProvider) {
-        final framesSinceBuild = currentFrame - _buildFrame + 1;
-        final isCacheHit = framesSinceBuild <= 1;
-        debugPrint('[IMAGE_READY] url=${widget.imageUrl} framesSinceBuild=$framesSinceBuild');
-        debugPrint('[CACHE_HIT] url=${widget.imageUrl} hit=$isCacheHit frames=$framesSinceBuild');
-        WidgetsBinding.instance.addPostFrameCallback((_) {
-          debugPrint('[IMAGE_VISIBLE] url=${widget.imageUrl}');
-        });
-        debugPrint('[SLIDE_DONE] url=${widget.imageUrl} source=FlutterImageCache');
-        return GestureDetector(
-          onDoubleTap: _handleDoubleTap,
-          child: InteractiveViewer(
-            transformationController: _transformController,
-            minScale: 1.0,
-            maxScale: 4.0,
-            boundaryMargin: const EdgeInsets.all(20),
-            child: Image(
-              image: imageProvider,
-              fit: BoxFit.contain,
-              gaplessPlayback: true,
-            ),
-          ),
-        );
-      },
-      placeholder: (context, url) {
-        debugPrint('[IMG_LOADING] url=$url source=placeholder');
-        return Container(
-          color: Colors.black,
-          alignment: Alignment.center,
-          child: const CircularProgressIndicator(strokeWidth: 3),
-        );
-      },
-      errorWidget: (context, url, error) {
-        final errorType = _classifyError(error);
-        debugPrint('[IMG_FAILED] url=$url errorType=${errorType.label}');
-        WidgetsBinding.instance.addPostFrameCallback((_) {
-          widget.onError?.call(errorType);
-        });
-        return const SizedBox.shrink();
-      },
+    final buildTs = DateTime.now().millisecondsSinceEpoch;
+    if (!_loggedFirstBuild && _widgetCreatedTs != null) {
+      _loggedFirstBuild = true;
+      final elapsed = buildTs - _widgetCreatedTs!;
+      debugPrint('[IMG_WIDGET_CREATED] url=${widget.imageUrl} '
+          'firstBuildElapsed=${elapsed}ms');
+    }
+    return GestureDetector(
+      onDoubleTap: _handleDoubleTap,
+      child: InteractiveViewer(
+        transformationController: _transformController,
+        minScale: 1.0,
+        maxScale: 4.0,
+        boundaryMargin: const EdgeInsets.all(20),
+        child: Image(
+          image: CachedNetworkImageProvider(widget.imageUrl),
+          fit: BoxFit.contain,
+          gaplessPlayback: true,
+          errorBuilder: (context, error, stackTrace) {
+            final errorType = _classifyError(error);
+            debugPrint('[IMG_FAILED] url=${widget.imageUrl} errorType=${errorType.label}');
+            WidgetsBinding.instance.addPostFrameCallback((_) {
+              widget.onError?.call(errorType);
+            });
+            return const SizedBox.shrink();
+          },
+          frameBuilder: (context, child, frame, wasSynchronouslyLoaded) {
+            if (wasSynchronouslyLoaded) {
+              debugPrint('[IMAGE_SYNC] url=${widget.imageUrl}');
+            }
+            if (frame == 0 && !wasSynchronouslyLoaded) {
+              debugPrint('[IMG_LOADING] url=${widget.imageUrl} source=frameBuilder');
+            }
+            if (frame != null && _imageReadyTs == null) {
+              final now = DateTime.now().millisecondsSinceEpoch;
+              final elapsedFromWidgetCreate = _widgetCreatedTs != null ? now - _widgetCreatedTs! : -1;
+              final elapsedFromBuild = now - buildTs;
+              _imageReadyTs = now;
+              debugPrint('[IMAGE_READY] url=${widget.imageUrl} '
+                  'widgetToReady=${elapsedFromWidgetCreate}ms '
+                  'buildToReady=${elapsedFromBuild}ms '
+                  'wasSynchronous=$wasSynchronouslyLoaded');
+              WidgetsBinding.instance.addPostFrameCallback((_) {
+                final visibleTs = DateTime.now().millisecondsSinceEpoch;
+                debugPrint('[IMAGE_VISIBLE] url=${widget.imageUrl} readyToVisible=${visibleTs - now}ms');
+              });
+              debugPrint('[SLIDE_DONE] url=${widget.imageUrl} source=CachedNetworkImageProvider');
+            }
+            return child;
+          },
+        ),
+      ),
     );
   }
 

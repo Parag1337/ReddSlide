@@ -24,7 +24,7 @@ class QueueManager:
         self._initialized = True
     
     async def count_queue_items(self) -> int:
-        """Count items in queue."""
+        """DEPRECATED: No longer used by slideshow. Will be removed in future."""
         async with get_db() as db:
             cursor = await db.execute("SELECT COUNT(*) as count FROM media_queue")
             row = await cursor.fetchone()
@@ -104,7 +104,7 @@ class QueueManager:
         return (row["max_pos"] or 0) + 1
     
     async def get_queue_items(self, limit: int = 20, offset: int = 0, subreddits: Optional[list[str]] = None) -> tuple[list[dict], bool]:
-        """Get items from queue, optionally filtered by subreddits. Returns (items, has_more)."""
+        """DEPRECATED: No longer used by slideshow. Will be removed in future."""
         async with get_db() as db:
             if subreddits:
                 placeholders = ",".join("?" * len(subreddits))
@@ -147,13 +147,14 @@ class QueueManager:
     
     async def get_subreddit_assets(
         self,
-        subreddit: str,
+        subreddit: Optional[str] = None,
         limit: int = 50,
         after_cursor: Optional[str] = None,
     ) -> tuple[list[dict], Optional[str], bool]:
-        """Get assets for a single subreddit directly from media_assets.
+        """Get assets directly from media_assets.
 
         Cursor-based pagination on (created_utc DESC, reddit_id DESC).
+        If subreddit is None, returns assets from all subreddits.
         Cursor format: \"created_utc,reddit_id\" (opaque string for frontend).
         Returns (items, next_cursor, has_more).
         """
@@ -168,27 +169,29 @@ class QueueManager:
                 except (ValueError, IndexError):
                     pass
 
-            if cursor_created_utc is not None and cursor_reddit_id is not None:
-                cursor = await db.execute(
-                    """SELECT ma.* FROM media_assets ma
-                       WHERE ma.subreddit = ?
-                         AND (
-                           ma.created_utc < ?
-                           OR (ma.created_utc = ? AND ma.reddit_id < ?)
-                         )
-                       ORDER BY ma.created_utc DESC, ma.reddit_id DESC
-                       LIMIT ?""",
-                    (subreddit, cursor_created_utc, cursor_created_utc, cursor_reddit_id, limit + 1),
-                )
-            else:
-                cursor = await db.execute(
-                    """SELECT ma.* FROM media_assets ma
-                       WHERE ma.subreddit = ?
-                       ORDER BY ma.created_utc DESC, ma.reddit_id DESC
-                       LIMIT ?""",
-                    (subreddit, limit + 1),
-                )
+            where_clauses: list[str] = []
+            params: list = []
 
+            if subreddit:
+                where_clauses.append("ma.subreddit = ?")
+                params.append(subreddit)
+
+            if cursor_created_utc is not None and cursor_reddit_id is not None:
+                where_clauses.append(
+                    "(ma.created_utc < ? OR (ma.created_utc = ? AND ma.reddit_id < ?))"
+                )
+                params.extend([cursor_created_utc, cursor_created_utc, cursor_reddit_id])
+
+            where = " WHERE " + " AND ".join(where_clauses) if where_clauses else ""
+            query = (
+                f"SELECT ma.* FROM media_assets ma"
+                f"{where}"
+                f" ORDER BY ma.created_utc DESC, ma.reddit_id DESC"
+                f" LIMIT ?"
+            )
+            params.append(limit + 1)
+
+            cursor = await db.execute(query, tuple(params))
             rows = await cursor.fetchall()
             items = [dict(row) for row in rows[:limit]]
             has_more = len(rows) > limit
@@ -217,23 +220,15 @@ class QueueManager:
             await db.commit()
     
     async def manage_queue(self) -> None:
-        """Ensure queue stays in optimal range."""
-        current = await self.count_queue_items()
-        
-        if current < QUEUE_EMERGENCY:
-            await self._refill_queue(200)
-        elif current < QUEUE_REFILL:
-            await self._refill_queue(100)
-        elif current > QUEUE_MAX:
-            await self._trim_queue(QUEUE_MAX)
+        """DEPRECATED: No longer used by slideshow. Will be removed in future."""
+        pass
     
     async def _refill_queue(self, count: int) -> None:
-        """Refill queue with media."""
-        # This would be called by background service with RedditClient
+        """DEPRECATED: No longer used by slideshow. Will be removed in future."""
         pass
     
     async def _trim_queue(self, max_size: int) -> None:
-        """Trim queue to max size."""
+        """DEPRECATED: No longer used by slideshow. Will be removed in future."""
         async with get_db() as db:
             await db.execute(
                 """DELETE FROM media_queue WHERE id IN (

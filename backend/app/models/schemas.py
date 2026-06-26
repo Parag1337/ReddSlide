@@ -46,6 +46,7 @@ class MediaAssetResponse(BaseModel):
     width: Optional[int] = None
     height: Optional[int] = None
     duration: Optional[int] = None
+    created_utc: Optional[int] = None
     gallery_urls: Optional[list[str]] = None
 
 

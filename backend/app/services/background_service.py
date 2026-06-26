@@ -105,8 +105,6 @@ class BackgroundRefreshService:
         Picks the subreddit with the lowest count.
         """
         try:
-            await self.queue_manager.manage_queue()
-
             needs_refill = await self._get_subreddits_needing_refill()
 
             if not needs_refill:

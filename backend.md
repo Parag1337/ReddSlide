@@ -105,24 +105,25 @@
 backend/
 ├── main.py                          # Server entry point (uvicorn)
 ├── app/
-│   ├── __init__.py                  # Empty
+│   ├── __init__.py                  # Empty (0 lines)
 │   ├── main.py                      # FastAPI app + lifespan (DB init, OAuth, background svc)
 │   ├── core/
-│   │   └── database.py              # SQLite schema, migrations, connection helper
+│   │   ├── database.py              # SQLite schema, migrations, connection helper
+│   │   └── (no __init__.py)         # Core is a namespace package
 │   ├── models/
 │   │   └── schemas.py               # Pydantic models (MediaAsset, response schemas, OAuthToken)
 │   ├── managers/
-│   │   ├── __init__.py
+│   │   ├── __init__.py              # Re-exports OAuthManager, ProviderManager
 │   │   ├── oauth.py                 # OAuthManager — token lifecycle
 │   │   └── provider.py              # ProviderManager — circuit breaker failover
 │   ├── services/
-│   │   ├── __init__.py
+│   │   ├── __init__.py              # Re-exports RedditClient, QueueManager
 │   │   ├── queue_manager.py         # QueueManager — queue CRUD, search, subreddit config, cursors
 │   │   ├── reddit_client.py         # RedditClient — fetch/parse media from Reddit API
 │   │   └── background_service.py    # BackgroundRefreshService — APScheduler jobs
 │   └── api/
 │       ├── __init__.py              # Imports feed, debug, search routers
-│       ├── feed.py                  # /api/feed*, /api/search*, /api/media*, /api/subreddits*
+│       ├── feed.py                  # /api/feed*, /api/media*, /api/subreddits*, /api/search, /api/search/debug
 │       ├── search.py                # /api/search/reddit (direct Reddit search)
 │       └── debug.py                 # /api/health, /api/debug/*
 ├── data/
@@ -184,7 +185,7 @@ The server starts via `backend/main.py`, which runs `uvicorn` on `app.main:app`.
 
 | Method | Endpoint | Description | Query Params |
 |--------|----------|-------------|--------------|
-| GET | `/api/feed` | Paginated media feed | `limit` (max 100), `after` (offset), `subreddits` (comma-sep), `sort` |
+| GET | `/api/feed` | Paginated media feed | `limit` (max 100), `after` (offset/cursor), `subreddits` (comma-sep), `sort` |
 | GET | `/api/feed/queue` | Queue status | `limit` |
 | GET | `/api/search` | FTS5 full-text search | `q` (required), `limit`, `page`, `subreddits`, `media_type`, `sort` |
 | GET | `/api/search/debug` | LIKE-based search fallback | `q` (required) |
@@ -200,6 +201,31 @@ The server starts via `backend/main.py`, which runs `uvicorn` on `app.main:app`.
 ### Detailed Endpoint Logic
 
 #### GET /api/feed
+
+The feed endpoint has two internal code paths controlled by the `SLIDESHOW_SOURCE` environment variable:
+
+**Path A: `SLIDESHOW_SOURCE=assets` (default) — Cursor-based on media_assets**
+Used when a single subreddit is requested. Paginates directly on the `media_assets` table using a composite cursor of `(created_utc DESC, reddit_id DESC)` via `QueueManager.get_subreddit_assets()`. This bypasses `media_queue` entirely.
+
+```
+1. Parse query params (limit, after/cursor, subreddits, sort)
+2. If single subreddit requested:
+   → Call get_subreddit_assets(subreddit, limit, after_cursor)
+     → SELECT from media_assets WHERE subreddit=?
+       ORDER BY created_utc DESC, reddit_id DESC LIMIT ?+1
+     → Cursor format: "created_utc,reddit_id"
+     → Returns (items, has_more, new_cursor)
+3. If no items AND first page:
+   → Synchronous on-demand fetch via ensure_subreddit_has_content()
+4. If items < limit:
+   → Fire async background refill for the subreddit
+   → Return has_more=True so frontend keeps polling
+5. Enrich items with gallery URLs via get_gallery_urls()
+6. Return FeedResponse(items, after=cursor, has_more)
+```
+
+**Path B: `SLIDESHOW_SOURCE=queue` — Offset-based on media_queue**
+Used when multiple subreddits are requested, no subreddits specified, or the env var is set to `"queue"`. Paginates on `media_queue` joined with `media_assets` using LIMIT/OFFSET.
 
 ```
 1. Parse query params (limit, after/offset, subreddits, sort)
@@ -334,6 +360,7 @@ The central service for queue and subreddit management.
 | Method | Purpose |
 |--------|---------|
 | `get_queue_items(limit, offset, subreddits)` | Fetch queue with optional subreddit filter. Returns `(items, has_more)` |
+| `get_subreddit_assets(subreddit, limit, after_cursor)` | Cursor-based pagination on `media_assets` by `(created_utc DESC, reddit_id DESC)` for single subreddit. Used when `SLIDESHOW_SOURCE=assets` (default). Returns `(items, has_more, new_cursor)` with cursor format `"created_utc,reddit_id"` |
 | `add_to_queue(asset)` | Insert asset into `media_assets` + `media_queue` + `gallery_items`. Dedup by `reddit_post_id` |
 | `remove_from_queue(reddit_post_id)` | Delete from queue |
 | `clear_queue()` | Truncate queue |
@@ -442,9 +469,10 @@ searching each subreddit separately and deduplicating the merged results.
 | Maximum | 100 |
 
 #### Search-specific validation (`_validate_search_asset`):
-- Reject if `width < 400` or `height < 300`
+- Reject deleted/removed posts (checking title and author)
 - Reject if `"thumbnail"` is in any URL path
-- Reject if `quality_score < 30`
+- Reject if `width < 400` or `height < 300`
+- Reject gallery posts missing gallery items
 
 ### BackgroundRefreshService (`app/services/background_service.py`)
 
@@ -462,6 +490,8 @@ Runs on APScheduler with two periodic jobs:
 ### OAuthManager (`app/managers/oauth.py`)
 
 Manages Reddit OAuth token lifecycle.
+
+**Note on instance sharing:** The `OAuthManager` instance created during startup in `app/main.py` is not shared with API routers. Each endpoint that needs OAuth (e.g., `/api/search/reddit` in `search.py`, `QueueManager.fetch_and_store()` in `feed.py`) creates its own fresh `OAuthManager` and `ProviderManager` instances, loading the token from the database again. This means the startup initialization is effectively redundant for API requests.
 
 **Token acquisition flow:**
 1. On `initialize()`: Load token from `oauth_tokens` table
@@ -642,6 +672,12 @@ JOIN media_queue mq ON ma.reddit_id = mq.reddit_post_id
 ORDER BY mq.position ASC
 LIMIT ? OFFSET ?;
 
+-- Get subreddit assets (cursor-based, used when SLIDESHOW_SOURCE=assets)
+SELECT ma.* FROM media_assets ma
+WHERE ma.subreddit = ?
+ORDER BY ma.created_utc DESC, ma.reddit_id DESC
+LIMIT ?;
+
 -- FTS5 search with filters
 SELECT ma.* FROM media_assets ma
 WHERE ma.reddit_id IN (
@@ -780,7 +816,10 @@ HomeScreen loads
           └── ApiClient.get("/api/feed?limit=50")
               │
               └── Backend: get_feed()
-                  ├── QueueManager.get_queue_items(50, 0)
+                  ├── Single subreddit: QueueManager.get_subreddit_assets()
+                  │   (cursor-based on media_assets, SLIDESHOW_SOURCE=assets default)
+                  ├── Multiple/no subreddits: QueueManager.get_queue_items()
+                  │   (offset-based on media_queue)
                   ├── If empty → trigger on-demand fetch
                   └── Return FeedResponse
 ```
@@ -851,7 +890,10 @@ REDDIT_CLIENT_ID=your_client_id
 REDDIT_CLIENT_SECRET=your_client_secret
 REDDIT_USER_AGENT=RedSlide/1.0 by u/your_username
 DATABASE_PATH=./data/redslide.db
+SLIDESHOW_SOURCE=assets  # "assets" (default): cursor-based on media_assets table; "queue": offset-based on media_queue
 ```
+
+**Note:** `praw` (Reddit Python wrapper) is listed in `requirements.txt` but is **not used** anywhere in the codebase. All Reddit API calls use raw `httpx` requests.
 
 ### Reddit OAuth Setup
 1. Go to https://www.reddit.com/prefs/apps
@@ -937,3 +979,6 @@ if added == 0 and new_cursor is None:
 8. **OAuth token has no public setup endpoint** — must be configured via `.env` before first startup
 9. **Local search budget is 1.5× global budget** — `_search_local_multi` uses `SEARCH_TIME_BUDGET_SECONDS × 1.5` to accommodate N subreddits, which may still time out if many subreddits are selected
 10. **`_search_local_multi` ignores incoming `after` cursor** — each call starts fresh; cursor is always returned as `None`, preventing incremental pagination for local search
+11. **OAuth initialized twice on startup** — both `app/main.py` lifespan and `BackgroundRefreshService.start()` call `OAuthManager.initialize()` on separate instances
+12. **Global instances not shared with routers** — the `oauth_manager` and `background_service` globals in `app/main.py` are never passed to API endpoints; each request creates fresh `OAuthManager` instances
+13. **`praw` dependency unused** — `praw>=7.8.0` is in `requirements.txt` but no code imports it

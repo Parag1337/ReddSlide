@@ -374,18 +374,20 @@ Manages search query, results, pagination, filters, and recent queries. Exposes:
 - `toggleSubreddit()` / `setSelectedSubreddits()` — Filter subreddits
 - `setMediaType()` / `setSort()` — Filter/sort controls
 - `syncSelectedSubreddits()` — Keep subreddit selection in sync with settings
-- `clearResults()` / `clearHistory()` / `removeRecentQuery()` — State management
+- `clearResults()` / `clearHistory()` / `removeRecentQuery()` / `resetFilters()` — State management
 
 ### SlideshowNotifier
 
 **Type:** `StateNotifier<SlideshowState>` (family by `SlideshowSource`)
 
 The most complex notifier. Manages:
+- `initialize()` — Entry point that calls `_loadInitialItems()` and starts auto-advance
+- `setStartIndex(int index)` — Jump to a specific start index after initial load
 - `_loadInitialItems()` — Fetches first page from the appropriate source
 - `next()` / `previous()` / `jumpTo()` — Navigation with auto-advance restart
 - `galleryNext()` / `galleryPrevious()` — Gallery sub-item navigation (advances to next asset at gallery end)
-- `togglePlay()` / `toggleMute()` / `toggleFullscreen()` / `toggleOverlay()` — UI state
-- `loadMore()` — Pagination with retry logic (up to 3 retries with exponential backoff)
+- `togglePlay()` / `toggleMute()` / `toggleFullscreen()` / `toggleOverlay()` / `showOverlay()` — UI state
+- `loadMore()` — Pagination with retry logic (up to 3 retries with exponential backoff, `retryCount * 2` seconds delay)
 - `_checkPreload()` — Triggers `loadMore()` when remaining items hits `preloadTriggerRemaining` (30)
 - `_startAutoAdvance()` / `_restartAutoAdvance()` / `_cancelAutoAdvance()` — Auto-play timer
 - `_startOverlayTimer()` / `_cancelOverlayTimer()` — Auto-hide overlay in fullscreen (3 seconds)
@@ -401,6 +403,8 @@ The most complex notifier. Manages:
 **Path:** `lib/core/network/api_client.dart`
 
 A thin wrapper around **Dio** that provides `get<T>()` and `post<T>()` methods. Key characteristics:
+
+> **Architecture note:** While `apiClientProvider` (a Riverpod family provider keyed by base URL) is the canonical way to obtain an `ApiClient`, several parts of the codebase create raw `ApiClient` instances directly: `app.dart._syncSubreddits()`, `settings_provider.dart._syncSubredditsToBackend()`, and `settings_screen.dart._validateUrl()`. This bypasses the dependency injection pattern.
 
 - **Configuration:** 10s connect timeout, 30s receive timeout, JSON content type
 - **Debug logging:** LogInterceptor enabled in debug mode only
@@ -472,8 +476,8 @@ Each feature has a repository that:
 
 | Method | Endpoint | Params | Return |
 |---|---|---|---|
-| `searchReddit()` | `GET /api/search/reddit` | `q`, `mode`, `limit`, `after`, `subreddits` | `Result<FeedResponse>` |
-| `search()` | `GET /api/search` | `q`, `limit`, `page`, `subreddits`, `mediaType`, `sort` | `Result<FeedResponse>` |
+| `searchReddit()` | `GET /api/search/reddit` | `query` (Dart param, sent as `q`), `mode`, `limit`, `after`, `subreddits` | `Result<FeedResponse>` |
+| `search()` | `GET /api/search` | `query` (Dart param, sent as `q`), `limit`, `page`, `subreddits`, `mediaType`, `sort` | `Result<FeedResponse>` |
 | `searchDebug()` | `GET /api/search/debug` | `q`, `limit`, `page` | `Result<FeedResponse>` |
 
 #### SettingsRepository
@@ -560,7 +564,9 @@ The main hub displays:
 - **Multi-select mode**: Long-press to enter, tap to toggle selection
 - **FAB**: "Start All" (no selection) or "N selected" (multi-select) → push `/slideshow` with `MultiSubredditSource`
 - Empty states for: no backend URL configured, no subreddits added
-- Placeholder queue status chip and health indicator in app bar
+- **`_QueueStatusChip`** — Placeholder/debug queue size indicator in app bar
+- **`_HealthIndicator`** — Placeholder/debug backend health dot in app bar
+- **`resumeSessionProvider`** — Stub `Provider.family<ResumeSession?, String>` returning `null`. `ResumeSession` class with `source`, `index`, `isPlaying` fields for future session resume feature
 
 #### SubredditScreen (`/subreddit/:name`)
 
@@ -605,6 +611,8 @@ class SearchState {
 
 ### SearchMode Enum
 
+**Defined in:** `lib/features/slideshow/domain/slideshow_source.dart` (cross-feature dependency — shared between search and slideshow)
+
 | Value | Meaning |
 |---|---|
 | `local` | Search within selected subreddits (sends `subreddits` param) |
@@ -620,7 +628,7 @@ Initial state (no query):
 - Recent search history chips (in-memory, max 8)
 
 Results state:
-- Results header with count and "Start Slideshow" button
+- Results header with `totalResults` count and "Start Slideshow" button
 - Filter icon button (opens `SearchFilterSheet` bottom sheet)
 - Scrollable grid of `SearchResultCard` with infinite scroll at 80% threshold
 - Subreddit filter syncs with settings on each search
@@ -693,22 +701,25 @@ The slideshow is a fullscreen page with a fade transition:
 
 **Auto-advance**: Timer advances to next item (or gallery sub-item) after configurable interval (default 5 seconds). Resets on any navigation.
 
-**Preloading (3-tier system):**
-| Tier | Items | What's Preloaded |
-|---|---|---|
-| Tier 0 | Current | Image + video URLs |
-| Tier 1 | Next 10 | Images only |
-| Tier 2 | Next 20 (after tier 1) | Images only |
-| History | Last 5 | Images only |
+**Preloading (5-tier priority queue system):**
+Preloading is managed via a priority queue (`_preloadQueue`) with concurrent download limit of 3.
 
-Preloaded URLs are tracked in a `_preloadedUrls` Set (max 500 entries). Preloading uses `CachedNetworkImageProvider.precacheImage()`.
+| Priority | Items | What's Preloaded |
+|---|---|---|
+| `urgent` | Current + immediate next | Image + video URLs |
+| `high` | Next 2-4 | Images only |
+| `medium` | Next 5-10 | Images only |
+| `low` | Next 11-30 | Images only |
+| `background` | Last 5 (history) | Images only |
+
+URLs are enqueued with a priority level and processed by `_processQueue()`. Preloaded URLs are tracked in a `_preloadedUrls` Set (max 500 entries). Active downloads are tracked in `_activeUrls` to prevent duplicate fetches. The concurrent limit (`_maxConcurrentPreloads = 3`) controls how many images are fetched simultaneously. Preloading uses `CachedNetworkImageProvider.precacheImage()`.
 
 **Gallery support:** Multi-image Reddit galleries tracked via `gallerySubIndex`. Gallery navigation stays within the current asset until all images are viewed, then advances to the next asset.
 
 **Error handling:** Media load errors are logged with structured info (`MediaErrorType`) and the slideshow advances to the next item. Video initialization has retry logic.
 
 **Actions:**
-- **Download**: Saves to temp directory via Dio → `path_provider` (stub, logs instead)
+- **Download**: Downloads to temp directory via `Dio().download()` and shows a snackbar on completion. No user-visible file location or download progress indicator.
 - **Share**: Via `share_plus`
 - **Open on Reddit**: Via `url_launcher`
 
@@ -750,7 +761,7 @@ Organized into sections:
 | **Content** | Subreddit management (bottom sheet with add/remove), NSFW toggle, default sort mode dropdown |
 | **Slideshow** | Interval selector radio dialog (3s / 5s / 10s / 15s / 30s) |
 | **Display** | Theme mode segmented button (System / Light / Dark) |
-| **Cache** | Clear session cache button (dialog, currently a stub) |
+| **Cache** | Clear session cache button (dialog, currently a stub; uses private `_SectionHeader` widget for section titles) |
 | **About** | App version (1.0.0+1), backend version from health check |
 
 **Subreddit management:** A bottom sheet displays the current list with delete buttons. A text field at the top allows adding new subreddits. Each change syncs to the backend via `POST /api/subreddits/sync`.
@@ -833,6 +844,7 @@ class GroupModel {
 | `subredditsFetch` | `/api/subreddits/fetch` | Fetch subreddits (unused) |
 | `defaultLimit` | 20 | Default page size |
 | `maxLimit` | 100 | Maximum page size |
+| `searchDefaultLimit` | 20 | Default page size for search |
 | `connectTimeoutMs` | 10000 | Connection timeout |
 | `receiveTimeoutMs` | 30000 | Receive timeout |
 
@@ -1105,15 +1117,15 @@ loadMore() called
 1. **No automated tests** — Only a single smoke test that checks `RedSlideApp` renders
 2. **No internationalization** — `lib/l10n/` is empty, all strings hardcoded in English
 3. **Groups feature** — Only a placeholder screen, `GroupModel` unused, `GroupSource` never instantiated
-4. **Session resume** — `resumeSessionProvider` is a stub; slideshow session state is not saved across app restarts
+4. **Session resume** — `resumeSessionProvider` (defined in `home_screen.dart`) is a stub returning `null`; slideshow session state is not saved across app restarts
 5. **Cache clearing** — Clear cache button triggers a dialog but is a no-op
-6. **Download** — Download saves to temp directory via `path_provider` (no user-visible file, no progress indicator)
+6. **Download** — Downloads to temp directory via `Dio().download()`. No user-visible file location, no progress indicator, and files are in a temp directory that may be cleaned up by the OS.
 7. **Permissions** — `permission_handler` is declared as dependency but never used
 8. **Code generation** — `freezed` and `json_serializable` annotations are present in `pubspec.yaml` models are hand-written with `copyWith`/`toJson`/`fromJson` instead of using generated code
 9. **FTS5 search endpoint** — The app calls `/api/search/reddit` (a Reddit proxy endpoint) instead of the backend's own FTS5 `/api/search` in most paths
 10. **Queue status chip** — The queue indicator in the app bar is a placeholder/debug display, not a polished UI element
 11. **Search history** — Recent queries are tracked in-memory only (not persisted) and reset on app restart
-12. **Backend URL validation** — `validateBackendUrl()` only checks for empty string, does not make an actual HTTP call in `SettingsNotifier`; the actual validation happens in `SettingsScreen` via `FeedRepository.getHealth()`
+12. **Backend URL validation** — `SettingsNotifier.validateBackendUrl()` only checks for empty string (no HTTP call). In `SettingsScreen._validateUrl()`, a **raw `ApiClient`** is created directly (not via `FeedRepository`) to make a `GET /api/health` call. This bypasses the `apiClientProvider` dependency injection pattern.
 13. **Local search loadMore** — Local mode search returns `after=None` (cursorless), so infinite scroll pagination in the search results grid does not work for local searches; only global mode supports cursor-based `loadMore`
 
 ### Backend Referenced

@@ -1,14 +1,9 @@
 import asyncio
-import os
 from fastapi import APIRouter, Depends, HTTPException, Query
 from typing import Optional
 from ..models.schemas import FeedResponse, QueueResponse, SearchResponse, MediaAssetResponse
 from ..services.queue_manager import QueueManager
 from ..core.database import get_db
-
-# Rollback gate: set SLIDESHOW_SOURCE=queue to revert to queue-based slideshow.
-# When "assets" (default), single-subreddit requests query media_assets directly.
-SLIDESHOW_SOURCE = os.getenv("SLIDESHOW_SOURCE", "assets")
 
 router = APIRouter()
 
@@ -46,6 +41,7 @@ async def _enrich_with_gallery_urls(
             width=item.get("width"),
             height=item.get("height"),
             duration=item.get("duration"),
+            created_utc=item.get("created_utc"),
             gallery_urls=gallery_urls,
         ))
     return result
@@ -58,19 +54,6 @@ def _parse_subreddits(subreddits: Optional[str]) -> Optional[list[str]]:
     return [s.strip().lower() for s in subreddits.split(",") if s.strip()]
 
 
-async def _ensure_subreddits_have_content(
-    subreddit_list: Optional[list[str]],
-    queue_manager: QueueManager,
-    sort: str = "hot",
-) -> None:
-    """Trigger on-demand fetch for any subreddit that has no content yet."""
-    if not subreddit_list:
-        return
-    for subreddit in subreddit_list:
-        if await queue_manager.count_subreddit_items(subreddit) == 0:
-            asyncio.create_task(queue_manager.ensure_subreddit_has_content(subreddit, sort=sort))
-
-
 @router.get("/feed", response_model=FeedResponse)
 async def get_feed(
     limit: int = Query(default=50, le=100),
@@ -79,76 +62,48 @@ async def get_feed(
     sort: str = Query(default="hot"),
     queue_manager: QueueManager = Depends(get_queue_manager)
 ):
-    """Get media feed.
+    """Get media feed from media_assets.
 
-    - Single subreddit (SLIDESHOW_SOURCE=assets, default):
-      Cursor-based pagination on media_assets directly.
-    - Multiple subreddits or SLIDESHOW_SOURCE=queue:
-      Offset-based pagination on media_queue (original behavior).
-    - No subreddits (global home feed):
-      Offset-based pagination on media_queue.
+    Single subreddit: cursor-based pagination on media_assets.
+    Multiple subreddits: rejected — use Flutter Merge Engine.
+    No subreddits: returns all assets ordered by created_utc DESC.
     """
     subreddit_list = _parse_subreddits(subreddits)
 
-    # Direct media_assets path: single subreddit, rollback flag not set
-    if subreddit_list and len(subreddit_list) == 1 and SLIDESHOW_SOURCE != "queue":
-        sub = subreddit_list[0]
-        items, next_cursor, has_more = await queue_manager.get_subreddit_assets(
-            subreddit=sub,
-            limit=limit,
-            after_cursor=after if after and "," in after else None,
-        )
-        enriched_items = await _enrich_with_gallery_urls(items, queue_manager)
-        print(
-            f"[API] direct_assets subreddit={sub} limit={limit} "
-            f"returned={len(items)} hasMore={has_more} after={next_cursor} cursor={after}"
-        )
-        return FeedResponse(
-            items=enriched_items,
-            after=next_cursor,
-            has_more=has_more,
+    # Multi-subreddit is handled by Flutter Merge Engine
+    if subreddit_list and len(subreddit_list) > 1:
+        raise HTTPException(
+            status_code=400,
+            detail="Multi subreddit handled by Flutter Merge Engine.",
         )
 
-    # Queue-based path: global feed or multi-subreddit feed or rollback
-    offset = int(after) if after and after.isdigit() else 0
+    single_sub = subreddit_list[0] if subreddit_list else None
 
-    items, has_more = await queue_manager.get_queue_items(
-        limit=limit, offset=offset, subreddits=subreddit_list
+    items, next_cursor, has_more = await queue_manager.get_subreddit_assets(
+        subreddit=single_sub,
+        limit=limit,
+        after_cursor=after if after and "," in after else None,
     )
 
-    # If no items exist for requested subreddits on first page, fetch on-demand synchronously
-    if not items and subreddit_list and offset == 0:
-        print(f"[API] sync_fetch_trigger subreddits={subreddit_list}")
-        for subreddit in subreddit_list:
-            await queue_manager.ensure_subreddit_has_content(subreddit, sort=sort)
-        # Re-query after fetch
-        items, has_more = await queue_manager.get_queue_items(
-            limit=limit, offset=offset, subreddits=subreddit_list
+    # If no items exist on first page, trigger on-demand fetch from Reddit
+    if not items and single_sub and not after:
+        print(f"[API] sync_fetch_trigger subreddit={single_sub}")
+        await queue_manager.ensure_subreddit_has_content(single_sub, sort=sort)
+        items, next_cursor, has_more = await queue_manager.get_subreddit_assets(
+            subreddit=single_sub,
+            limit=limit,
+            after_cursor=None,
         )
 
-    # For subreddit-scoped feeds, trigger async refill when queue runs low
-    if subreddit_list:
-        if not items or len(items) < limit:
-            print(f"[API] async_bg_refill_trigger subreddit={subreddit_list[0]} "
-                  f"items={len(items)} limit={limit}")
-            asyncio.create_task(
-                queue_manager.ensure_subreddit_has_content(subreddit_list[0], sort=sort)
-            )
-        if not items:
-            has_more = False
-
-    next_after = str(offset + len(items)) if has_more else None
     enriched_items = await _enrich_with_gallery_urls(items, queue_manager)
     print(
-        f"[API] offset={offset} limit={limit} "
-        f"returned={len(items)} hasMore={has_more} "
-        f"subreddits={subreddits} after={next_after} "
-        f"cursor={after}"
+        f"[API] subreddit={single_sub} limit={limit} "
+        f"returned={len(items)} hasMore={has_more} after={next_cursor} cursor={after}"
     )
     return FeedResponse(
         items=enriched_items,
-        after=next_after,
-        has_more=has_more
+        after=next_cursor,
+        has_more=has_more,
     )
 
 
