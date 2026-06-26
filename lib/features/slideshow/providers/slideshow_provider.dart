@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:developer';
+import 'package:flutter/foundation.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../../../core/network/result.dart';
 import '../../../core/constants/app_constants.dart';
@@ -112,10 +113,17 @@ class SlideshowNotifier extends StateNotifier<SlideshowState> {
   Future<void> next() async {
     if (state.items.isEmpty) return;
     final nextIndex = state.currentIndex + 1;
+    final asset = nextIndex < state.items.length ? state.items[nextIndex] : null;
+    final url = asset != null
+        ? (asset.isGallery && asset.galleryUrls != null && asset.galleryUrls!.isNotEmpty
+              ? asset.galleryUrls![0]
+              : asset.mediaUrl)
+        : 'none';
     log('[SLIDESHOW] currentIndex=${state.currentIndex} '
         'totalItems=${state.items.length} '
         'remaining=${state.items.length - state.currentIndex - 1} '
         'galleryIndex=${state.gallerySubIndex}');
+    debugPrint('[SLIDE_START] index=$nextIndex url=$url');
 
     if (nextIndex >= state.items.length) {
       log('[SLIDESHOW] currentIndex=${state.currentIndex} '
@@ -137,7 +145,15 @@ class SlideshowNotifier extends StateNotifier<SlideshowState> {
 
   Future<void> previous() async {
     if (state.currentIndex <= 0) return;
-    state = state.copyWith(currentIndex: state.currentIndex - 1, gallerySubIndex: 0);
+    final prevIndex = state.currentIndex - 1;
+    final asset = prevIndex < state.items.length ? state.items[prevIndex] : null;
+    final url = asset != null
+        ? (asset.isGallery && asset.galleryUrls != null && asset.galleryUrls!.isNotEmpty
+              ? asset.galleryUrls![0]
+              : asset.mediaUrl)
+        : 'none';
+    debugPrint('[SLIDE_START] index=$prevIndex url=$url direction=previous');
+    state = state.copyWith(currentIndex: prevIndex, gallerySubIndex: 0);
     _restartAutoAdvance();
     _checkPreload();
   }
@@ -191,6 +207,25 @@ class SlideshowNotifier extends StateNotifier<SlideshowState> {
   void galleryNext() {
     if (state.items.isEmpty) return;
     final asset = state.items[state.currentIndex];
+    final nextGalleryIndex = state.gallerySubIndex + 1;
+    final maxGalleryIndex = (asset.isGallery && asset.galleryUrls != null && asset.galleryUrls!.isNotEmpty)
+        ? asset.galleryUrls!.length - 1
+        : 0;
+    final willAdvanceItem = !asset.isGallery || asset.galleryUrls == null ||
+        asset.galleryUrls!.isEmpty || state.gallerySubIndex >= maxGalleryIndex;
+    final targetIndex = willAdvanceItem ? state.currentIndex + 1 : state.currentIndex;
+    final targetUrl = willAdvanceItem
+        ? (targetIndex < state.items.length
+            ? (state.items[targetIndex].isGallery && state.items[targetIndex].galleryUrls != null
+                ? state.items[targetIndex].galleryUrls!.first
+                : state.items[targetIndex].mediaUrl)
+            : 'none')
+        : (asset.galleryUrls![nextGalleryIndex.clamp(0, maxGalleryIndex)]);
+    debugPrint('[NEXT_PRESSED] action=galleryNext '
+        'currentIndex=${state.currentIndex} '
+        'gallerySubIndex=${state.gallerySubIndex} '
+        'targetIndex=$targetIndex '
+        'targetUrl=$targetUrl');
     log('[UI] galleryNext action=galleryAdvance '
         'currentIndex=${state.currentIndex} '
         'totalItems=${state.items.length} '
@@ -210,6 +245,22 @@ class SlideshowNotifier extends StateNotifier<SlideshowState> {
   void galleryPrevious() {
     if (state.items.isEmpty) return;
     final asset = state.items[state.currentIndex];
+    final prevGalleryIndex = state.gallerySubIndex - 1;
+    final willAdvanceItem = !asset.isGallery || asset.galleryUrls == null ||
+        asset.galleryUrls!.isEmpty || state.gallerySubIndex <= 0;
+    final targetIndex = willAdvanceItem ? state.currentIndex - 1 : state.currentIndex;
+    final targetUrl = willAdvanceItem
+        ? (targetIndex >= 0
+            ? (state.items[targetIndex].isGallery && state.items[targetIndex].galleryUrls != null
+                ? state.items[targetIndex].galleryUrls!.last
+                : state.items[targetIndex].mediaUrl)
+            : 'none')
+        : (asset.galleryUrls![prevGalleryIndex.clamp(0, asset.galleryUrls!.length - 1)]);
+    debugPrint('[NEXT_PRESSED] action=galleryPrevious '
+        'currentIndex=${state.currentIndex} '
+        'gallerySubIndex=${state.gallerySubIndex} '
+        'targetIndex=$targetIndex '
+        'targetUrl=$targetUrl');
     if (asset.isGallery && asset.galleryUrls != null && asset.galleryUrls!.isNotEmpty) {
       if (state.gallerySubIndex > 0) {
         state = state.copyWith(gallerySubIndex: state.gallerySubIndex - 1);
@@ -250,7 +301,7 @@ class SlideshowNotifier extends StateNotifier<SlideshowState> {
         state = state.copyWith(
           items: [...state.items, ...data.items],
           isLoadingMore: false,
-          hasMorePages: newCount > 0 ? data.hasMore : state.hasMorePages,
+          hasMorePages: newCount > 0 && data.hasMore,
           paginationCursor: data.after,
         );
       },
@@ -269,10 +320,13 @@ class SlideshowNotifier extends StateNotifier<SlideshowState> {
 
   void _checkPreload() {
     final remaining = state.items.length - state.currentIndex;
-    log('[PRELOAD] currentIndex=${state.currentIndex} '
+    final willLoad = remaining <= AppConstants.preloadTriggerRemaining && !state.isLoadingMore;
+    debugPrint('[PRELOAD_TRIGGER] currentIndex=${state.currentIndex} '
         'totalItems=${state.items.length} '
-        'remaining=$remaining');
-    if (remaining <= AppConstants.preloadTriggerRemaining && !state.isLoadingMore) {
+        'remaining=$remaining '
+        'threshold=${AppConstants.preloadTriggerRemaining} '
+        'willLoad=$willLoad');
+    if (willLoad) {
       loadMore();
     }
   }

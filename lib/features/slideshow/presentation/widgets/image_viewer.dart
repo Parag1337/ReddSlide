@@ -1,7 +1,6 @@
-import 'dart:typed_data';
+import 'package:cached_network_image/cached_network_image.dart';
 import 'package:flutter/material.dart';
 import '../../../../core/media/media_error.dart';
-import '../../../../core/media/image_loader.dart';
 
 class ImageViewer extends StatefulWidget {
   final String imageUrl;
@@ -20,44 +19,16 @@ class ImageViewer extends StatefulWidget {
 class _ImageViewerState extends State<ImageViewer> {
   final TransformationController _transformController = TransformationController();
   bool _zoomed = false;
-  bool _loading = true;
-  List<int>? _imageBytes;
-
-  @override
-  void initState() {
-    super.initState();
-    _loadImage();
-  }
+  int _buildFrame = 0;
+  int _frameCount = 0;
 
   @override
   void didUpdateWidget(ImageViewer oldWidget) {
     super.didUpdateWidget(oldWidget);
     if (oldWidget.imageUrl != widget.imageUrl) {
-      _reset();
-      _loadImage();
-    }
-  }
-
-  void _reset() {
-    _loading = true;
-    _imageBytes = null;
-  }
-
-  Future<void> _loadImage() async {
-    final result = await loadImageWithRetry(widget.imageUrl);
-    if (!mounted) return;
-
-    if (result.isSuccess) {
-      setState(() {
-        _imageBytes = result.bytes;
-        _loading = false;
-      });
-    } else {
-      final errorType = result.errorType ?? MediaErrorType.unknown;
-      setState(() => _loading = false);
-      WidgetsBinding.instance.addPostFrameCallback((_) {
-        widget.onError?.call(errorType);
-      });
+      _zoomed = false;
+      _transformController.value = Matrix4.identity();
+      _buildFrame = 0;
     }
   }
 
@@ -69,28 +40,51 @@ class _ImageViewerState extends State<ImageViewer> {
 
   @override
   Widget build(BuildContext context) {
-    if (_loading) {
-      return const Center(child: CircularProgressIndicator(strokeWidth: 2));
-    }
-
-    if (_imageBytes != null) {
-      return GestureDetector(
-        onDoubleTap: _handleDoubleTap,
-        child: InteractiveViewer(
-          transformationController: _transformController,
-          minScale: 1.0,
-          maxScale: 4.0,
-          boundaryMargin: const EdgeInsets.all(20),
-          child: Image.memory(
-            Uint8List.fromList(_imageBytes!),
-            fit: BoxFit.contain,
-            gaplessPlayback: true,
+    if (_buildFrame == 0) _buildFrame = ++_frameCount;
+    final currentFrame = _frameCount;
+    return CachedNetworkImage(
+      imageUrl: widget.imageUrl,
+      imageBuilder: (context, imageProvider) {
+        final framesSinceBuild = currentFrame - _buildFrame + 1;
+        final isCacheHit = framesSinceBuild <= 1;
+        debugPrint('[IMAGE_READY] url=${widget.imageUrl} framesSinceBuild=$framesSinceBuild');
+        debugPrint('[CACHE_HIT] url=${widget.imageUrl} hit=$isCacheHit frames=$framesSinceBuild');
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          debugPrint('[IMAGE_VISIBLE] url=${widget.imageUrl}');
+        });
+        debugPrint('[SLIDE_DONE] url=${widget.imageUrl} source=FlutterImageCache');
+        return GestureDetector(
+          onDoubleTap: _handleDoubleTap,
+          child: InteractiveViewer(
+            transformationController: _transformController,
+            minScale: 1.0,
+            maxScale: 4.0,
+            boundaryMargin: const EdgeInsets.all(20),
+            child: Image(
+              image: imageProvider,
+              fit: BoxFit.contain,
+              gaplessPlayback: true,
+            ),
           ),
-        ),
-      );
-    }
-
-    return const SizedBox.shrink();
+        );
+      },
+      placeholder: (context, url) {
+        debugPrint('[IMG_LOADING] url=$url source=placeholder');
+        return Container(
+          color: Colors.black,
+          alignment: Alignment.center,
+          child: const CircularProgressIndicator(strokeWidth: 3),
+        );
+      },
+      errorWidget: (context, url, error) {
+        final errorType = _classifyError(error);
+        debugPrint('[IMG_FAILED] url=$url errorType=${errorType.label}');
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          widget.onError?.call(errorType);
+        });
+        return const SizedBox.shrink();
+      },
+    );
   }
 
   void _handleDoubleTap() {
@@ -103,5 +97,19 @@ class _ImageViewerState extends State<ImageViewer> {
       _transformController.value = position;
       _zoomed = true;
     }
+  }
+
+  static MediaErrorType _classifyError(Object error) {
+    try {
+      final statusCode = (error as dynamic).statusCode;
+      if (statusCode == 404) return MediaErrorType.http404;
+      if (statusCode == 410) return MediaErrorType.http410;
+    } catch (_) {}
+    final msg = error.toString().toLowerCase();
+    if (msg.contains('404') || msg.contains('not found')) return MediaErrorType.http404;
+    if (msg.contains('410') || msg.contains('gone')) return MediaErrorType.http410;
+    if (msg.contains('timeout') || msg.contains('timed out')) return MediaErrorType.timeout;
+    if (msg.contains('socket') || msg.contains('connection')) return MediaErrorType.socketError;
+    return MediaErrorType.unknown;
   }
 }

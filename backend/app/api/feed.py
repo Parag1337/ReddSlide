@@ -1,9 +1,14 @@
 import asyncio
+import os
 from fastapi import APIRouter, Depends, HTTPException, Query
 from typing import Optional
 from ..models.schemas import FeedResponse, QueueResponse, SearchResponse, MediaAssetResponse
 from ..services.queue_manager import QueueManager
 from ..core.database import get_db
+
+# Rollback gate: set SLIDESHOW_SOURCE=queue to revert to queue-based slideshow.
+# When "assets" (default), single-subreddit requests query media_assets directly.
+SLIDESHOW_SOURCE = os.getenv("SLIDESHOW_SOURCE", "assets")
 
 router = APIRouter()
 
@@ -74,12 +79,37 @@ async def get_feed(
     sort: str = Query(default="hot"),
     queue_manager: QueueManager = Depends(get_queue_manager)
 ):
-    """Get media feed with offset-based pagination.
+    """Get media feed.
 
-    If a subreddit has no items in the queue, triggers an on-demand fetch
-    so content becomes available on subsequent requests.
+    - Single subreddit (SLIDESHOW_SOURCE=assets, default):
+      Cursor-based pagination on media_assets directly.
+    - Multiple subreddits or SLIDESHOW_SOURCE=queue:
+      Offset-based pagination on media_queue (original behavior).
+    - No subreddits (global home feed):
+      Offset-based pagination on media_queue.
     """
     subreddit_list = _parse_subreddits(subreddits)
+
+    # Direct media_assets path: single subreddit, rollback flag not set
+    if subreddit_list and len(subreddit_list) == 1 and SLIDESHOW_SOURCE != "queue":
+        sub = subreddit_list[0]
+        items, next_cursor, has_more = await queue_manager.get_subreddit_assets(
+            subreddit=sub,
+            limit=limit,
+            after_cursor=after if after and "," in after else None,
+        )
+        enriched_items = await _enrich_with_gallery_urls(items, queue_manager)
+        print(
+            f"[API] direct_assets subreddit={sub} limit={limit} "
+            f"returned={len(items)} hasMore={has_more} after={next_cursor} cursor={after}"
+        )
+        return FeedResponse(
+            items=enriched_items,
+            after=next_cursor,
+            has_more=has_more,
+        )
+
+    # Queue-based path: global feed or multi-subreddit feed or rollback
     offset = int(after) if after and after.isdigit() else 0
 
     items, has_more = await queue_manager.get_queue_items(
@@ -96,19 +126,16 @@ async def get_feed(
             limit=limit, offset=offset, subreddits=subreddit_list
         )
 
-    # For subreddit-scoped feeds, there is always more content available
-    # from Reddit. When the queue runs low (fewer items than the page
-    # limit), trigger an async background refill so subsequent requests
-    # find new items.  Always return has_more=True so the frontend keeps
-    # polling until refill completes.
+    # For subreddit-scoped feeds, trigger async refill when queue runs low
     if subreddit_list:
-        has_more = True
         if not items or len(items) < limit:
             print(f"[API] async_bg_refill_trigger subreddit={subreddit_list[0]} "
                   f"items={len(items)} limit={limit}")
             asyncio.create_task(
                 queue_manager.ensure_subreddit_has_content(subreddit_list[0], sort=sort)
             )
+        if not items:
+            has_more = False
 
     next_after = str(offset + len(items)) if has_more else None
     enriched_items = await _enrich_with_gallery_urls(items, queue_manager)

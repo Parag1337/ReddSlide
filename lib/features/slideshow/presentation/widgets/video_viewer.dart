@@ -48,17 +48,32 @@ class _VideoViewerState extends State<VideoViewer> {
   }
 
   Future<void> _initController() async {
+    debugPrint('[VIDEO_ENTER] url=${widget.videoUrl}');
+    final createSw = Stopwatch()..start();
     _controller = VideoPlayerController.networkUrl(Uri.parse(widget.videoUrl));
+    final createMs = createSw.elapsedMilliseconds;
+    debugPrint('[VIDEO_CONTROLLER_CREATE] url=${widget.videoUrl} elapsed=${createMs}ms');
+
+    final initSw = Stopwatch()..start();
+    debugPrint('[VIDEO_INITIALIZE_START] url=${widget.videoUrl}');
     try {
       await _controller!.initialize();
+      final initMs = initSw.elapsedMilliseconds;
+      debugPrint('[VIDEO_INITIALIZE_DONE] url=${widget.videoUrl} elapsed=${initMs}ms');
+
       await _controller!.setVolume(widget.muted ? 0 : 1);
       await _controller!.setLooping(true);
+
       await _controller!.play();
+      final totalMs = createMs + initMs;
+      debugPrint('[VIDEO_PLAY] url=${widget.videoUrl} '
+          'create=${createMs}ms init=${initMs}ms total=${totalMs}ms');
       if (mounted) {
         setState(() => _initialized = true);
       }
     } catch (e) {
-      debugPrint('[VideoViewer] Failed to initialize video: url=${widget.videoUrl} error=$e');
+      final initMs = initSw.elapsedMilliseconds;
+      debugPrint('[VIDEO_INITIALIZE_FAILED] url=${widget.videoUrl} elapsed=${initMs}ms error=$e');
       if (_retryCount < 1) {
         _retryCount++;
         _controller?.dispose();

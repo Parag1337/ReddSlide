@@ -34,6 +34,14 @@ class SlideshowScreen extends ConsumerStatefulWidget {
   ConsumerState<SlideshowScreen> createState() => _SlideshowScreenState();
 }
 
+enum _PreloadPriority { urgent, high, medium, low, background }
+
+class _PreloadTask {
+  final String url;
+  final _PreloadPriority priority;
+  const _PreloadTask({required this.url, required this.priority});
+}
+
 class _SlideshowScreenState extends ConsumerState<SlideshowScreen> with WidgetsBindingObserver {
   late final PageController _pageController;
   int _lastPreloadIndex = -1;
@@ -95,12 +103,30 @@ class _SlideshowScreenState extends ConsumerState<SlideshowScreen> with WidgetsB
     debugPrint('[Slideshow] source=$desc');
   }
 
-  void _preloadCurrentItem(List<MediaAsset> items, int currentIndex) {
-    if (currentIndex >= items.length) return;
-    final asset = items[currentIndex];
-    for (final url in _allAssetUrls(asset, includeVideo: true)) {
-      if (_markPreloaded(url)) {
-        unawaited(_safePrecache(url));
+  void _logNextReadyFromUrl(String url) {
+    try {
+      final st = ref.read(slideshowProvider(widget.source));
+      for (int i = 1; i <= 3 && st.currentIndex + i < st.items.length; i++) {
+        final asset = st.items[st.currentIndex + i];
+        final urls = _imageUrls(asset);
+        if (urls.contains(url)) {
+          final allCached = urls.every((u) => _preloadedUrls.contains(u));
+          debugPrint('[NEXT_READY] index=${st.currentIndex + i} url=$url '
+              'cached=$allCached');
+          return;
+        }
+      }
+    } catch (_) {}
+  }
+
+  void _logNextReadyStatus(List<MediaAsset> items, int currentIndex) {
+    for (int i = 1; i <= 5 && currentIndex + i < items.length; i++) {
+      final asset = items[currentIndex + i];
+      final urls = _imageUrls(asset);
+      final allCached = urls.every((url) => _preloadedUrls.contains(url));
+      if (allCached) {
+        debugPrint('[NEXT_READY] index=${currentIndex + i} cached=true '
+            'url=${urls.isNotEmpty ? urls.first : "none"}');
       }
     }
   }
@@ -129,11 +155,59 @@ class _SlideshowScreenState extends ConsumerState<SlideshowScreen> with WidgetsB
     }
   }
 
-  Future<void> _safePrecache(String url) async {
+  void _enqueueUrl(String url, _PreloadPriority priority) {
+    if (_preloadedUrls.contains(url)) return;
+    if (_activeUrls.contains(url)) return;
+    if (_queuedUrls.contains(url)) return;
+    _queuedUrls.add(url);
+    final task = _PreloadTask(url: url, priority: priority);
+    int insertAt = _preloadQueue.length;
+    for (int i = 0; i < _preloadQueue.length; i++) {
+      if (_preloadQueue[i].priority.index > priority.index) {
+        insertAt = i;
+        break;
+      }
+    }
+    _preloadQueue.insert(insertAt, task);
+  }
+
+  void _processQueue() {
+    while (_inFlightPreloads < _maxConcurrentPreloads && _preloadQueue.isNotEmpty) {
+      final task = _preloadQueue.removeAt(0);
+      _queuedUrls.remove(task.url);
+      _activeUrls.add(task.url);
+      _inFlightPreloads++;
+      unawaited(_executePreload(task.url));
+    }
+    debugPrint('[PRELOAD_STATS] queued=${_queuedUrls.length} '
+        'active=$_inFlightPreloads completed=${_preloadedUrls.length}');
+  }
+
+  void _logImageCacheStats() {
+    final cache = PaintingBinding.instance.imageCache;
+    debugPrint('[IMAGE_CACHE] entries=${cache.currentSize} '
+        'sizeKB=${cache.currentSizeBytes ~/ 1024}');
+  }
+
+  Future<void> _executePreload(String url) async {
+    debugPrint('[PRELOAD_START] url=$url active=$_inFlightPreloads');
+    final sw = Stopwatch()..start();
     try {
       await precacheImage(CachedNetworkImageProvider(url), context);
+      _preloadedUrls.add(url);
+      if (_preloadedUrls.length > AppConstants.maxCacheMemoryItems) {
+        _preloadedUrls.clear();
+      }
+      debugPrint('[PRELOAD_DONE] url=$url duration=${sw.elapsedMilliseconds}ms '
+          'active=${_inFlightPreloads - 1}');
+      _logNextReadyFromUrl(url);
+      _logImageCacheStats();
     } catch (e) {
-      debugPrint('[Preload] skipped broken url=$url error=$e');
+      debugPrint('[PRELOAD_FAILED] url=$url duration=${sw.elapsedMilliseconds}ms error=$e');
+    } finally {
+      _activeUrls.remove(url);
+      _inFlightPreloads--;
+      _processQueue();
     }
   }
 
@@ -141,14 +215,12 @@ class _SlideshowScreenState extends ConsumerState<SlideshowScreen> with WidgetsB
     // Session saved to local storage for resume
   }
 
+  static const int _maxConcurrentPreloads = 3;
   final Set<String> _preloadedUrls = {};
-
-  bool _markPreloaded(String url) {
-    if (_preloadedUrls.contains(url)) return false;
-    _preloadedUrls.add(url);
-    if (_preloadedUrls.length > AppConstants.maxCacheMemoryItems) _preloadedUrls.clear();
-    return true;
-  }
+  final Set<String> _activeUrls = {};
+  int _inFlightPreloads = 0;
+  final List<_PreloadTask> _preloadQueue = [];
+  final Set<String> _queuedUrls = {};
 
   List<String> _allAssetUrls(MediaAsset asset, {bool includeVideo = false}) {
     final urls = <String>[
@@ -176,43 +248,78 @@ class _SlideshowScreenState extends ConsumerState<SlideshowScreen> with WidgetsB
   void _preloadForIndex(List<MediaAsset> items, int currentIndex) {
     if (items.isEmpty) return;
 
+    final remaining = items.length - currentIndex;
+    debugPrint('[PRELOAD_TRIGGER] currentIndex=$currentIndex remaining=$remaining '
+        'active=$_inFlightPreloads '
+        'queued=${_preloadQueue.length} '
+        'completed=${_preloadedUrls.length}');
+
+    // Priority 1: current item + immediate next (urgent)
     final current = items[currentIndex];
     for (final url in _allAssetUrls(current, includeVideo: true)) {
-      if (_markPreloaded(url)) {
-        unawaited(_safePrecache(url));
+      _enqueueUrl(url, _PreloadPriority.urgent);
+    }
+    if (currentIndex + 1 < items.length) {
+      final asset = items[currentIndex + 1];
+      for (final url in _imageUrls(asset)) {
+        _enqueueUrl(url, _PreloadPriority.urgent);
       }
     }
 
-    final tier1End = currentIndex + AppConstants.tier1PreloadCount;
-    for (int i = currentIndex + 1; i <= tier1End && i < items.length; i++) {
+    // Priority 2: currentIndex + 2 through +4 (high)
+    int highCount = 0;
+    for (int i = currentIndex + 2; i <= currentIndex + 4 && i < items.length; i++) {
       final asset = items[i];
       for (final url in _imageUrls(asset)) {
-        if (_markPreloaded(url)) {
-          unawaited(_safePrecache(url));
-        }
+        _enqueueUrl(url, _PreloadPriority.high);
+        highCount++;
       }
     }
 
-    final tier2Start = currentIndex + AppConstants.tier1PreloadCount + 1;
-    final tier2End = currentIndex + AppConstants.tier1PreloadCount + AppConstants.tier2PreloadCount;
-    for (int i = tier2Start; i <= tier2End && i < items.length; i++) {
+    // Priority 3: currentIndex + 5 through +10 (medium)
+    int medCount = 0;
+    for (int i = currentIndex + 5; i <= currentIndex + 10 && i < items.length; i++) {
       final asset = items[i];
       for (final url in _imageUrls(asset)) {
-        if (_markPreloaded(url)) {
-          unawaited(_safePrecache(url));
-        }
+        _enqueueUrl(url, _PreloadPriority.medium);
+        medCount++;
       }
     }
 
-    final historyStart = currentIndex - AppConstants.historyCount;
-    for (int i = currentIndex - 1; i >= historyStart && i >= 0; i--) {
+    // Priority 4: everything else ahead (low)
+    int lowCount = 0;
+    final farEnd = currentIndex + AppConstants.tier1PreloadCount + AppConstants.tier2PreloadCount;
+    for (int i = currentIndex + 11; i <= farEnd && i < items.length; i++) {
       final asset = items[i];
       for (final url in _imageUrls(asset)) {
-        if (_markPreloaded(url)) {
-          unawaited(_safePrecache(url));
-        }
+        _enqueueUrl(url, _PreloadPriority.low);
+        lowCount++;
       }
     }
+
+    // Priority 5: history (background)
+    int histCount = 0;
+    final histStart = currentIndex - AppConstants.historyCount;
+    for (int i = currentIndex - 1; i >= histStart && i >= 0; i--) {
+      final asset = items[i];
+      for (final url in _imageUrls(asset)) {
+        _enqueueUrl(url, _PreloadPriority.background);
+        histCount++;
+      }
+    }
+
+    debugPrint('[PRELOAD_QUEUE] current=$currentIndex '
+        'queued=${_preloadQueue.length} '
+        'urgent=${
+          (currentIndex + 1 < items.length ? _imageUrls(items[currentIndex + 1]).length : 0)
+        } '
+        'high=$highCount '
+        'medium=$medCount '
+        'low=$lowCount '
+        'history=$histCount');
+
+    _logNextReadyStatus(items, currentIndex);
+    _processQueue();
   }
 
   @override
@@ -227,10 +334,7 @@ class _SlideshowScreenState extends ConsumerState<SlideshowScreen> with WidgetsB
 
     if (state.items.isNotEmpty && _lastPreloadIndex != state.currentIndex) {
       _lastPreloadIndex = state.currentIndex;
-      WidgetsBinding.instance.addPostFrameCallback((_) {
-        _preloadForIndex(state.items, state.currentIndex);
-      });
-      _preloadCurrentItem(state.items, state.currentIndex);
+      _preloadForIndex(state.items, state.currentIndex);
     }
 
     return Scaffold(

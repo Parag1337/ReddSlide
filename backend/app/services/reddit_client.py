@@ -225,7 +225,7 @@ class RedditClient:
                 width = source.get("width") or width
                 height = source.get("height") or height
         
-        # Extract thumbnail from preview
+        # Extract thumbnail from preview, falling back to Reddit's thumbnail field
         if post_data.get("preview"):
             preview_images = post_data.get("preview", {}).get("images", [])
             if preview_images:
@@ -233,12 +233,17 @@ class RedditClient:
                 if "source" in thumbnail_data:
                     thumbnail_url = thumbnail_data["source"].get("url")
                 elif "resolutions" in thumbnail_data:
-                    # Use the smallest resolution as thumbnail
                     resolutions = thumbnail_data["resolutions"]
                     if resolutions:
                         thumbnail_url = resolutions[0].get("url")
                 if thumbnail_url:
                     thumbnail_url = html.unescape(thumbnail_url)
+
+        # Fallback: use Reddit's own thumbnail field when preview extraction fails
+        if not thumbnail_url:
+            raw_thumb = post_data.get("thumbnail")
+            if raw_thumb and raw_thumb.startswith(("http://", "https://")):
+                thumbnail_url = raw_thumb
         
         # Final sanitization: ensure no external-*.redd.it URLs slip through
         if media_url:
@@ -271,22 +276,30 @@ class RedditClient:
         Scans multiple Reddit pages until enough media-only results are found,
         a page limit is hit, or a time budget is exhausted.
 
+        For local mode with subreddits, searches each subreddit individually
+        (Reddit's multi-subreddit restricted search frequently returns 0 results
+        even when individual subreddits have many matches), then merges and
+        deduplicates results.
+
         Returns raw post data dicts (not parsed MediaAsset objects).
         """
         provider = await self.provider_manager.get_healthy_provider()
+        print(f"[SEARCH_PROVIDER] healthy_provider={provider}")
         if provider != "reddit_oauth":
             return [], None
 
         target_results = max(limit * 4, 100)
+        print(f"[SEARCH_LOOP] entering query={query} mode={mode} subreddits={subreddits} target={target_results}")
+
+        if mode == "local" and subreddits:
+            return await self._search_local_multi(query, subreddits, target_results)
+
         results: list[dict] = []
         current_after = after
         pages_scanned = 0
         start_time = time.monotonic()
 
-        audit = SearchAuditResult(
-            query=query,
-            mode=mode,
-        )
+        audit = SearchAuditResult(query=query, mode=mode)
 
         while True:
             if len(results) >= target_results:
@@ -320,15 +333,7 @@ class RedditClient:
             media_items = [item for item in page_items if self._is_media_post(item)]
 
             audit.non_media_removed += len(page_items) - len(text_items) - len(media_items)
-
-            if mode == "local" and subreddits:
-                subreddits_lower = {s.lower() for s in subreddits}
-                before = len(media_items)
-                media_items = [
-                    item for item in media_items
-                    if item.get("subreddit", "").lower() in subreddits_lower
-                ]
-                audit.subreddit_filtered += before - len(media_items)
+            print(f"[SEARCH_MEDIA] page_items={len(page_items)} text_removed={len(text_items)} media_kept={len(media_items)}")
 
             for item in media_items:
                 if item.get("is_gallery"):
@@ -352,8 +357,129 @@ class RedditClient:
 
         print(f"[Search] DONE query='{query}' pages={pages_scanned} returned={len(results)} elapsed={time.monotonic() - start_time:.2f}s")
         print(f"[Search] Audit: raw={audit.raw_posts} text_removed={audit.text_posts_removed} non_media_removed={audit.non_media_removed} sub_filtered={audit.subreddit_filtered} kept={audit.kept} images={audit.images} galleries={audit.galleries} videos={audit.videos}")
+        print(f"[SEARCH_FINAL] returned={len(results)} after={current_after}")
 
         return results, current_after
+
+    async def _search_local_multi(
+        self,
+        query: str,
+        subreddits: list[str],
+        target_results: int,
+    ) -> tuple[list[dict], None]:
+        """Search each selected subreddit individually, then merge and deduplicate.
+
+        Reddit's multi-subreddit search (r/sub1+sub2/search?restrict_sr=on)
+        frequently returns zero results even when individual subreddits have
+        many matching posts. This method works around that by searching each
+        subreddit separately.
+        """
+        overall_start = time.monotonic()
+        all_results: list[dict] = []
+
+        for subreddit in subreddits:
+            sub_start = time.monotonic()
+
+            sub_results, sub_after, sub_audit = await self._accumulate_search(
+                query=query,
+                subreddits=[subreddit],
+                mode="local",
+                target_results=target_results,
+            )
+
+            print(f"[LOCAL_SEARCH] subreddit={subreddit} raw={sub_audit.raw_posts} kept={len(sub_results)} "
+                  f"images={sub_audit.images} galleries={sub_audit.galleries} videos={sub_audit.videos} "
+                  f"elapsed={time.monotonic() - sub_start:.2f}s")
+
+            if sub_results:
+                all_results.extend(sub_results)
+
+            if len(all_results) >= target_results:
+                print(f"[LOCAL_SEARCH] target reached ({len(all_results)} >= {target_results}), stopping")
+                break
+
+            if time.monotonic() - overall_start > SEARCH_TIME_BUDGET_SECONDS * 1.5:
+                print(f"[LOCAL_SEARCH] overall time budget exhausted")
+                break
+
+        seen_ids = set()
+        deduped: list[dict] = []
+        for item in all_results:
+            pid = item.get("id")
+            if pid and pid not in seen_ids:
+                deduped.append(item)
+                seen_ids.add(pid)
+
+        print(f"[LOCAL_SEARCH_MERGE] before={len(all_results)} duplicates_removed={len(all_results) - len(deduped)} after={len(deduped)}")
+        print(f"[Search] DONE query='{query}' pages=merged returned={len(deduped)} elapsed={time.monotonic() - overall_start:.2f}s")
+        print(f"[SEARCH_FINAL] returned={len(deduped)} after=None")
+
+        return deduped, None
+
+    async def _accumulate_search(
+        self,
+        query: str,
+        subreddits: Optional[list[str]],
+        mode: str,
+        target_results: int,
+    ) -> tuple[list[dict], Optional[str], SearchAuditResult]:
+        """Accumulate search results across pages for a given query/subreddit/mode combination."""
+        results: list[dict] = []
+        current_after = None
+        pages_scanned = 0
+        start_time = time.monotonic()
+
+        audit = SearchAuditResult(query=query, mode=mode)
+
+        while True:
+            if len(results) >= target_results:
+                break
+            if pages_scanned >= SEARCH_MAX_PAGES:
+                break
+            if time.monotonic() - start_time > SEARCH_TIME_BUDGET_SECONDS:
+                break
+
+            page_items, next_after = await self._search_oauth(
+                query=query,
+                limit=25,
+                after=current_after,
+                subreddits=subreddits,
+                mode=mode,
+            )
+
+            audit.raw_posts += len(page_items)
+
+            if not page_items:
+                break
+
+            text_items = [item for item in page_items if not self._extract_preview_url(item)]
+            audit.text_posts_removed += len(text_items)
+
+            media_items = [item for item in page_items if self._is_media_post(item)]
+            audit.non_media_removed += len(page_items) - len(text_items) - len(media_items)
+            print(f"[SEARCH_MEDIA] page_items={len(page_items)} text_removed={len(text_items)} media_kept={len(media_items)}")
+
+            for item in media_items:
+                if item.get("is_gallery"):
+                    audit.galleries += 1
+                elif item.get("is_video"):
+                    audit.videos += 1
+                else:
+                    audit.images += 1
+
+            results.extend(media_items)
+            audit.kept = len(results)
+
+            current_after = next_after
+            pages_scanned += 1
+            audit.pages_scanned = pages_scanned
+
+            print(f"[Search] page={pages_scanned} fetched={len(page_items)} media={len(media_items)} total={len(results)} after={current_after}")
+
+            if not next_after:
+                break
+
+        return results, current_after, audit
 
     def _extract_preview_url(self, post_data: dict) -> Optional[str]:
         """Check if a raw post dict has any extractable media URL (without fully parsing)."""
@@ -391,8 +517,10 @@ class RedditClient:
             params["after"] = after
         if subreddits and mode == "local":
             params["restrict_sr"] = "on"
+            params["include_over_18"] = "on"
 
         print(f"[SEARCH_CURSOR] before={after}")
+        print(f"[SEARCH_REQUEST] q={query} after={after} url={url} params={params}")
 
         async with httpx.AsyncClient() as client:
             response = await client.get(
@@ -403,6 +531,8 @@ class RedditClient:
                 },
                 params=params,
             )
+
+            print(f"[SEARCH_RESPONSE] status={response.status_code}")
 
             if response.status_code == 401:
                 await self.oauth.refresh_token()
@@ -421,6 +551,7 @@ class RedditClient:
             raw_items = []
             for child in data.get("data", {}).get("children", []):
                 raw_items.append(child.get("data", {}))
+            print(f"[SEARCH_RAW] count={len(raw_items)} after_cursor={after_cursor}")
             return raw_items, after_cursor
 
     def _is_media_post(self, post_data: dict) -> bool:

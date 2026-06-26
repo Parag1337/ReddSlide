@@ -43,14 +43,21 @@ Future<ImageLoadResult> loadImageWithRetry(String url) async {
   final cacheManager = DefaultCacheManager();
 
   try {
+    final cacheSw = Stopwatch()..start();
     final fileInfo = await cacheManager.getFileFromCache(url);
+    final cacheLookupMs = cacheSw.elapsedMilliseconds;
     if (fileInfo != null && await fileInfo.file.exists()) {
       try {
+        final readSw = Stopwatch()..start();
         final bytes = await fileInfo.file.readAsBytes();
+        final readMs = readSw.elapsedMilliseconds;
+        log('[CACHE_CHECK] url=$url hit=true cacheLookup=${cacheLookupMs}ms readFromDisk=${readMs}ms totalBytes=${bytes.length}');
         return ImageLoadResult.success(bytes);
       } catch (e) {
         log('[ImageLoader] cache read failed url=$url error=$e');
       }
+    } else {
+      log('[CACHE_CHECK] url=$url hit=false cacheLookup=${cacheLookupMs}ms');
     }
   } catch (e) {
     log('[ImageLoader] cache check failed url=$url error=$e');
@@ -59,28 +66,32 @@ Future<ImageLoadResult> loadImageWithRetry(String url) async {
   for (int attempt = 0; attempt <= 1; attempt++) {
     try {
       log('[ImageLoader] fetching url=$url attempt=$attempt');
+      final fetchSw = Stopwatch()..start();
       final response = await _mediaDio.get<List<int>>(
         url,
         options: Options(responseType: ResponseType.bytes),
       );
+      final fetchMs = fetchSw.elapsedMilliseconds;
 
       final statusCode = response.statusCode;
       if (statusCode == 200) {
         final data = response.data;
         if (data != null && data.isNotEmpty) {
+          final cachePutSw = Stopwatch()..start();
           try {
             await cacheManager.putFile(url, Uint8List.fromList(data));
           } catch (e) {
             log('[ImageLoader] cache put failed url=$url error=$e');
           }
-          log('[ImageLoader] success url=$url');
+          final cachePutMs = cachePutSw.elapsedMilliseconds;
+          log('[IMAGE_DOWNLOAD] url=$url attempt=$attempt fetch=${fetchMs}ms cachePut=${cachePutMs}ms totalBytes=${data.length}');
           return ImageLoadResult.success(data);
         }
         log('[ImageLoader] empty body url=$url');
         return ImageLoadResult.failure(MediaErrorType.unknown);
       }
 
-      log('[ImageLoader] non-200 url=$url status=$statusCode');
+      log('[ImageLoader] non-200 url=$url status=$statusCode fetch=${fetchMs}ms');
       if (statusCode == 404) {
         return ImageLoadResult.failure(MediaErrorType.http404);
       }

@@ -231,11 +231,23 @@ The server starts via `backend/main.py`, which runs `uvicorn` on `app.main:app`.
 ```
 1. Create RedditClient with fresh OAuthManager + ProviderManager
 2. OAuthManager.initialize() — loads/acquires token
-3. Call RedditClient.search_reddit(query, limit, after, subreddits)
-   → Calls Reddit OAuth search API
-   → Parses response into MediaAsset list
-4. Fire async task to store results in search_results table (dedup)
-5. Return FeedResponse with live Reddit results
+3. Call RedditClient.search_reddit(query, limit, after, subreddits, mode)
+   │
+   ├── Global mode: Calls _accumulate_search() — scans Reddit up to 20 pages
+   │   or until target_results (limit × 4, min 100) media items are found,
+   │   within SEARCH_TIME_BUDGET_SECONDS (5s). Uses single Reddit OAuth
+   │   search request per page, passes restrict_sr=on if subreddits given.
+   │
+   └── Local mode: Calls _search_local_multi() — searches EACH selected
+       subreddit individually via _accumulate_search(), then merges and
+       deduplicates by post id. Bypasses Reddit's multi-subreddit search
+       (r/sub1+sub2/search) which returns 0 results for many queries.
+       Passes include_over_18=on for NSFW content.
+
+4. _parse_post() converts raw dicts → MediaAsset objects
+5. validate_media() + _validate_search_asset() filter low-quality items
+6. _asset_to_response() enriches with gallery URLs
+7. Return FeedResponse (NO storage in search_results table)
 ```
 
 #### GET /api/search (FTS5)
@@ -341,21 +353,83 @@ The central service for queue and subreddit management.
 
 ### RedditClient (`app/services/reddit_client.py`)
 
-Fetches and validates media from Reddit.
+Fetches and validates media from Reddit. Contains two independent pipelines:
+one for **feed fetching** (`fetch_subreddit_media` → `_fetch_oauth`) and one
+for **live search** (`search_reddit` → `_accumulate_search` / `_search_local_multi`).
 
-**Media URL extraction logic:**
+#### Feed Fetching
+
+**`fetch_subreddit_media(subreddit, limit, after, sort)`** — Fetches media
+from a single subreddit for the queue/background refresh pipeline, using
+`_fetch_oauth` (Reddit OAuth) or `_fetch_redlib` (stub fallback).
+
+**`_fetch_oauth` failure handling:**
+- **401**: Refresh token, record failure, fallback to Redlib
+- **Non-200**: Record failure, fallback to Redlib
+- **Success**: Record success for OAuth + provider
+
+`_fetch_redlib` is a **stub** — returns `[], None`.
+
+#### Live Reddit Search (v3 / v4.1)
+
+Three-tier architecture that replaced the original single-page search:
+
+```
+search_reddit()
+  │
+  ├── Local mode + subreddits present:
+  │     └── _search_local_multi(query, subreddits, target_results)
+  │           ├── for each subreddit:
+  │           │     └── _accumulate_search(query, [subreddit], mode="local")
+  │           │           └── _search_oauth() → page loop up to 20 pages
+  │           ├── merge all results
+  │           └── deduplicate by post "id"
+  │
+  └── Global mode (or no subreddits):
+        └── _accumulate_search(query, subreddits, mode="global")
+              └── _search_oauth() → page loop up to 20 pages
+```
+
+**Constants:**
+| Constant | Value | Purpose |
+|----------|-------|---------|
+| `SEARCH_MAX_PAGES` | 20 | Max Reddit pages scanned per accumulation |
+| `SEARCH_TIME_BUDGET_SECONDS` | 5.0 | Max wall-clock time per accumulation |
+| `target_results` | `max(limit * 4, 100)` | Stop accumulating when enough media found |
+
+**Key methods:**
+
+| Method | Purpose |
+|--------|---------|
+| `search_reddit(query, limit, after, subreddits, mode)` | Entry point. Delegates to `_search_local_multi` (local) or `_accumulate_search` (global). Returns `(list[dict], cursor)` |
+| `_search_local_multi(query, subreddits, target_results)` | Iterates subreddits individually, calls `_accumulate_search` per subreddit, merges, deduplicates by `id`. Budget: `SEARCH_TIME_BUDGET_SECONDS × 1.5`. Returns `(merged_list, None)` |
+| `_accumulate_search(query, subreddits, mode, target_results)` | Accumulation loop: fetches pages of 25 via `_search_oauth` until target reached, pages exhausted, or time budget exceeded. Returns `(results, last_cursor, SearchAuditResult)` |
+| `_search_oauth(query, limit, after, subreddits, mode)` | Single Reddit OAuth search HTTP request. Builds URL (`r/sub/search` for local, `search` for global). Adds `restrict_sr=on` + `include_over_18=on` for local mode. Returns raw post dicts |
+
+**Why per-subreddit search for local mode?** Reddit's OAuth API returns 0
+children for multi-subreddit restricted searches
+(`r/sub1+sub2/search?restrict_sr=on&q=...`) even when individual subreddits
+contain many matching posts. `_search_local_multi` works around this by
+searching each subreddit separately and deduplicating the merged results.
+
+**`SearchAuditResult`** — Dataclass used during accumulation to track:
+`raw_posts`, `text_posts_removed`, `non_media_removed`,
+`subreddit_filtered`, `kept`, `images`, `galleries`, `videos`.
+
+#### Media URL Extraction Logic
+
 1. **Gallery posts**: Extract all images from `media_metadata`, use first as primary `media_url`, store all as `gallery_items`
 2. **Video posts**: Extract `reddit_video.fallback_url` as both `media_url` and `video_url`
 3. **Direct image**: If URL ends with `.jpg/.jpeg/.png/.gif/.webp`, use as-is
 4. **Preview fallback**: Use `preview.images[0].source.url`
 5. **Thumbnail**: From `preview.images[0].source.url` (fallback to smallest resolution)
 
-**Quality validation (`validate_media`):**
+#### Quality validation (`validate_media`):
 - Reject if `"thumbnail"` is in the media_url path
 - Reject if `width < 400` or `height < 300`
 - Calculate quality score (base: 50, resolution bonus up to +20, video: +10, score bonus: +5/+10)
 
-**Quality scoring:**
+#### Quality scoring:
 | Condition | Bonus |
 |-----------|-------|
 | Base score | 50 |
@@ -367,25 +441,10 @@ Fetches and validates media from Reddit.
 | Score > 1000 | +10 |
 | Maximum | 100 |
 
-**Provider failover in `fetch_subreddit_media`:**
-```
-1. provider = ProviderManager.get_healthy_provider()
-2. if provider == "reddit_oauth":
-       return _fetch_oauth()
-   else:
-       return _fetch_redlib()
-```
-
-`_fetch_oauth` failure handling:
-- **401**: Refresh token, record failure, fallback to Redlib
-- **Non-200**: Record failure, fallback to Redlib
-- **Success**: Record success for OAuth + provider
-
-`_fetch_redlib` is a **stub** — returns `[], None`.
-
-**Reddit search (`search_reddit`, `_search_oauth`):**
-- Searches via `oauth.reddit.com/r/{subreddits}/search` (local) or `oauth.reddit.com/search` (global)
-- Same parsing logic as `fetch_subreddit_media` via `_parse_search_response`
+#### Search-specific validation (`_validate_search_asset`):
+- Reject if `width < 400` or `height < 300`
+- Reject if `"thumbnail"` is in any URL path
+- Reject if `quality_score < 30`
 
 ### BackgroundRefreshService (`app/services/background_service.py`)
 
@@ -528,32 +587,38 @@ Indexes: `idx_position`, `idx_added`
 
 Index: `idx_enabled`
 
-#### search_results
+#### search_results (currently unused by search endpoint)
 | Column | Type | Notes |
 |--------|------|-------|
 | id | INTEGER PK | AUTOINCREMENT |
-| search_query | TEXT | |
-| reddit_id | TEXT | |
-| title | TEXT | |
-| author | TEXT | |
-| subreddit | TEXT | |
-| media_url | TEXT | |
+| search_query | TEXT |
+| reddit_id | TEXT |
+| title | TEXT |
+| author | TEXT |
+| subreddit | TEXT |
+| media_url | TEXT |
 | video_url | TEXT | Nullable |
 | thumbnail_url | TEXT | Nullable |
-| is_video | BOOLEAN | |
-| is_gallery | BOOLEAN | |
-| nsfw | BOOLEAN | |
+| is_video | BOOLEAN |
+| is_gallery | BOOLEAN |
+| nsfw | BOOLEAN |
 | width | INTEGER | Nullable |
 | height | INTEGER | Nullable |
 | duration | INTEGER | Nullable |
-| score | INTEGER | |
-| permalink | TEXT | |
-| created_utc | INTEGER | |
-| cached_at | INTEGER | |
+| score | INTEGER |
+| permalink | TEXT |
+| created_utc | INTEGER |
+| cached_at | INTEGER |
 | hide_from_results | BOOLEAN | Default FALSE |
 
 Unique: `(reddit_id, search_query)`
 Indexes: `idx_search_query`, `idx_search_cached`
+
+**Note:** The `search_results` table was previously used to cache search
+results returned by `/api/search/reddit`. As of Search v3, results are no
+longer stored in this table — they are returned live from Reddit and
+discarded after the API response. The table schema remains for backward
+compatibility but is not populated by any active code path.
 
 #### media_search (FTS5 virtual table)
 | Column | Type |
@@ -870,3 +935,5 @@ if added == 0 and new_cursor is None:
 6. **`_refill_queue` is a stub** — the actual per-subreddit refill happens in `BackgroundRefreshService._refresh_job()`
 7. **Cleanup only prunes `media_queue`** — `media_assets` and `gallery_items` are not auto-cleaned beyond 30 days
 8. **OAuth token has no public setup endpoint** — must be configured via `.env` before first startup
+9. **Local search budget is 1.5× global budget** — `_search_local_multi` uses `SEARCH_TIME_BUDGET_SECONDS × 1.5` to accommodate N subreddits, which may still time out if many subreddits are selected
+10. **`_search_local_multi` ignores incoming `after` cursor** — each call starts fresh; cursor is always returned as `None`, preventing incremental pagination for local search

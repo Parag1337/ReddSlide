@@ -1014,11 +1014,20 @@ User types query in SearchScreen
   │     ├── Sync selected subreddits from settings
   │     ├── Call SearchRepository.searchReddit()
   │     │     └── ApiClient.get(/api/search/reddit?q=...&mode=...)
+  │     │         Backend (accumulation-based, v3+):
+  │     │           Global mode: scans up to 20 pages until target (limit×4)
+  │     │             media items found or 5s budget exhausted
+  │     │           Local mode: searches each subreddit individually
+  │     │             (workaround for Reddit multi-subreddit API bug),
+  │     │             merges & deduplicates
+  │     │           Returns FeedResponse directly (no caching)
   │     └── Update state (results, hasMore, isLoading: false)
   │
   ├── User taps "Start Slideshow" → push /slideshow with SearchSource
   │
-  └── User scrolls → searchNotifier.loadMore() (cursor-based)
+  └── User scrolls → searchNotifier.loadMore()
+        Note: local search always returns after=None, so loadMore only
+        works meaningfully in global mode
 ```
 
 ### Slideshow Flow
@@ -1105,6 +1114,7 @@ loadMore() called
 10. **Queue status chip** — The queue indicator in the app bar is a placeholder/debug display, not a polished UI element
 11. **Search history** — Recent queries are tracked in-memory only (not persisted) and reset on app restart
 12. **Backend URL validation** — `validateBackendUrl()` only checks for empty string, does not make an actual HTTP call in `SettingsNotifier`; the actual validation happens in `SettingsScreen` via `FeedRepository.getHealth()`
+13. **Local search loadMore** — Local mode search returns `after=None` (cursorless), so infinite scroll pagination in the search results grid does not work for local searches; only global mode supports cursor-based `loadMore`
 
 ### Backend Referenced
 

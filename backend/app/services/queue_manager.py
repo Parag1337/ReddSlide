@@ -145,6 +145,64 @@ class QueueManager:
             )
             return [dict(row) for row in rows], has_more
     
+    async def get_subreddit_assets(
+        self,
+        subreddit: str,
+        limit: int = 50,
+        after_cursor: Optional[str] = None,
+    ) -> tuple[list[dict], Optional[str], bool]:
+        """Get assets for a single subreddit directly from media_assets.
+
+        Cursor-based pagination on (created_utc DESC, reddit_id DESC).
+        Cursor format: \"created_utc,reddit_id\" (opaque string for frontend).
+        Returns (items, next_cursor, has_more).
+        """
+        async with get_db() as db:
+            cursor_created_utc = None
+            cursor_reddit_id = None
+            if after_cursor and "," in after_cursor:
+                parts = after_cursor.split(",", 1)
+                try:
+                    cursor_created_utc = int(parts[0])
+                    cursor_reddit_id = parts[1]
+                except (ValueError, IndexError):
+                    pass
+
+            if cursor_created_utc is not None and cursor_reddit_id is not None:
+                cursor = await db.execute(
+                    """SELECT ma.* FROM media_assets ma
+                       WHERE ma.subreddit = ?
+                         AND (
+                           ma.created_utc < ?
+                           OR (ma.created_utc = ? AND ma.reddit_id < ?)
+                         )
+                       ORDER BY ma.created_utc DESC, ma.reddit_id DESC
+                       LIMIT ?""",
+                    (subreddit, cursor_created_utc, cursor_created_utc, cursor_reddit_id, limit + 1),
+                )
+            else:
+                cursor = await db.execute(
+                    """SELECT ma.* FROM media_assets ma
+                       WHERE ma.subreddit = ?
+                       ORDER BY ma.created_utc DESC, ma.reddit_id DESC
+                       LIMIT ?""",
+                    (subreddit, limit + 1),
+                )
+
+            rows = await cursor.fetchall()
+            items = [dict(row) for row in rows[:limit]]
+            has_more = len(rows) > limit
+            next_cursor = None
+            if has_more and items:
+                last = items[-1]
+                next_cursor = f"{last['created_utc']},{last['reddit_id']}"
+            print(
+                f"[DATABASE] get_subreddit_assets subreddit={subreddit} "
+                f"limit={limit} cursor={after_cursor} "
+                f"returned={len(items)} has_more={has_more} next_cursor={next_cursor}"
+            )
+            return items, next_cursor, has_more
+
     async def remove_from_queue(self, reddit_post_id: str) -> bool:
         """Remove item from queue."""
         async with get_db() as db:
@@ -291,12 +349,17 @@ class QueueManager:
             return [row["subreddit"] for row in rows]
 
     async def disable_subreddit(self, subreddit: str) -> None:
-        """Disable a subreddit so background service stops fetching it."""
+        """Disable a subreddit and remove its items from the queue."""
         async with get_db() as db:
             await db.execute(
                 "UPDATE subreddit_configs SET enabled=0 WHERE subreddit=?",
                 (subreddit,)
             )
+            await db.execute("""
+                DELETE FROM media_queue WHERE reddit_post_id IN (
+                    SELECT reddit_id FROM media_assets WHERE subreddit = ?
+                )
+            """, (subreddit,))
             await db.commit()
 
     @staticmethod
