@@ -7,13 +7,15 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../../../core/constants/app_constants.dart';
 import '../../../core/media/media_source.dart';
 import '../../feed/data/feed_repository.dart';
+import '../../feed/domain/media_asset.dart';
 import '../../search/data/search_repository.dart';
 import '../../settings/providers/settings_provider.dart';
 import '../data/search_media_source.dart';
 import '../data/subreddit_media_source.dart';
-import '../domain/adaptive_preloader.dart';
+import '../domain/media_preparation_engine.dart';
 import '../domain/merge_engine.dart';
 import '../domain/playlist_manager.dart';
+import '../domain/prepared_media_handle.dart';
 import '../domain/slideshow_source.dart';
 import '../domain/slideshow_state.dart';
 
@@ -37,7 +39,7 @@ final slideshowProvider = StateNotifierProvider.family<SlideshowNotifier, Slides
 class SlideshowNotifier extends StateNotifier<SlideshowState> {
   late final PlaylistManager _playlist;
   late final MergeEngine? _mergeEngine;
-  late final AdaptivePreloader? _preloader;
+  MediaPreparationEngine? _preparationEngine;
   Timer? _autoAdvanceTimer;
   Timer? _overlayTimer;
   int _slideshowIntervalSeconds = AppConstants.defaultSlideshowIntervalSeconds;
@@ -48,20 +50,29 @@ class SlideshowNotifier extends StateNotifier<SlideshowState> {
     required SearchRepository searchRepository,
     required SlideshowSource source,
     required List<String> allSubreddits,
-  }) : super(SlideshowState()) {
+  }  ) : super(SlideshowState()) {
     _playlist = PlaylistManager();
     _mergeEngine = _buildMergeEngine(source, feedRepository, searchRepository, allSubreddits);
-    _preloader = null;
   }
 
-  void attachPreloaderContext(BuildContext context) {
+  void attachPreparationEngine(BuildContext context) {
     if (_mergeEngine != null) {
-      _preloader = AdaptivePreloader(
+      _preparationEngine = MediaPreparationEngine(
         playlist: _playlist,
         onLoadMore: loadMore,
-        context: context,
-      );
+      )..attachContext(context, onReadinessChanged: _onVideoReadinessChanged);
     }
+  }
+
+  PreparedMediaHandle getPreparedHandle(MediaAsset asset, {int galleryIndex = 0}) {
+    return _preparationEngine?.prepare(asset, galleryIndex: galleryIndex) ?? PreparedMediaHandle(
+      asset: asset,
+      ready: false,
+    );
+  }
+
+  void _onVideoReadinessChanged() {
+    _syncState();
   }
 
   MergeEngine? _buildMergeEngine(
@@ -321,7 +332,7 @@ class SlideshowNotifier extends StateNotifier<SlideshowState> {
   }
 
   void _notifyPreloader() {
-    _preloader?.onIndexChanged(_playlist.currentIndex);
+    _preparationEngine?.onIndexChanged(_playlist.currentIndex);
   }
 
   void _startAutoAdvance() {
@@ -363,7 +374,7 @@ class SlideshowNotifier extends StateNotifier<SlideshowState> {
   void dispose() {
     _cancelAutoAdvance();
     _cancelOverlayTimer();
-    _preloader?.dispose();
+    _preparationEngine?.dispose();
     _mergeEngine?.dispose();
     _playlist.dispose();
     super.dispose();

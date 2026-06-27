@@ -48,7 +48,7 @@ class _SlideshowScreenState extends ConsumerState<SlideshowScreen> with WidgetsB
     Future.microtask(() {
       final notifier = ref.read(slideshowProvider(widget.source).notifier);
 
-      notifier.attachPreloaderContext(context);
+      notifier.attachPreparationEngine(context);
 
       notifier.initialize();
 
@@ -246,6 +246,7 @@ class _SlideshowPageContent extends ConsumerWidget {
     final currentIndex = ref.watch(slideshowProvider(source).select((s) => s.currentIndex));
     final gallerySubIndex = ref.watch(slideshowProvider(source).select((s) => s.gallerySubIndex));
     final isMuted = ref.watch(slideshowProvider(source).select((s) => s.isMuted));
+    final notifier = ref.read(slideshowProvider(source).notifier);
 
     return PageView.builder(
       controller: pageController,
@@ -255,6 +256,10 @@ class _SlideshowPageContent extends ConsumerWidget {
       itemBuilder: (context, index) {
         if (index >= items.length) return const SizedBox();
         final asset = items[index];
+        final handle = notifier.getPreparedHandle(
+          asset,
+          galleryIndex: index == currentIndex ? gallerySubIndex : 0,
+        );
         return RepaintBoundary(
           child: GestureDetector(
             onTapUp: (details) {
@@ -268,9 +273,8 @@ class _SlideshowPageContent extends ConsumerWidget {
               }
             },
             child: MediaViewer(
-              asset: asset,
+              handle: handle,
               isMuted: isMuted,
-              galleryIndex: index == currentIndex ? gallerySubIndex : 0,
               onMediaError: onMediaError,
             ),
           ),

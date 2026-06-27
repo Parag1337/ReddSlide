@@ -230,9 +230,10 @@ lib/
 │       │   ├── search_media_source.dart   # SearchMediaSource — wraps search as MediaSource
 │       │   └── subreddit_media_source.dart # SubredditMediaSource — wraps feed as MediaSource
 │       ├── domain/
-│       │   ├── adaptive_preloader.dart    # Priority-queue image preloader
-│       │   ├── merge_engine.dart          # Multi-subreddit merge engine
-│       │   ├── playlist_manager.dart      # Item list + index management
+│   │   ├── adaptive_preloader.dart    # Priority-queue image preloader (internal to MPE)
+│   │   ├── media_preparation_engine.dart # Preparation layer gateway (Phase 5.2)
+│   │   ├── merge_engine.dart          # Multi-subreddit merge engine
+│   │   ├── playlist_manager.dart      # Item list + index management
 │       │   ├── slideshow_source.dart      # Sealed source types + SlideshowRouteExtra
 │       │   └── slideshow_state.dart       # SlideshowState
 │       ├── presentation/
@@ -434,7 +435,7 @@ The most complex notifier. Manages a **unified** pipeline using `MediaSource` ab
 **Internal architecture:**
 - `PlaylistManager _playlist` — Manages the flat item list + current index + navigation
 - `MergeEngine? _mergeEngine` — Optional merge engine (null for single-source direct feeds, but currently always created since even single subreddits use a MergeEngine with one SourceBuffer)
-- `AdaptivePreloader? _preloader` — Lazily attached via `attachPreloaderContext()`
+- `MediaPreparationEngine? _preparationEngine` — Preparation layer, created via `attachPreparationEngine(context)`. Wraps `AdaptivePreloader` internally. Exposes `getPreparedHandle(asset, galleryIndex)` for widgets. (Phase 5.2)
 
 **Construction (`_buildMediaSources`):**
 ```
@@ -456,9 +457,10 @@ wraps the list of `MediaSource` objects in `SourceBuffer` instances.
   3. Appends to `_playlist`, copies to `state.items`, starts auto-advance
   4. If items empty, sets `hasMorePages: false` early
 
-**Preloader attachment (separate from constructor):**
-- `attachPreloaderContext(BuildContext)` — Called from `SlideshowScreen.initState()` after the notifier is created but before `initialize()`. Creates `AdaptivePreloader` with `_playlist`, a `loadMore` callback, and the build context (needed for `precacheImage`).
+**Preparation engine attachment (separate from constructor):**
+- `attachPreparationEngine(BuildContext)` — Called from `SlideshowScreen.initState()` after the notifier is created but before `initialize()`. Creates `MediaPreparationEngine` with `_playlist` and `loadMore` callback, then attaches context. The engine wraps `AdaptivePreloader` internally.
 - This separation avoids requiring `BuildContext` during provider construction.
+- Unlike the previous `attachPreloaderContext`, this method creates a `MediaPreparationEngine` (Phase 5.2) which provides future extension points for video pre-initialization, cancellation, and memory management.
 
 **Navigation:**
 - `next()` / `previous()` / `jumpTo()` — Navigation with auto-advance restart
@@ -477,6 +479,8 @@ wraps the list of `MediaSource` objects in `SourceBuffer` instances.
   - `hasMorePages` set based on whether new items exist OR engine has more sources
 
 **No more separate init methods**: Unlike the previous architecture, there are no separate `_initMergeEngine()`, `_initSearchMergeEngine()`, or `_loadInitialItems()` methods. All source types are handled uniformly.
+
+**MediaPreparationEngine**: Created in Phase 5.2 as the dedicated preparation layer, evolved from `AdaptivePreloader`. `SlideshowNotifier` creates it via `attachPreparationEngine(context)` which delegates to `MediaPreparationEngine.attachContext()`. The engine wraps `AdaptivePreloader` internally and exposes `onIndexChanged()` which is called on every navigation event. The notifier no longer directly manages preloader lifecycle. See `MediaPreparationEngine` section below.
 
 **State fields removed**: `source` and `paginationCursor` are no longer part of `SlideshowState`. The source is held by the notifier itself.
 
@@ -880,9 +884,9 @@ The slideshow is a fullscreen page with a fade transition:
 
 | Widget | Purpose |
 |---|---|
-| `MediaViewer` | Dispatches to `VideoViewer` or `ImageViewer` based on asset type (video/gallery/image). Logs render build time via `[RENDER_TIMELINE]` |
-| `VideoViewer` | `VideoPlayerController.networkUrl` with 1 retry on failure, thumbnail fallback, mute support, tap to play/pause. Logs `[VIDEO_ENTER]`, `[VIDEO_CONTROLLER_CREATE]`, `[VIDEO_INITIALIZE_START/DONE]`, `[VIDEO_PLAY]`, `[VIDEO_VISIBLE]` timing |
-| `ImageViewer` | Loads via `CachedNetworkImageProvider`, displays with `InteractiveViewer` (pinch-to-zoom, double-tap zoom toggle). Extensive performance logging: `[USER_REQUESTED_IMAGE]`, `[NEED_IMAGE]`, `[IMG_WIDGET_CREATED]`, `[CACHE_AUDIT]`, `[IMAGE_READY]`, `[IMAGE_VISIBLE]`. Async disk cache check via `DefaultCacheManager.getFileFromCache()` |
+| `MediaViewer` | Presentation-only dispatch. Accepts `PreparedMediaHandle`, delegates to `VideoViewer` or `ImageViewer` based on `handle.isVideo`. No preparation logic. |
+| `VideoViewer` | Receives `PreparedMediaHandle` with ready-made `VideoPlayerController`. Attaches/detaches listeners. Handles play/pause, mute, thumbnail fallback. No controller creation or initialization. No timing/diagnostic logging. |
+| `ImageViewer` | Receives `PreparedMediaHandle`, renders image via `CachedNetworkImageProvider` with `InteractiveViewer` zoom. No cache checks, no disk audits, no timing logging. Error classification retained (rendering concern). |
 | `SlideshowOverlay` | Gradient background overlay combining top bar, queue indicator, and controls |
 | `SlideshowControls` | Navigation row (prev/play-pause/next) + actions row (fullscreen, mute, download, share, open on Reddit) |
 | `QueueIndicator` | Horizontal scrollable chip list showing ±25 items around current index |
@@ -1043,6 +1047,181 @@ AdaptivePreloader(playlist, onLoadMore, context)
 | `dispose()` | Clears all tracking sets, queues, and active URLs |
 
 **Memory tracking**: Preloaded URLs tracked in `_LruSet` (max 500). Dedup checks also include `ImageCache.containsKey()` to avoid re-preloading.
+
+---
+
+## Core: MediaPreparationEngine
+
+**Path:** `lib/features/slideshow/domain/media_preparation_engine.dart`
+
+Introduced in Phase 5.2 as the dedicated preparation layer, evolved from `AdaptivePreloader`. Provides a clean architectural boundary between the slideshow notifier (state + navigation) and media preparation (preloading, future decode/cancellation/memory management).
+
+### Architecture Position
+
+```
+SlideshowNotifier
+    │
+    ├── getPreparedHandle(asset, galleryIndex)
+    │
+    ▼
+MediaPreparationEngine
+    │   prepare(asset) → PreparedMediaHandle
+    │   onIndexChanged / onPlaylistChanged (window)
+    │   PreparationPolicy (ahead=6, behind=3)
+    │
+    ├── AdaptivePreloader (internal) ──► CachedNetworkImageProvider → ImageCache
+    │
+    └── VideoPreparationService (internal)
+            │   prepare(url)        → kicks off controller init (fire & forget)
+            │   isReady(url)        → query controller readiness
+            │   getController(url)  → return ready controller
+            │   evictOutsideWindow  → dispose unused controllers
+            │   onReadinessChanged  → triggers state refresh
+            │
+            └── Controller Lifecycle:
+                NotCreated → Preparing → Ready → Evicted → Disposed
+                                             ↓
+                                         Visible (displayed by widget)
+```
+
+The notifier calls `getPreparedHandle(asset, galleryIndex)` which delegates to `MPE.prepare()`. Widgets receive a `PreparedMediaHandle` and render — they never initiate preparation. For videos, the handle carries a ready-made `VideoPlayerController` from `VideoPreparationService`.
+
+### Public API
+
+| Method | Purpose |
+|--------|---------|
+| `MediaPreparationEngine({policy})` | Accepts optional `PreparationPolicy` (decodedAhead=6, decodedBehind=3) |
+| `attachContext(BuildContext, {onReadinessChanged})` | Creates `AdaptivePreloader` + wires `VideoPreparationService.onReadinessChanged` |
+| `initialize()` | Future extension point for initial preparation work |
+| `onPlaylistChanged()` | Re-reconciles preparation window after playlist mutations |
+| `onIndexChanged(int)` | Delegates to `AdaptivePreloader`; reconciles window; kicks off video preparation for window items |
+| `prepare(MediaAsset, {galleryIndex})` | Returns `PreparedMediaHandle` with resolved `displayUrl`, readiness status, and optional `VideoPlayerController` |
+| `isReady(MediaAsset)` | Returns true if asset is in window and prepared (image cached or video controller ready) |
+| `dispose()` | Disposes preloader, video service, clears tracking |
+
+### Ownership
+
+- **Owns**: Preparation lifecycle, preload orchestration, window management, readiness tracking, output via `PreparedMediaHandle`, video controller pool lifecycle
+- **Does NOT own**: Playlist, playback state, navigation, Riverpod state, UI, widget lifecycle
+
+### Current Implementation
+
+`MediaPreparationEngine` wraps `AdaptivePreloader` internally without modification. All preloading behavior is preserved exactly as before. Configuration is centralized into `PreparationPolicy`. The engine owns all preparation decisions and exposes results via `PreparedMediaHandle`.
+
+Future phases will add:
+- Video pre-initialization (`DecodeScheduler` / `VideoControllerPool`)
+- In-flight cancellation (`CancellationManager`)
+- Memory pressure response (`MemoryManager`)
+- Metrics collection (`MetricsCollector`)
+
+### Testability
+
+The engine can be instantiated and its methods called without a widget tree. Without an attached context, all preparation methods are no-ops, making unit testing practical. `prepare()` returns handles without side effects.
+
+---
+
+## Core: PreparationPolicy
+
+**Path:** `lib/features/slideshow/domain/preparation_policy.dart`
+
+Introduced in Phase 5.3 to centralize preparation window configuration.
+
+```dart
+class PreparationPolicy {
+  final int decodedAhead;   // default 6
+  final int decodedBehind;  // default 3
+}
+```
+
+Previously hardcoded as `static const` in `MediaPreparationEngine`. Extracted to a parameter object so future phases can switch policies (adaptive, memory-aware) without modifying the engine.
+
+### Current Values
+
+| Parameter | Default | Purpose |
+|-----------|---------|---------|
+| `decodedAhead` | 6 | Number of items ahead of current index to prepare |
+| `decodedBehind` | 3 | Number of items behind current index to prepare |
+
+---
+
+## Core: PreparedMediaHandle
+
+**Path:** `lib/features/slideshow/domain/prepared_media_handle.dart`
+
+Introduced in Phase 5.3 as the output contract between `MediaPreparationEngine` and widgets. Widgets receive a handle and render — they never initiate preparation.
+
+```dart
+class PreparedMediaHandle {
+  final MediaAsset asset;
+  final bool ready;                       // Is the media ready to display?
+  final VideoPlayerController? controller;  // Ready-made controller (video only)
+  final bool preparationFailed;           // Controller preparation failed
+  String get displayUrl;                  // Resolved URL (gallery index resolved by prepare())
+  String get displayThumbnailUrl;         // Thumbnail fallback
+  bool get isVideo;
+}
+```
+
+### Design Rules
+
+- `displayUrl` always returns `asset.mediaUrl` — gallery URL resolution happens in `MPE.prepare()` via `copyWith`, not in the handle
+- `controller` is non-null only when `isVideo` is true AND the `VideoPreparationService` has finished initializing the controller
+- `preparationFailed` is set when video controller initialization fails (after one retry)
+- Widgets never inspect the raw `MediaAsset` — they use handle properties
+- `VideoViewer` attaches/detaches listeners to `controller` — it never creates or initializes the controller
+
+---
+
+## Core: VideoPreparationService
+
+**Path:** `lib/features/slideshow/domain/video_preparation_service.dart`
+
+Introduced in Phase 5.4. Owns the full lifecycle of `VideoPlayerController` instances. Maintains an internal pool keyed by video URL. Controllers are created, initialized, and evicted based on the preparation window.
+
+### Controller Lifecycle
+
+```
+NotCreated
+    │  prepare(url) called
+    ▼
+Preparing
+    │  VideoPlayerController.networkUrl() + initialize() (async, 1 retry on failure)
+    ├── success ──► Ready
+    └── failure ──► Failed (preparationFailed = true on handle)
+    
+Ready
+    ├── widget displays ──► Visible (play/pause via widget)
+    ├── window shift ──► Evicted (controller.dispose(), pool entry removed)
+    └── reuse ──► Ready (same URL returns same controller until evicted)
+```
+
+### Public API
+
+| Method | Purpose |
+|--------|---------|
+| `prepare(url)` | Returns `Future<VideoPlayerController>`. Starts async creation+initialization. Returns existing future if already in progress. |
+| `isReady(url)` | Returns true if controller is fully initialized |
+| `getController(url)` | Returns the ready controller, or null |
+| `hasFailed(url)` | Returns true if initialization failed (after retry) |
+| `evictOutsideWindow(urlsInWindow)` | Disposes and removes controllers for URLs not in the provided set |
+| `dispose()` | Disposes all controllers, clears pool |
+
+### Design Rules
+
+- **No duplicate controllers**: Same URL returns same entry from the pool
+- **Retry-once**: If initialization fails, one retry is attempted before marking as failed
+- **Event-driven readiness**: `onReadinessChanged` fires when any controller becomes ready (triggers `SlideshowNotifier._syncState()`)
+- **Eviction**: Controllers are evicted when the item leaves the preparation window. `dispose()` does not complete pending `prepare()` futures (they remain uncompleted, eligible for GC).
+- **Widget decoupling**: `VideoViewer` never calls `prepare()`. It receives ready (or null) controllers via `PreparedMediaHandle`.
+
+### Integration
+
+Reconciliation in `MediaPreparationEngine._reconcilePreparationWindow()`:
+1. Iterates over items in the window
+2. For videos: calls `_videoService.prepare(url).then((_) {}, onError: (_) {})` (fire-and-forget)
+3. After reconciliation: calls `_videoService.evictOutsideWindow(videoUrlsInWindow)` to clean up
+
+`SlideshowNotifier.attachPreparationEngine()` passes `onReadinessChanged` callback that calls `_syncState()`, triggering a widget rebuild when any video controller becomes ready.
 
 ---
 

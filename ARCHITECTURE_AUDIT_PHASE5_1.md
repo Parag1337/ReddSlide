@@ -1,7 +1,8 @@
 # RedSlide Architecture Audit & Migration Plan — Phase 5.1
 
-> **Status**: Analysis Complete — No production code modified
+> **Status**: Phase 5.2 Complete — MediaPreparationEngine created
 > **Date**: 2026-06-27
+> **Phase Progress**: Phase 1 (MPE Foundation) ✅ → Phase 2 (Video Pre-init) ⬜ → Phase 3 (Decouple Notifier) 🟡 → Phase 4 (Strip Widget Prep) ⬜ → Phase 5 (Cancellation/Memory) ⬜ → Phase 6 (Metrics) ⬜
 > **Auditor**: Architecture analysis agent
 
 ---
@@ -812,6 +813,51 @@ Phase 6: Metrics
 | 6 | 4 (all *viewer files) | 0 | Existing tests must pass | Low |
 
 **Total**: 10 files modified, ~7 files created, 0 backend changes.
+
+## Appendix C: Phase 5.2 Completion Report
+
+### Completed Work
+| Item | Status | Details |
+|------|--------|---------|
+| `MediaPreparationEngine` class | ✅ | Created at `lib/features/slideshow/domain/media_preparation_engine.dart` (36 lines) |
+| Wraps `AdaptivePreloader` | ✅ | Internal composition; all existing behavior preserved |
+| Clean public API | ✅ | `attachContext()`, `initialize()`, `onPlaylistChanged()`, `onIndexChanged()`, `dispose()` |
+| SlideshowNotifier updated | ✅ | Uses `_preparationEngine` instead of `_preloader`; references renamed |
+| SlideshowScreen updated | ✅ | Calls `attachPreparationEngine(context)` |
+| `AdaptivePreloader` preserved | ✅ | Unchanged, used internally by MPE |
+| Unit tests created | ✅ | 6 tests covering creation, no-context safety, dispose safety |
+| `flutter analyze` | ✅ | No new issues (44 pre-existing info-level warnings only) |
+| `flutter test` | ✅ | 33/33 tests pass |
+| Docs updated | ✅ | `frontend.md` updated with MPE section; architecture audit updated |
+
+### File Changes Summary
+| Action | File | Lines |
+|--------|------|-------|
+| **Created** | `lib/features/slideshow/domain/media_preparation_engine.dart` | +36 |
+| **Created** | `test/media_preparation_engine_test.dart` | +56 |
+| **Modified** | `lib/features/slideshow/providers/slideshow_provider.dart` | -4 / +4 (field rename, method rename) |
+| **Modified** | `lib/features/slideshow/presentation/slideshow_screen.dart` | -1 / +1 (method call rename) |
+| **Modified** | `frontend.md` | +45 (new MPE section + notifier updates) |
+
+### Responsibility Changes
+| Before | After | Reason |
+|--------|-------|--------|
+| `SlideshowNotifier._preloader` (AdaptivePreloader) | `SlideshowNotifier._preparationEngine` (MPE) | Clear architectural boundary; MPE is the dedicated preparation layer |
+| `attachPreloaderContext()` | `attachPreparationEngine()` | Reflects new component name |
+| AdaptivePreloader created inline in notifier | Created via MPE.attachContext() | MPE owns preloader lifecycle |
+
+### Regression Verification
+| Feature | Status | Test Method |
+|---------|--------|-------------|
+| Single subreddit slideshow | ✅ Unchanged | Code path identical — MPE delegates to AdaptivePreloader |
+| Multi subreddit slideshow | ✅ Unchanged | Same delegation |
+| Search slideshow | ✅ Unchanged | Same delegation |
+| Gallery navigation | ✅ Unchanged | Notifier.galleryNext() untouched |
+| Video playback | ✅ Unchanged | Widgets unchanged |
+| Infinite scrolling | ✅ Unchanged | loadMore() path untouched |
+| Auto-advance | ✅ Unchanged | Timer logic untouched |
+| Preloading behavior | ✅ Unchanged | AdaptivePreloader unchanged internally |
+| Overlay timers | ✅ Unchanged | Untouched |
 
 ## Appendix B: Key Architectural Invariants (MUST NOT CHANGE)
 

@@ -2,17 +2,16 @@ import 'package:flutter/material.dart';
 import 'package:video_player/video_player.dart';
 import '../../../../core/media/media_error.dart';
 import '../../../../core/media/safe_network_image.dart';
+import '../../../slideshow/domain/prepared_media_handle.dart';
 
 class VideoViewer extends StatefulWidget {
-  final String videoUrl;
-  final String? thumbnailUrl;
+  final PreparedMediaHandle handle;
   final bool muted;
   final void Function(MediaErrorType errorType)? onError;
 
   const VideoViewer({
     super.key,
-    required this.videoUrl,
-    this.thumbnailUrl,
+    required this.handle,
     required this.muted,
     this.onError,
   });
@@ -22,128 +21,97 @@ class VideoViewer extends StatefulWidget {
 }
 
 class _VideoViewerState extends State<VideoViewer> {
-  VideoPlayerController? _controller;
-  bool _initialized = false;
+  VideoPlayerController? _attachedController;
   bool _firstFrameRendered = false;
-  bool _videoFailed = false;
-  bool _videoVisibleLogged = false;
-  int _retryCount = 0;
-  int _pipelineStart = 0;
+  bool _errorReported = false;
 
   @override
   void initState() {
     super.initState();
-    _initController();
+    _attachToController();
+    _reportErrorIfNeeded();
   }
 
   @override
   void didUpdateWidget(VideoViewer oldWidget) {
     super.didUpdateWidget(oldWidget);
-    if (oldWidget.videoUrl != widget.videoUrl) {
-      _controller?.removeListener(_onVideoUpdate);
-      _controller?.dispose();
-      _initialized = false;
+    if (oldWidget.handle.asset.id != widget.handle.asset.id) {
+      _detachFromController();
       _firstFrameRendered = false;
-      _videoFailed = false;
-      _videoVisibleLogged = false;
-      _retryCount = 0;
-      _initController();
+      _errorReported = false;
+      _attachToController();
+      _reportErrorIfNeeded();
     } else if (oldWidget.muted != widget.muted) {
-      _controller?.setVolume(widget.muted ? 0 : 1);
+      _attachedController?.setVolume(widget.muted ? 0 : 1);
     }
+  }
+
+  void _attachToController() {
+    final c = widget.handle.controller;
+    if (c == null || !c.value.isInitialized) return;
+    _attachedController = c;
+    _attachedController!.addListener(_onVideoUpdate);
+    _attachedController!.setVolume(widget.muted ? 0 : 1);
+    _attachedController!.seekTo(Duration.zero);
+    _attachedController!.play();
+  }
+
+  void _detachFromController() {
+    final c = _attachedController;
+    if (c == null) return;
+    try {
+      c.removeListener(_onVideoUpdate);
+    } catch (_) {}
+    _attachedController = null;
   }
 
   void _onVideoUpdate() {
-    if (!_controller!.value.isInitialized) return;
-    final position = _controller!.value.position;
+    if (!_attachedController!.value.isInitialized) return;
+    final position = _attachedController!.value.position;
     if (!_firstFrameRendered && position > Duration.zero) {
-      if (mounted) {
-        setState(() => _firstFrameRendered = true);
-      }
-    }
-    if (!_videoVisibleLogged && position > Duration.zero) {
-      _videoVisibleLogged = true;
-      final visibleTs = DateTime.now().millisecondsSinceEpoch;
-      debugPrint('[VIDEO_VISIBLE] url=${widget.videoUrl} '
-          'totalToVisible=${visibleTs - _pipelineStart}ms');
+      if (mounted) setState(() => _firstFrameRendered = true);
     }
   }
 
-  Future<void> _initController() async {
-    debugPrint('[VIDEO_ENTER] url=${widget.videoUrl}');
-    _pipelineStart = DateTime.now().millisecondsSinceEpoch;
-    final createSw = Stopwatch()..start();
-    _controller = VideoPlayerController.networkUrl(Uri.parse(widget.videoUrl));
-    final createMs = createSw.elapsedMilliseconds;
-    debugPrint('[VIDEO_CONTROLLER_CREATE] url=${widget.videoUrl} elapsed=${createMs}ms');
-
-    final initSw = Stopwatch()..start();
-    debugPrint('[VIDEO_INITIALIZE_START] url=${widget.videoUrl}');
-    try {
-      await _controller!.initialize();
-      final initMs = initSw.elapsedMilliseconds;
-      debugPrint('[VIDEO_INITIALIZE_DONE] url=${widget.videoUrl} elapsed=${initMs}ms');
-
-      await _controller!.setVolume(widget.muted ? 0 : 1);
-      await _controller!.setLooping(true);
-      _controller!.addListener(_onVideoUpdate);
-
-      await _controller!.play();
-      final totalMs = createMs + initMs;
-      debugPrint('[VIDEO_PLAY] url=${widget.videoUrl} '
-          'create=${createMs}ms init=${initMs}ms total=${totalMs}ms');
-      if (mounted) {
-        setState(() {
-          _initialized = true;
-        });
-      }
-    } catch (e) {
-      final initMs = initSw.elapsedMilliseconds;
-      debugPrint('[VIDEO_INITIALIZE_FAILED] url=${widget.videoUrl} elapsed=${initMs}ms error=$e');
-      if (_retryCount < 1) {
-        _retryCount++;
-        _controller?.dispose();
-        _controller = null;
-        _initController();
-        return;
-      }
-      if (widget.thumbnailUrl != null && mounted) {
-        setState(() => _videoFailed = true);
-      }
-      WidgetsBinding.instance.addPostFrameCallback((_) {
-        widget.onError?.call(MediaErrorType.videoInitError);
-      });
-    }
+  void _reportErrorIfNeeded() {
+    if (!widget.handle.preparationFailed || _errorReported) return;
+    _errorReported = true;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      widget.onError?.call(MediaErrorType.videoInitError);
+    });
   }
 
   @override
   void dispose() {
-    _controller?.dispose();
+    _detachFromController();
     super.dispose();
   }
 
   @override
   Widget build(BuildContext context) {
-    if (_videoFailed && widget.thumbnailUrl != null) {
+    if (widget.handle.preparationFailed && widget.handle.displayThumbnailUrl.isNotEmpty) {
       return Center(
         child: SafeNetworkImage(
-          url: widget.thumbnailUrl!,
+          url: widget.handle.displayThumbnailUrl,
           fit: BoxFit.contain,
         ),
       );
     }
 
-    if (!_initialized || (!_firstFrameRendered && widget.thumbnailUrl != null)) {
+    final c = _attachedController;
+    final initialized = c != null && c.value.isInitialized;
+
+    if (!initialized || (!_firstFrameRendered && widget.handle.displayThumbnailUrl.isNotEmpty)) {
       return Center(
-        child: widget.thumbnailUrl != null
+        child: widget.handle.displayThumbnailUrl.isNotEmpty
             ? Stack(
                 fit: StackFit.expand,
                 children: [
                   SafeNetworkImage(
-                    url: widget.thumbnailUrl!,
+                    url: widget.handle.displayThumbnailUrl,
                     fit: BoxFit.contain,
                   ),
-                  if (!_initialized)
+                  if (!initialized)
                     const Center(
                       child: CircularProgressIndicator(strokeWidth: 2),
                     ),
@@ -159,16 +127,16 @@ class _VideoViewerState extends State<VideoViewer> {
         children: [
           Center(
             child: AspectRatio(
-              aspectRatio: _controller!.value.aspectRatio,
-              child: VideoPlayer(_controller!),
+              aspectRatio: c.value.aspectRatio,
+              child: VideoPlayer(c),
             ),
           ),
           GestureDetector(
             onTap: () {
-              if (_controller!.value.isPlaying) {
-                _controller!.pause();
+              if (c.value.isPlaying) {
+                c.pause();
               } else {
-                _controller!.play();
+                c.play();
               }
             },
           ),
