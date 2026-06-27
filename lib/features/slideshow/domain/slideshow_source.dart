@@ -93,7 +93,10 @@ class GroupSource extends SlideshowSource {
 class SlideshowRouteExtra {
   final SlideshowSource source;
   final int startIndex;
-  const SlideshowRouteExtra({required this.source, this.startIndex = 0});
+  const SlideshowRouteExtra({
+    required this.source,
+    this.startIndex = 0,
+  });
 }
 
 class ListEquality {

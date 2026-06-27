@@ -1,4 +1,4 @@
-# RedSlide Frontend Documentation
+# RedSlide Frontend Architecture
 
 ## Table of Contents
 1. [Overview](#overview)
@@ -11,18 +11,20 @@
 8. [Data Layer](#data-layer)
 9. [Feature: Feed](#feature-feed)
 10. [Feature: Search](#feature-search)
-11. [Feature: Slideshow](#feature-slideshow)
+11. [Feature: Slideshow & MergeEngine](#feature-slideshow--mergeengine)
 12. [Feature: Settings](#feature-settings)
 13. [Feature: Groups](#feature-groups)
-14. [Screens & Pages](#screens--pages)
-15. [Widgets & Components](#widgets--components)
-16. [Theme & Styling](#theme--styling)
-17. [Media Loading](#media-loading)
-18. [Utilities & Extensions](#utilities--extensions)
-19. [API Integration](#api-integration)
-20. [Data Flow](#data-flow)
-21. [Known Limitations](#known-limitations)
-22. [Future Improvements](#future-improvements)
+14. [Core: MediaSource Abstraction](#core-mediasource-abstraction)
+15. [Core: AdaptivePreloader](#core-adaptivepreloader)
+16. [Core: PlaylistManager](#core-playlistmanager)
+17. [Media Loading & Preloading](#media-loading--preloading)
+18. [Widgets & Components](#widgets--components)
+19. [Theme & Styling](#theme--styling)
+20. [Utilities & Extensions](#utilities--extensions)
+21. [API Integration](#api-integration)
+22. [Data Flow](#data-flow)
+23. [Known Limitations](#known-limitations)
+24. [Future Improvements](#future-improvements)
 
 ---
 
@@ -30,12 +32,16 @@
 
 **RedSlide** is a Flutter-based media-first slideshow and wallpaper discovery app that connects to a Python FastAPI backend. It aggregates media from Reddit subreddits and presents it in an immersive slideshow format, allowing users to browse images and videos from their favorite communities.
 
-The frontend is fully implemented (not boilerplate) and provides:
-- Home screen with configured subreddits
-- Media feed browsing per subreddit
+The frontend is fully implemented and provides:
+- Home screen with configured subreddits and cover image previews
+- Media feed browsing per subreddit with infinite scroll
 - Full-text search (local within subreddits or global across Reddit)
-- Fullscreen slideshow with auto-advance, video playback, and gallery support
-- Settings management with persistence
+- Fullscreen slideshow with auto-advance, video playback, gallery support
+- Multi-subreddit merging client-side via MergeEngine using the MediaSource abstraction
+- MediaSource-based abstract data loading (SubredditMediaSource, SearchMediaSource)
+- PlaylistManager for item list + index management separated from state
+- Dedicated AdaptivePreloader class with priority-queue-based image preloading
+- Settings management with SharedPreferences persistence and backend auto-sync
 - Bottom navigation with Home, Search, Groups (placeholder), and Settings tabs
 
 ---
@@ -60,6 +66,7 @@ The frontend is fully implemented (not boilerplate) and provides:
 │                │     │     │     └── /settings  → SettingsScreen         │
 │                │     │     ├── /subreddit/:name → SubredditScreen        │
 │                │     │     └── /slideshow       → SlideshowScreen        │
+│                │     │           (via SlideshowRouteExtra)                │
 │                │     ├── ThemeData (Material 3, Inter font, red seed)     │
 │                │     └── settingsProvider (AsyncNotifier)                │
 │                │                                                          │
@@ -70,6 +77,23 @@ The frontend is fully implemented (not boilerplate) and provides:
 │                      │                AsyncNotifier)       │              │
 │                      │  domain/       (models, state)      │              │
 │                      │  data/         (repositories)       │              │
+│                      └──────────┬──────────────────────────┘              │
+│                                 │                                          │
+│                                 ▼                                          │
+│                      ┌─────────────────────────────────────┐              │
+│                      │ MediaSource abstraction             │              │
+│                      │  SubredditMediaSource (feed)        │              │
+│                      │  SearchMediaSource (search)         │              │
+│                      └──────────┬──────────────────────────┘              │
+│                                 │                                          │
+│                                 ▼                                          │
+│                      ┌─────────────────────────────────────┐              │
+│                      │ MergeEngine (multi-subreddit merger) │              │
+│                      │ ─────────────────────────────────── │              │
+│                      │ SourceBuffer per MediaSource        │              │
+│                      │ Round-robin + freshness + diversity │              │
+│                      │ Auto-refill at low watermark (8)    │              │
+│                      │ Used for all multi-source types     │              │
 │                      └──────────┬──────────────────────────┘              │
 │                                 │                                          │
 │                                 ▼                                          │
@@ -96,7 +120,7 @@ The app follows a **feature-first** architecture where each feature (feed, searc
 - **`providers/`** — Riverpod providers and notifiers that hold state and business logic
 - **`presentation/`** — Screens and widgets
 
-Shared code lives in `lib/core/` (constants, network, errors, routing, utils) and `lib/shared/` (reusable widgets, utilities).
+Shared code lives in `lib/core/` (constants, network, errors, routing, utils, media_source) and `lib/shared/` (reusable widgets, utilities).
 
 ---
 
@@ -141,7 +165,7 @@ lib/
 ├── core/
 │   ├── constants/
 │   │   ├── api_constants.dart             # API paths, timeouts, defaults
-│   │   ├── app_constants.dart             # Preload counts, pagination, etc.
+│   │   ├── app_constants.dart             # Preload config, pagination, merge engine params
 │   │   └── theme_constants.dart           # Spacing, radius, duration, colors
 │   ├── errors/
 │   │   └── app_error.dart                 # Sealed error hierarchy
@@ -149,8 +173,8 @@ lib/
 │   │   ├── context_extensions.dart        # BuildContext helpers
 │   │   └── string_extensions.dart         # String formatting helpers
 │   ├── media/
-│   │   ├── image_loader.dart              # Image loading with retry+cache
 │   │   ├── media_error.dart               # Media error types + logging
+│   │   ├── media_source.dart              # MediaSource abstract class + MediaPage
 │   │   └── safe_network_image.dart        # Safe image widget with fallback
 │   ├── network/
 │   │   ├── api_client.dart                # Dio HTTP client wrapper
@@ -158,11 +182,12 @@ lib/
 │   ├── router/
 │   │   └── app_router.dart                # GoRouter config + AppShell
 │   └── utils/
-│       └── debouncer.dart                 # Generic debounce utility
+│       ├── debouncer.dart                 # Generic debounce utility
+│       └── pipeline_timer.dart            # Performance timing utility
 ├── features/
 │   ├── feed/
 │   │   ├── data/
-│   │   │   └── feed_repository.dart       # Feed API calls
+│   │   │   └── feed_repository.dart       # Feed API calls + response models
 │   │   ├── domain/
 │   │   │   └── media_asset.dart           # MediaAsset model
 │   │   ├── presentation/
@@ -201,19 +226,26 @@ lib/
 │   │   └── providers/
 │   │       └── settings_provider.dart     # SettingsNotifier (AsyncNotifier)
 │   └── slideshow/
+│       ├── data/
+│       │   ├── search_media_source.dart   # SearchMediaSource — wraps search as MediaSource
+│       │   └── subreddit_media_source.dart # SubredditMediaSource — wraps feed as MediaSource
 │       ├── domain/
-│       │   ├── slideshow_source.dart      # Sealed source types
+│       │   ├── adaptive_preloader.dart    # Priority-queue image preloader
+│       │   ├── merge_engine.dart          # Multi-subreddit merge engine
+│       │   ├── playlist_manager.dart      # Item list + index management
+│       │   ├── slideshow_source.dart      # Sealed source types + SlideshowRouteExtra
 │       │   └── slideshow_state.dart       # SlideshowState
 │       ├── presentation/
 │       │   ├── slideshow_screen.dart      # Fullscreen slideshow
 │       │   └── widgets/
-│       │       ├── image_viewer.dart      # Zoomable image
+│       │       ├── image_viewer.dart      # Zoomable image with performance logging
 │       │       ├── media_viewer.dart      # Dispatches to video/image
 │       │       ├── queue_indicator.dart   # Horizontal queue chips
 │       │       ├── slideshow_controls.dart
-│       │       └── slideshow_overlay.dart
+│       │       ├── slideshow_overlay.dart
+│       │       └── video_viewer.dart      # Video player with thumbnail fallback + retry
 │       └── providers/
-│           └── slideshow_provider.dart    # SlideshowNotifier
+│           └── slideshow_provider.dart    # SlideshowNotifier (refactored — uses MediaSource)
 ├── shared/
 │   ├── utils/
 │   │   └── url_sanitizer.dart            # Reddit URL sanitization
@@ -236,10 +268,11 @@ lib/
 The entry point configures the app environment and launches the widget tree:
 
 1. **`WidgetsFlutterBinding.ensureInitialized()`** — Ensures plugin channels are ready
-2. **Orientation lock** — All four orientations enabled (portrait-up, portrait-down, landscape-left, landscape-right)
+2. **Orientation lock** — All four orientations enabled
 3. **System UI overlay** — Transparent status bar and navigation bar with light icons
-4. **ProviderScope** — Riverpod's root provider container wraps the entire app
-5. **RedSlideApp** — The root widget is rendered
+4. **Image cache configuration** — Sets `ImageCache` maximum size (500 entries, 200MB)
+5. **ProviderScope** — Riverpod's root provider container wraps the entire app
+6. **RedSlideApp** — The root widget is rendered
 
 ### `app.dart` — Root Widget
 
@@ -254,8 +287,8 @@ The entry point configures the app environment and launches the widget tree:
    - `themeMode` resolved from settings (system/light/dark)
    - Light and dark themes built with Material 3 `ColorScheme.fromSeed` (seed: red `#E53935`)
    - `GoogleFonts.interTextTheme()` for all typography
-4. **Loading state** — Shows a centered `CircularProgressIndicator` while settings load
-5. **Error state** — Shows "Failed to load settings" text
+4. **Loading state** — Shows a centered `CircularProgressIndicator`
+5. **Error state** — Shows `Text('Failed to load settings')`
 
 #### Theme Configuration
 
@@ -296,7 +329,7 @@ Routing is handled by **go_router** with a `ShellRoute` for the bottom navigatio
 The `AppShell` widget wraps the four main tab routes with a `NavigationBar` containing four destinations:
 
 | Index | Label | Icon | Selected Icon |
-|---|---|---|---|
+|---|---|---|---|---|
 | 0 | Home | `Icons.home_outlined` | `Icons.home` |
 | 1 | Search | `Icons.search` | Same |
 | 2 | Groups | `Icons.folder_outlined` (with `Badge("Soon")`) | `Icons.folder` |
@@ -310,6 +343,15 @@ The `/slideshow` route receives data via `state.extra`:
 - If `SlideshowRouteExtra` is passed: contains a `SlideshowSource` + optional `startIndex`
 - Otherwise: the extra itself is treated as a `SlideshowSource` (with a fallback to `GlobalFeedSource`)
 
+`SlideshowRouteExtra` is defined in `slideshow_source.dart`:
+```dart
+class SlideshowRouteExtra {
+  final SlideshowSource source;
+  final int startIndex;
+  const SlideshowRouteExtra({required this.source, this.startIndex = 0});
+}
+```
+
 ### Groups Placeholder
 
 The Groups tab shows a placeholder screen with an icon and "Coming in a future update" message. The feature is stubbed out.
@@ -318,10 +360,12 @@ The Groups tab shows a placeholder screen with an icon and "Coming in a future u
 
 ## State Management
 
-The app uses **Riverpod** exclusively with three provider types:
+The app uses **Riverpod** exclusively with these provider types:
 - **`Provider`** — For singletons (GoRouter, repositories, ApiClient family)
+- **`Provider.family`** — For parameterized singletons (ApiClient by baseUrl)
 - **`StateNotifierProvider` / `StateNotifierProvider.family`** — For mutable state (feed, search, slideshow)
 - **`AsyncNotifierProvider`** — For async initialization (settings)
+- **`FutureProvider.autoDispose.family`** — For one-shot async fetches (home feed cover images)
 
 ### Provider Inventory
 
@@ -337,12 +381,15 @@ The app uses **Riverpod** exclusively with three provider types:
 | `searchProvider` | `StateNotifierProvider<SearchNotifier, SearchState>` | No | `search_provider.dart` | `SearchState` |
 | `searchResultsProvider` | `Provider<SearchState>` | No | `search_provider.dart` | (alias) |
 | `slideshowProvider` | `StateNotifierProvider.family<SlideshowNotifier, SlideshowState, SlideshowSource>` | Yes (by source) | `slideshow_provider.dart` | `SlideshowState` |
+| `homeFeedProvider` | `FutureProvider.autoDispose.family<Map<String, String?>, String>` | Yes (by subreddit) | `home_screen.dart` | — |
+| `resumeSessionProvider` | `Provider.family<ResumeSession?, String>` | Yes | `home_screen.dart` | (stub returning null) |
 
 ### Provider Lifecycle
 
 - **`apiClientProvider`** — Family provider keyed by `baseUrl` string. Each unique base URL gets its own `ApiClient` instance.
 - **`feedProvider`** — Family provider keyed by `String?` (subreddit name or null for global feed). Each subreddit gets its own `FeedNotifier`.
-- **`slideshowProvider`** — Family provider keyed by `SlideshowSource` (sealed class with equality). Each slideshow session gets its own notifier.
+- **`slideshowProvider`** — Family provider keyed by `SlideshowSource` (sealed class with custom equality). Each slideshow session gets its own notifier.
+- **`homeFeedProvider`** — Auto-disposing future provider that fetches a single cover image for each configured subreddit on the home screen.
 
 ### SettingsNotifier
 
@@ -368,31 +415,80 @@ Manages a paginated list of `MediaAsset` items for a single subreddit (or the gl
 **Type:** `StateNotifier<SearchState>`
 
 Manages search query, results, pagination, filters, and recent queries. Exposes:
-- `search(query)` — Execute search with current filters
-- `loadMore()` — Paginate results
+- `search(query)` — Execute search with current filters. Calls `/api/search/reddit`
+- `loadMore()` — Paginate results (cursor-based, only works in global mode; local always returns `after=None`)
 - `setMode()` — Toggle local (within selected subreddits) vs global (all Reddit)
 - `toggleSubreddit()` / `setSelectedSubreddits()` — Filter subreddits
 - `setMediaType()` / `setSort()` — Filter/sort controls
-- `syncSelectedSubreddits()` — Keep subreddit selection in sync with settings
+- `syncSelectedSubreddits()` — Keep subreddit selection in sync with settings (intersection)
 - `clearResults()` / `clearHistory()` / `removeRecentQuery()` / `resetFilters()` — State management
+
+**Search result deduplication**: `loadMore()` deduplicates by `MediaAsset.id` to prevent duplicates from appearing when paginating.
 
 ### SlideshowNotifier
 
 **Type:** `StateNotifier<SlideshowState>` (family by `SlideshowSource`)
 
-The most complex notifier. Manages:
-- `initialize()` — Entry point that calls `_loadInitialItems()` and starts auto-advance
-- `setStartIndex(int index)` — Jump to a specific start index after initial load
-- `_loadInitialItems()` — Fetches first page from the appropriate source
+The most complex notifier. Manages a **unified** pipeline using `MediaSource` abstraction + `MergeEngine`:
+
+**Internal architecture:**
+- `PlaylistManager _playlist` — Manages the flat item list + current index + navigation
+- `MergeEngine? _mergeEngine` — Optional merge engine (null for single-source direct feeds, but currently always created since even single subreddits use a MergeEngine with one SourceBuffer)
+- `AdaptivePreloader? _preloader` — Lazily attached via `attachPreloaderContext()`
+
+**Construction (`_buildMediaSources`):**
+```
+SlideshowSource → List<MediaSource>
+  SubredditSource       → [SubredditMediaSource(repository, subreddit, sortMode)]
+  MultiSubredditSource  → [SubredditMediaSource × N]
+  GlobalFeedSource      → [SubredditMediaSource × allConfiguredSubreddits]
+  SearchSource          → [SearchMediaSource(repository, query, mode, subreddits)]
+  GroupSource           → [SubredditMediaSource × groupSubreddits]
+```
+
+All source types now go through a single MergeEngine pipeline. The MergeEngine
+wraps the list of `MediaSource` objects in `SourceBuffer` instances.
+
+**Initialization:**
+- `initialize()` — Single unified method:
+  1. Calls `_mergeEngine.initialize()` — fires parallel `loadNext()` on all sources
+  2. `drainMerged()` — Gets first batch of merged items
+  3. Appends to `_playlist`, copies to `state.items`, starts auto-advance
+  4. If items empty, sets `hasMorePages: false` early
+
+**Preloader attachment (separate from constructor):**
+- `attachPreloaderContext(BuildContext)` — Called from `SlideshowScreen.initState()` after the notifier is created but before `initialize()`. Creates `AdaptivePreloader` with `_playlist`, a `loadMore` callback, and the build context (needed for `precacheImage`).
+- This separation avoids requiring `BuildContext` during provider construction.
+
+**Navigation:**
 - `next()` / `previous()` / `jumpTo()` — Navigation with auto-advance restart
+  - `next()` handles boundary: if at end of `_playlist`, waits for `loadMore()`, then advances
+  - `_syncState()` copies `_playlist` state to `SlideshowState`
+  - `_notifyPreloader()` calls `_preloader.onIndexChanged(currentIndex)`
 - `galleryNext()` / `galleryPrevious()` — Gallery sub-item navigation (advances to next asset at gallery end)
-- `togglePlay()` / `toggleMute()` / `toggleFullscreen()` / `toggleOverlay()` / `showOverlay()` — UI state
-- `loadMore()` — Pagination with retry logic (up to 3 retries with exponential backoff, `retryCount * 2` seconds delay)
-- `_checkPreload()` — Triggers `loadMore()` when remaining items hits `preloadTriggerRemaining` (30)
-- `_startAutoAdvance()` / `_restartAutoAdvance()` / `_cancelAutoAdvance()` — Auto-play timer
+
+**UI State:**
+- `togglePlay()` / `toggleMute()` / `toggleFullscreen()` / `toggleOverlay()` / `showOverlay()` — Standard state toggles
+
+**Pagination:**
+- `loadMore()` — Guarded by `isLoadingMore`, ensures only one in-flight. Calls `_doLoadMore()`
+  - `_doLoadMore()` calls `_mergeEngine.autoRefill()` (refills buffers below low watermark)
+  - `drainMerged()` returns new items → `_playlist.append(newItems)` → update state
+  - `hasMorePages` set based on whether new items exist OR engine has more sources
+
+**No more separate init methods**: Unlike the previous architecture, there are no separate `_initMergeEngine()`, `_initSearchMergeEngine()`, or `_loadInitialItems()` methods. All source types are handled uniformly.
+
+**State fields removed**: `source` and `paginationCursor` are no longer part of `SlideshowState`. The source is held by the notifier itself.
+
+**Auto-advance:**
+- `_startAutoAdvance()` / `_restartAutoAdvance()` / `_cancelAutoAdvance()` — Timer-based auto-play
+
+**Overlay:**
 - `_startOverlayTimer()` / `_cancelOverlayTimer()` — Auto-hide overlay in fullscreen (3 seconds)
-- `setInterval()` — Configure auto-advance interval
-- `_fetchPage()` — Dispatches to `FeedRepository` or `SearchRepository` based on source type
+
+**Advanced:**
+- `setInterval()` — Configure auto-advance interval from settings
+- `debugDump()` — Forensic dump of complete internal state including MergeEngine buffer audit
 
 ---
 
@@ -403,8 +499,6 @@ The most complex notifier. Manages:
 **Path:** `lib/core/network/api_client.dart`
 
 A thin wrapper around **Dio** that provides `get<T>()` and `post<T>()` methods. Key characteristics:
-
-> **Architecture note:** While `apiClientProvider` (a Riverpod family provider keyed by base URL) is the canonical way to obtain an `ApiClient`, several parts of the codebase create raw `ApiClient` instances directly: `app.dart._syncSubreddits()`, `settings_provider.dart._syncSubredditsToBackend()`, and `settings_screen.dart._validateUrl()`. This bypasses the dependency injection pattern.
 
 - **Configuration:** 10s connect timeout, 30s receive timeout, JSON content type
 - **Debug logging:** LogInterceptor enabled in debug mode only
@@ -476,8 +570,8 @@ Each feature has a repository that:
 
 | Method | Endpoint | Params | Return |
 |---|---|---|---|
-| `searchReddit()` | `GET /api/search/reddit` | `query` (Dart param, sent as `q`), `mode`, `limit`, `after`, `subreddits` | `Result<FeedResponse>` |
-| `search()` | `GET /api/search` | `query` (Dart param, sent as `q`), `limit`, `page`, `subreddits`, `mediaType`, `sort` | `Result<FeedResponse>` |
+| `searchReddit()` | `GET /api/search/reddit` | `query` (sent as `q`), `mode`, `limit`, `after`, `subreddits` | `Result<FeedResponse>` |
+| `search()` | `GET /api/search` | `query` (sent as `q`), `limit`, `page`, `subreddits`, `mediaType`, `sort` | `Result<FeedResponse>` |
 | `searchDebug()` | `GET /api/search/debug` | `q`, `limit`, `page` | `Result<FeedResponse>` |
 
 #### SettingsRepository
@@ -513,7 +607,7 @@ The Feed feature manages subreddit browsing and media display.
 
 ```dart
 class MediaAsset {
-  final String id;              // Reddit post ID
+  final String id;              // Reddit post ID (not the composite id)
   final String title;
   final String author;
   final int score;
@@ -528,12 +622,13 @@ class MediaAsset {
   final int? width;
   final int? height;
   final int? duration;
+  final int? createdUtc;        // Reddit creation timestamp
   final List<String>? galleryUrls;  // Gallery image URLs (sanitized)
 }
 ```
 
 Key behaviors:
-- **URL sanitization** — All URLs are sanitized via `UrlSanitizer` during `fromJson()` (replaces `external-preview.redd.it` → `preview.redd.it`, `external-i.redd.it` → `i.redd.it`)
+- **URL sanitization** — All URLs are sanitized via `UrlSanitizer` during `fromJson()`
 - **Immutable** — `copyWith()` for state updates
 - **JSON serialization** — `fromJson()` and `toJson()` for API communication
 
@@ -554,17 +649,23 @@ class FeedState {
 
 Family provider keyed by optional subreddit name. `null` = global feed.
 
+### Home Feed Cover Provider: `homeFeedProvider`
+
+**Defined in:** `home_screen.dart`
+
+A `FutureProvider.autoDispose.family` that fetches a single cover image per subreddit for display in `SubredditCard`. Fires one `GET /api/feed?limit=1&subreddits=<name>` per configured subreddit.
+
 ### Screens
 
 #### HomeScreen (`/`)
 
 The main hub displays:
-- A grid of **SubredditCard** widgets for each configured subreddit
+- A grid of **SubredditCard** widgets for each configured subreddit with cover images
 - Adaptive grid: 2 columns (<600px), 3 columns (600–900px), 4 columns (≥900px)
 - **Multi-select mode**: Long-press to enter, tap to toggle selection
 - **FAB**: "Start All" (no selection) or "N selected" (multi-select) → push `/slideshow` with `MultiSubredditSource`
 - Empty states for: no backend URL configured, no subreddits added
-- **`_QueueStatusChip`** — Placeholder/debug queue size indicator in app bar
+- **`_QueueStatusChip`** — Placeholder/debug queue size indicator in app bar (shows `--`)
 - **`_HealthIndicator`** — Placeholder/debug backend health dot in app bar
 - **`resumeSessionProvider`** — Stub `Provider.family<ResumeSession?, String>` returning `null`. `ResumeSession` class with `source`, `index`, `isPlaying` fields for future session resume feature
 
@@ -573,7 +674,7 @@ The main hub displays:
 Shows a paginated grid of media for one subreddit:
 - AppBar with subreddit name, refresh button, sort popup menu (Hot/New/Top)
 - Shimmer loading grid, error widget, or empty state
-- `MediaGrid` with infinite scroll at 80% scroll threshold
+- `MediaGrid` with infinite scroll at 80% scroll threshold via `ScrollController`
 - FAB: "Slideshow" → push `/slideshow` with `SubredditSource`
 
 ### Feed Widgets
@@ -604,14 +705,14 @@ class SearchState {
   final List<String> recentQueries;   // Max 8, in-memory only
   final List<String> selectedSubreddits;
   final String? mediaType;            // Filter: all/images/galleries/videos
-  final String? sort;                 // Sort: relevance/newest/most upvoted
+  final String? sort;                 // Filter: relevance/newest/most upvoted
   final int totalResults;
 }
 ```
 
 ### SearchMode Enum
 
-**Defined in:** `lib/features/slideshow/domain/slideshow_source.dart` (cross-feature dependency — shared between search and slideshow)
+**Defined in:** `lib/features/slideshow/domain/slideshow_source.dart`
 
 | Value | Meaning |
 |---|---|
@@ -645,9 +746,9 @@ Results state:
 
 ---
 
-## Feature: Slideshow
+## Feature: Slideshow & MergeEngine
 
-The slideshow is the core experience — a fullscreen, auto-advancing media viewer.
+The slideshow is the core experience — a fullscreen, auto-advancing media viewer with a sophisticated client-side multi-subreddit merge engine.
 
 ### Domain Model: SlideshowSource
 
@@ -657,13 +758,15 @@ A sealed class hierarchy that determines where slideshow items come from:
 
 | Source Type | Fields | Meaning |
 |---|---|---|
-| `SubredditSource` | `subreddit`, `sortMode?` | Single subreddit feed |
-| `MultiSubredditSource` | `subreddits`, `sortMode?` | Multiple subreddits combined |
-| `GlobalFeedSource` | (empty) | Global Reddit feed |
-| `SearchSource` | `query`, `mode`, `subreddits?`, `mediaType?`, `sort?` | Search results |
-| `GroupSource` | `groupName`, `subreddits`, `filter?` | Group feed (not yet used) |
+| `SubredditSource` | `subreddit`, `sortMode?` | Single subreddit feed — wrapped as one SubredditMediaSource |
+| `MultiSubredditSource` | `subreddits`, `sortMode?` | Multiple subreddits — wrapped as N SubredditMediaSources |
+| `GlobalFeedSource` | (empty) | All configured subreddits — wrapped as N SubredditMediaSources |
+| `SearchSource` | `query`, `mode`, `subreddits?`, `mediaType?`, `sort?` | Search results — wrapped as one SearchMediaSource |
+| `GroupSource` | `groupName`, `subreddits`, `filter?` | Group feed — wrapped as N SubredditMediaSources (not yet used) |
 
 Each source has custom `==` and `hashCode` for proper Riverpod family key comparison (`ListEquality` for list fields).
+
+`SlideshowRouteExtra` wraps a `SlideshowSource` with an optional `startIndex` for route transitions.
 
 ### Domain Model: SlideshowState
 
@@ -675,14 +778,71 @@ class SlideshowState {
   final bool isMuted;
   final bool isFullscreen;
   final bool overlayVisible;
-  final SlideshowSource source;
   final bool isLoading;
   final bool isLoadingMore;
   final bool hasMorePages;
-  final String? paginationCursor;
   final int gallerySubIndex;   // Position within multi-image gallery
 }
 ```
+
+**Removed fields**: `source` and `paginationCursor` are no longer in state.
+- `source` is held by the `SlideshowNotifier` instance (it is the family key)
+- `paginationCursor` is managed internally by the MergeEngine's SourceBuffers and PlaylistManager
+
+### MergeEngine (`lib/features/slideshow/domain/merge_engine.dart`)
+
+The MergeEngine is a client-side multi-subreddit media merger. It is now built
+on the `MediaSource` abstraction — each source is wrapped in a `SourceBuffer`
+that calls `source.loadNext()` for pagination.
+
+**Architecture:**
+
+```
+MergeEngine
+├── List<MediaSource> sources (provided at construction)
+│
+├── N SourceBuffers (one per MediaSource)
+│   ├── source: MediaSource
+│   ├── items: List<MediaAsset> — buffered items
+│   ├── hasMore: bool — whether source has more pages
+│   ├── isLoading: bool — whether a loadNextPage is in progress
+│   └── _consumePointer: int — tracks consumed items
+│
+├── Load: loadNextPage() → source.loadNext()
+│         → dedup by item.id → append to buffer items
+│         → update hasMore from MediaPage.hasMore
+│
+├── Merged output list (_merged)
+│
+└── Selection algorithm (_selectNext)
+    ├── 45% randomness (Random.nextDouble)
+    ├── 35% freshness (based on createdUtc age, max 7 days)
+    ├── 20% diversity
+    │   ├── -20% consecutive same-buffer
+    │   ├── -5% same-author
+    │   └── -2% same-domain
+    └── Constraint: max 2 consecutive from same subreddit
+```
+
+**Key constants:**
+| Constant | Value | Purpose |
+|---|---|---|
+| `_lowWatermark` | 8 | Trigger buffer refill when remaining drops below this |
+| `_mergeBatchSize` | 20 | Items generated per merge batch |
+
+**Key methods:**
+
+| Method | Purpose |
+|---|---|
+| `initialize()` | Create SourceBuffers for all MediaSources, fire parallel `loadNextPage()` on all, generate first merged batch |
+| `autoRefill()` | Check all buffers for low-watermark, refill those that need it via `loadNextPage()`, generate new batch |
+| `drainMerged()` | Return and clear the merged output list |
+| `generateBatch()` | Generate a batch of merged items without buffer refill (called by autoRefill) |
+| `_selectNext()` | Core selection — scores all candidate items by freshness + diversity + randomness |
+| `hasMoreSources` | Whether any buffer still has unconsumed items or can fetch more pages |
+| `dispose()` | Dispose all MediaSources, clear buffers and merged output |
+
+**SourceBuffer** — Each buffer tracks its own cursor internally via the `MediaSource` interface (callers don't need to manage cursors directly). The buffer deduplicates incoming items by `item.id`.
 
 ### Screen: SlideshowScreen (`/slideshow`)
 
@@ -692,44 +852,37 @@ The slideshow is a fullscreen page with a fade transition:
 - Full-screen black background
 - `PageView` for swiping between media items
 - Tap zones: left 30% = previous, right 30% = next, middle = toggle overlay
-- Three-finger double-tap for fullscreen toggle
+- Three-finger double-tap for fullscreen toggle (via `SystemChrome`)
 
-**Overlay** (auto-hides after 3 seconds in fullscreen):
+**Initialization sequence** (in `initState` → `Future.microtask`):
+1. `notifier.attachPreloaderContext(context)` — Creates AdaptivePreloader with context
+2. `notifier.initialize()` — Fires parallel MediaSource loads, drains first batch
+3. `notifier.setStartIndex(widget.startIndex)` — Jump to starting position if not zero
+4. `notifier.setInterval(settings.slideshowIntervalSeconds)` — Apply saved interval
+
+**Overlay** (auto-hides after 3 seconds in fullscreen, tracks via `_overlayTimer`):
 - **Top bar**: Back button, title, subreddit/author, NSFW badge, source label, more menu
 - **Queue indicator**: Horizontal scrollable chip list showing ±25 items around current index (tap to jump)
 - **Control bar**: Previous / Play-Pause / Next, Fullscreen toggle, Mute, Download, Share, Open on Reddit
 
 **Auto-advance**: Timer advances to next item (or gallery sub-item) after configurable interval (default 5 seconds). Resets on any navigation.
 
-**Preloading (5-tier priority queue system):**
-Preloading is managed via a priority queue (`_preloadQueue`) with concurrent download limit of 3.
-
-| Priority | Items | What's Preloaded |
-|---|---|---|
-| `urgent` | Current + immediate next | Image + video URLs |
-| `high` | Next 2-4 | Images only |
-| `medium` | Next 5-10 | Images only |
-| `low` | Next 11-30 | Images only |
-| `background` | Last 5 (history) | Images only |
-
-URLs are enqueued with a priority level and processed by `_processQueue()`. Preloaded URLs are tracked in a `_preloadedUrls` Set (max 500 entries). Active downloads are tracked in `_activeUrls` to prevent duplicate fetches. The concurrent limit (`_maxConcurrentPreloads = 3`) controls how many images are fetched simultaneously. Preloading uses `CachedNetworkImageProvider.precacheImage()`.
-
 **Gallery support:** Multi-image Reddit galleries tracked via `gallerySubIndex`. Gallery navigation stays within the current asset until all images are viewed, then advances to the next asset.
 
-**Error handling:** Media load errors are logged with structured info (`MediaErrorType`) and the slideshow advances to the next item. Video initialization has retry logic.
+**Session resume:** `_saveSession()` is called on `didChangeAppLifecycleState.paused` (stub implementation — currently a no-op).
 
 **Actions:**
-- **Download**: Downloads to temp directory via `Dio().download()` and shows a snackbar on completion. No user-visible file location or download progress indicator.
+- **Download**: Downloads to temp directory via `Dio().download()` and shows a snackbar on completion
 - **Share**: Via `share_plus`
-- **Open on Reddit**: Via `url_launcher`
+- **Open on Reddit**: Via `url_launcher` (constructs `reddit.com/r/{subreddit}/comments/{id}`)
 
 ### Slideshow Widgets
 
 | Widget | Purpose |
 |---|---|
-| `MediaViewer` | Dispatches to `VideoViewer` or `ImageViewer` based on asset type |
-| `VideoViewer` | `VideoPlayerController.networkUrl` with retry, thumbnail fallback on failure, mute support, tap to play/pause |
-| `ImageViewer` | Loads via `loadImageWithRetry`, displays with `InteractiveViewer` (pinch-to-zoom, double-tap zoom toggle) |
+| `MediaViewer` | Dispatches to `VideoViewer` or `ImageViewer` based on asset type (video/gallery/image). Logs render build time via `[RENDER_TIMELINE]` |
+| `VideoViewer` | `VideoPlayerController.networkUrl` with 1 retry on failure, thumbnail fallback, mute support, tap to play/pause. Logs `[VIDEO_ENTER]`, `[VIDEO_CONTROLLER_CREATE]`, `[VIDEO_INITIALIZE_START/DONE]`, `[VIDEO_PLAY]`, `[VIDEO_VISIBLE]` timing |
+| `ImageViewer` | Loads via `CachedNetworkImageProvider`, displays with `InteractiveViewer` (pinch-to-zoom, double-tap zoom toggle). Extensive performance logging: `[USER_REQUESTED_IMAGE]`, `[NEED_IMAGE]`, `[IMG_WIDGET_CREATED]`, `[CACHE_AUDIT]`, `[IMAGE_READY]`, `[IMAGE_VISIBLE]`. Async disk cache check via `DefaultCacheManager.getFileFromCache()` |
 | `SlideshowOverlay` | Gradient background overlay combining top bar, queue indicator, and controls |
 | `SlideshowControls` | Navigation row (prev/play-pause/next) + actions row (fullscreen, mute, download, share, open on Reddit) |
 | `QueueIndicator` | Horizontal scrollable chip list showing ±25 items around current index |
@@ -757,11 +910,11 @@ Organized into sections:
 
 | Section | Controls |
 |---|---|
-| **Backend** | Backend URL text field (edit dialog), health validation button (calls `/api/health`) |
+| **Backend** | Backend URL text field (edit dialog), health validation button (calls `/api/health` via raw `ApiClient`) |
 | **Content** | Subreddit management (bottom sheet with add/remove), NSFW toggle, default sort mode dropdown |
 | **Slideshow** | Interval selector radio dialog (3s / 5s / 10s / 15s / 30s) |
 | **Display** | Theme mode segmented button (System / Light / Dark) |
-| **Cache** | Clear session cache button (dialog, currently a stub; uses private `_SectionHeader` widget for section titles) |
+| **Cache** | Clear session cache button (dialog, currently a stub) |
 | **About** | App version (1.0.0+1), backend version from health check |
 
 **Subreddit management:** A bottom sheet displays the current list with delete buttons. A text field at the top allows adding new subreddits. Each change syncs to the backend via `POST /api/subreddits/sync`.
@@ -778,18 +931,172 @@ The Groups feature exists as a domain model (`GroupModel`) and a route (`/groups
 - `GroupSource` exists in `SlideshowSource` but is never instantiated
 - The `GroupsPlaceholderScreen` is a simple `StatelessWidget` with an icon and explanatory text
 
-### GroupModel Fields
+---
+
+## Core: MediaSource Abstraction
+
+**Path:** `lib/core/media/media_source.dart`
+
+The `MediaSource` abstract class provides a uniform interface for loading paginated media, unifying feed and search data sources.
 
 ```dart
-class GroupModel {
-  final String id;
-  final String name;
-  final List<String> subreddits;
-  final String? filter;
-  final String? coverImageUrl;
-  final bool enabled;  // default: true
+class MediaPage {
+  final List<MediaAsset> items;
+  final String? cursor;
+  final bool hasMore;
+}
+
+abstract class MediaSource {
+  Future<MediaPage> loadNext();
+  bool get hasMore;
+  Future<void> dispose();
 }
 ```
+
+### Implementations
+
+#### SubredditMediaSource
+
+**Path:** `lib/features/slideshow/data/subreddit_media_source.dart`
+
+Wraps `FeedRepository.getFeed()` as a `MediaSource`. Used for single and multi-subreddit slideshows.
+
+- Calls `_repository.getFeed(limit: mergeEngineBufferSize, after: cursor, subreddits:, sort:)`
+- Returns `MediaPage` with items, cursor, hasMore from the FeedResponse
+- Used by: `SubredditSource`, `MultiSubredditSource`, `GlobalFeedSource`, `GroupSource`
+
+#### SearchMediaSource
+
+**Path:** `lib/features/slideshow/data/search_media_source.dart`
+
+Wraps `SearchRepository.searchReddit()` as a `MediaSource`. Used for search-based slideshows.
+
+- Calls `_repository.searchReddit(query:, mode:, limit: mergeEngineBufferSize, after: cursor, subreddits:)`
+- Returns `MediaPage` with items, cursor, hasMore from the FeedResponse
+- Used by: `SearchSource`
+
+---
+
+## Core: AdaptivePreloader
+
+**Path:** `lib/features/slideshow/domain/adaptive_preloader.dart`
+
+A standalone priority-queue-based image preloader, extracted from the old inline preload system in `SlideshowScreen`. Manages preloading via a priority queue with concurrent download limit.
+
+### Data structures:
+- `_LruSet` — LRU-tracked set of preloaded URLs (max 500 entries)
+- `_activeUrls` — Set of URLs currently being downloaded
+- `_queuedUrls` — Set of URLs queued for download
+- `_preloadQueue` — `List<_PreloadTask>` sorted by `_PreloadPriority` enum
+- `_inFlightPreloads` — Counter of concurrent downloads
+- `_maxConcurrentPreloads = 3`
+
+### Priority Levels:
+
+| Priority | Level | When |
+|---|---|---|
+| `urgent` | 0 | Current item + immediate next window |
+| `high` | 1 | Medium-range items ahead |
+| `medium` | 2 | Far ahead (tier1+tier2) |
+| `background` | 3 | History items (last 5) |
+
+### Flow:
+
+```
+AdaptivePreloader(playlist, onLoadMore, context)
+  │
+  └── onIndexChanged(currentIndex)
+      │
+      ├── Current item: urgent (includes video URL if present, gallery URLs)
+      ├── Next N items (adaptive: 6-12 based on remaining count): urgent
+      ├── Next M items (adaptive): high priority
+      ├── Far ahead (tier1+tier2): medium priority
+      ├── History (last 5): background priority
+      │
+      ├── _enqueueUrl() for each URL
+      │     ├── Skip if already in _preloadedUrls, _activeUrls, _queuedUrls, or ImageCache
+      │     └── Insert into _preloadQueue sorted by priority (lower index = higher priority)
+      │
+      ├── _processQueue()
+      │     └── While _inFlightPreloads < 3 and queue not empty:
+      │           ├── Remove first task from queue
+      │           └── _executePreload(url) via precacheImage(CachedNetworkImageProvider)
+      │
+      └── _checkLoadMore(currentIndex)
+            └── If remaining items ≤ preloadTriggerRemaining (30):
+                  └── unawaited(_onLoadMore())  // triggers MergeEngine autoRefill
+```
+
+### Adaptive Window Sizing:
+- remaining >= 40 → wide window (urgent: 12 items ahead)
+- remaining < 15 → tight window (urgent: 6 items ahead)
+- otherwise → normal (urgent: 8 items ahead)
+
+### Key Methods:
+| Method | Purpose |
+|---|---|
+| `onIndexChanged(currentIndex)` | Main entry point — recalculates priority queue for new position |
+| `_enqueueUrl(url, priority)` | Adds URL to priority queue with dedup checks (preloaded, active, queued, cached) |
+| `_processQueue()` | Drains queue up to max concurrent limit |
+| `_executePreload(url)` | Preloads one image via `CachedNetworkImageProvider.precacheImage()` |
+| `_checkLoadMore(index)` | Triggers loadMore when playlist is running low |
+| `dispose()` | Clears all tracking sets, queues, and active URLs |
+
+**Memory tracking**: Preloaded URLs tracked in `_LruSet` (max 500). Dedup checks also include `ImageCache.containsKey()` to avoid re-preloading.
+
+---
+
+## Core: PlaylistManager
+
+**Path:** `lib/features/slideshow/domain/playlist_manager.dart`
+
+A simple list+index manager separated from `SlideshowState`. Used by both `SlideshowNotifier` and `AdaptivePreloader`.
+
+```dart
+class PlaylistManager {
+  List<MediaAsset> get items;
+  int get currentIndex;
+  int get length;
+  bool get hasPrevious / hasNext / isNearEnd;
+  MediaAsset? get current;
+  MediaAsset? itemAt(int index);
+
+  void append(List<MediaAsset> items);
+  MediaAsset? next();
+  MediaAsset? previous();
+  void jumpTo(int index);
+  bool advance();          // Advance index without returning item
+  int get remainingCount;  // items.length - currentIndex - 1
+  void clear();
+  void dispose();
+}
+```
+
+Key design: `items` and `currentIndex` are managed in the `PlaylistManager` rather than copied into state on every change. `_syncState()` copies the playlist state into `SlideshowState` for reactive UI updates.
+
+---
+
+## Media Loading & Preloading
+
+### SafeNetworkImage
+
+**Path:** `lib/core/media/safe_network_image.dart`
+
+A `StatefulWidget` that loads images via `CachedNetworkImageProvider` and displays using `Image.memory`. Used as thumbnail fallback in `VideoViewer`. Provides retry logic and error state handling.
+
+### MediaError
+
+**Path:** `lib/core/media/media_error.dart`
+
+**Enum:** `MediaErrorType` — `http404`, `http410`, `timeout`, `socketError`, `videoInitError`, `unknown`
+
+**Function:** `logMediaError(...)` — Logs structured error info with action label (`SKIP_GALLERY_NEXT` or `SKIP_NEXT`). Records reddit_id, subreddit, url, errorType, isGallery, isLastInGallery.
+
+### Image Cache Configuration
+
+Configured in `main.dart`:
+- `PaintingBinding.instance.imageCache.maximumSize = 500` (entries)
+- `PaintingBinding.instance.imageCache.maximumSizeBytes = 200 * 1024 * 1024` (200MB)
 
 ---
 
@@ -825,6 +1132,13 @@ class GroupModel {
 | `maxRetries` | 3 | Max retries for pagination errors |
 | `overlayAutoHideMs` | 3000 | Auto-hide overlay in fullscreen |
 | `paginationPageSize` | 50 | Items per page fetch |
+| `mergeEngineBufferSize` | 25 | Items per buffer refill fetch |
+| `imageCacheCapacity` | 500 | ImageCache max entries |
+| `imageCacheSizeMb` | 200 | ImageCache max size (MB) |
+| `maxConcurrentPreloads` | 3 | Parallel preload downloads |
+| `preloadedUrlSetMaxSize` | 500 | LRU set max for preload tracking |
+| `preloadCheckIntervalMs` | 100 | Preload interval |
+| `videoPreloadWindow` | 2 | Videos ahead to prepare |
 
 ### API Constants
 
@@ -850,41 +1164,6 @@ class GroupModel {
 
 ---
 
-## Media Loading
-
-**Path:** `lib/core/media/`
-
-### ImageLoader
-
-**Key function:** `loadImageWithRetry(String url)` → `ImageLoadResult`
-
-1. Checks `DefaultCacheManager` (flutter_cache_manager) for cached copy
-2. If missing, fetches via dedicated Dio instance (`_mediaDio`) with 10s connect, 20s receive, 10s send timeout
-3. On timeout/connection error: retries once
-4. Caches successful results to disk via `DefaultCacheManager`
-5. Returns `ImageLoadResult(status, bytes, errorType)`
-
-```dart
-enum ImageLoadStatus { success, failure }
-class ImageLoadResult {
-  final ImageLoadStatus status;
-  final Uint8List? bytes;
-  final MediaErrorType? errorType;
-}
-```
-
-### MediaError
-
-**Enum:** `MediaErrorType` — `http404`, `http410`, `timeout`, `socketError`, `videoInitError`, `unknown`
-
-**Function:** `logMediaError(...)` — Logs structured error info with action label (`SKIP_GALLERY_NEXT` or `SKIP_NEXT`)
-
-### SafeNetworkImage
-
-A `StatefulWidget` that loads images via `loadImageWithRetry` and displays using `Image.memory`. Used as thumbnail fallback in `VideoViewer`.
-
----
-
 ## Utilities & Extensions
 
 ### UrlSanitizer
@@ -905,6 +1184,18 @@ Methods: `sanitize(String)`, `sanitizeOptional(String?)`, `sanitizeAll(List<Stri
 **Path:** `lib/core/utils/debouncer.dart`
 
 Generic debounce utility with `call()`, `cancel()`, `dispose()` methods. Used in search (500ms debounce).
+
+### PipelineTimer
+
+**Path:** `lib/core/utils/pipeline_timer.dart`
+
+Performance timing utility that logs render timeline with `[RENDER_TIMELINE]` prefix. Tracks elapsed time between stages (mark points). Used in `SlideshowNotifier.next()` for performance debugging.
+
+```dart
+PipelineTimer({required String label})
+  ├── mark(String stage)  → log elapsed + since-last
+  └── end()               → log final elapsed
+```
 
 ### Extensions
 
@@ -933,7 +1224,7 @@ Generic debounce utility with `call()`, `cancel()`, `dispose()` methods. Used in
 
 | Method | Endpoint | Feature | Parameters |
 |---|---|---|---|
-| GET | `/api/feed` | Feed | `limit`, `after`, `subreddits`, `sort` |
+| GET | `/api/feed` | Feed | `limit`, `after`, `subreddits` (single only), `sort` |
 | GET | `/api/feed/queue` | Feed | — |
 | GET | `/api/search` | Search | `q`, `limit`, `page`, `subreddits`, `media_type`, `sort` |
 | GET | `/api/search/debug` | Search | `q`, `limit`, `page` |
@@ -942,6 +1233,8 @@ Generic debounce utility with `call()`, `cancel()`, `dispose()` methods. Used in
 | GET | `/api/media/{id}` | Feed | — |
 | POST | `/api/media/start/{id}` | Feed | — |
 | POST | `/api/subreddits/sync` | Settings | `{subreddits: [...]}` |
+
+**Important**: The backend rejects multi-subreddit requests to `/api/feed` with status 400. The Flutter Merge Engine handles multi-subreddit merging client-side.
 
 ### Error Handling Flow
 
@@ -982,7 +1275,7 @@ main()
               │
               ├── If settings loaded:
               │     ├── If first load + valid URL + subreddits:
-              │     │     └── POST /api/subreddits/sync
+              │     │     └── POST /api/subreddits/sync  (via raw ApiClient)
               │     ├── Build MaterialApp.router
               │     │     ├── routerProvider → GoRouter
               │     │     ├── ThemeData (light + dark)
@@ -990,7 +1283,7 @@ main()
               │     └── Show the app
               │
               └── If loading: CircularProgressIndicator
-              └── If error: "Failed to load settings"
+              └── If error: Text('Failed to load settings')
 ```
 
 ### Media Browsing Flow
@@ -1007,6 +1300,8 @@ User opens SubredditScreen (/subreddit/:name)
   │           ├── Call FeedRepository.getFeed(limit: 50, subreddits: name)
   │           │     └── ApiClient.get(/api/feed?limit=50&subreddits=name)
   │           │           ├── Success → FeedResponse.fromJson(json)
+  │           │           │     Backend: cursor-based on media_assets
+  │           │           │     (single subreddit only; multi-sub→400)
   │           │           └── Failure → wraps AppError
   │           └── Update state (items, hasMore, after, isLoading: false)
   │
@@ -1023,52 +1318,77 @@ User types query in SearchScreen
   │
   ├── Debounce 500ms → searchProvider.search(query)
   │     ├── state = (isLoading: true, query: query)
-  │     ├── Sync selected subreddits from settings
+  │     ├── Sync selected subreddits from settings (intersection)
   │     ├── Call SearchRepository.searchReddit()
   │     │     └── ApiClient.get(/api/search/reddit?q=...&mode=...)
-  │     │         Backend (accumulation-based, v3+):
-  │     │           Global mode: scans up to 20 pages until target (limit×4)
-  │     │             media items found or 5s budget exhausted
-  │     │           Local mode: searches each subreddit individually
-  │     │             (workaround for Reddit multi-subreddit API bug),
-  │     │             merges & deduplicates
-  │     │           Returns FeedResponse directly (no caching)
-  │     └── Update state (results, hasMore, isLoading: false)
+  │   │           Backend (accumulation-based, v4.1):
+  │   │             Global mode: scans up to 20 pages until target (limit×4)
+  │   │             media items found or 5s budget exhausted
+  │   │           Local mode: searches each subreddit individually
+  │   │             (workaround for Reddit multi-subreddit API bug),
+  │   │             merges & deduplicates
+  │   │           Returns FeedResponse directly (no caching)
+  │     └── Update state (results, hasMore, afterCursor, isLoading: false)
   │
   ├── User taps "Start Slideshow" → push /slideshow with SearchSource
   │
   └── User scrolls → searchNotifier.loadMore()
+        (deduplicates by MediaAsset.id; caps at 1000 items)
         Note: local search always returns after=None, so loadMore only
         works meaningfully in global mode
 ```
 
-### Slideshow Flow
+### Slideshow Flow (with MergeEngine + MediaSource)
 
 ```
-User starts slideshow (from search, subreddit, or home)
+User starts slideshow (MultiSubredditSource from home)
   │
   ├── slideshowProvider(source) is created
-  │     └── SlideshowNotifier constructor → state = (isLoading: true)
+  │     └── SlideshowNotifier constructor
+  │           ├── Creates PlaylistManager
+  │           ├── _buildMediaSources() → List<MediaSource>
+  │           └── MergeEngine(sources: mediaSources)
   │
-  ├── initialize() → _loadInitialItems()
-  │     └── _fetchPage(cursor: null)
-  │           ├── SubredditSource → FeedRepository.getFeed(...)
-  │           ├── SearchSource    → SearchRepository.searchReddit(...)
-  │           ├── MultiSubreddit  → FeedRepository.getFeed(...)
-  │           └── GlobalFeed     → FeedRepository.getFeed(...)
-  │     └── Update state (items, hasMorePages, paginationCursor)
-  │     └── Start auto-advance timer
+  ├── SlideshowScreen.initState()
+  │     ├── notifier.attachPreloaderContext(context)
+  │     │     └── Creates AdaptivePreloader(playlist, onLoadMore, context)
+  │     ├── notifier.initialize()
+  │     │     ├── engine.initialize()
+  │     │     │     ├── Create N SourceBuffers (one per MediaSource)
+  │     │     │     ├── Fire N parallel source.loadNext() calls
+  │     │     │     │     └── SubredditMediaSource → FeedRepository.getFeed()
+  │     │     │     ├── generateBatch(20) via round-robin + scoring
+  │     │     │     └── drainMerged() → first batch of items
+  │     │     ├── _playlist.append(items)
+  │     │     └── state = (items, isLoading: false)
+  │     ├── notifier.setStartIndex(startIndex)  // if > 0
+  │     └── notifier.setInterval(settings.interval)
+  │
+  ├── User navigates → next() / previous()
+  │     ├── _playlist.next() / _playlist.previous()
+  │     ├── _syncState() → copies playlist to state
+  │     ├── _restartAutoAdvance()
+  │     └── _notifyPreloader() → _preloader.onIndexChanged(index)
+  │           ├── Enqueue URLs for current, upcoming, far, history
+  │           └── _checkLoadMore() if remaining ≤ 30
   │
   ├── Auto-advance timer fires → galleryNext()
   │     ├── If gallery asset + more images → advance gallerySubIndex
-  │     ├── Else → currentIndex++
-  │     └── Restart auto-advance timer
+  │     ├── Else → _playlist.next()
+  │     └── _restartAutoAdvance() + _notifyPreloader()
   │
-  ├── remaining ≤ 30 → trigger _checkPreload() → loadMore()
-  │     └── _fetchPage(cursor: paginationCursor)
-  │           └── Append to items
+  ├── Load more triggered:
+  │     └── MergeEngine.autoRefill()
+  │           ├── Check each SourceBuffer:
+  │           │     if remaining < 8 and hasMore → loadNextPage()
+  │           └── generateBatch() → drainMerged() → _playlist.append()
   │
-  └── User exits → dispose() (cancel timers)
+  └── User exits → dispose()
+        ├── Cancel auto-advance timer
+        ├── Cancel overlay timer
+        ├── _preloader.dispose()
+        ├── _mergeEngine.dispose()  (disposes all MediaSources)
+        └── _playlist.dispose()
 ```
 
 ### Settings Change Flow
@@ -1081,7 +1401,7 @@ User changes setting in SettingsScreen
   │     ├── SettingsRepository.saveFull(updated)
   │     │     └── SharedPreferences.setString/setBool/setStringList
   │     └── If subreddit change: _syncSubredditsToBackend()
-  │           └── POST /api/subreddits/sync
+  │           └── POST /api/subreddits/sync (via raw ApiClient)
   │
   └── Widgets watching settingsProvider rebuild
 ```
@@ -1099,6 +1419,7 @@ loadMore() called
   │
   ├── On Success:
   │     ├── Append data.items to existing items
+  │     │     (SearchNotifier deduplicates by MediaAsset.id, caps at 1000)
   │     ├── state = (isLoadingMore: false, hasMore: data.hasMore, after: data.after)
   │     └── Trigger preload check (slideshow only)
   │
@@ -1106,6 +1427,12 @@ loadMore() called
         ├── Increment retry count
         ├── If retries < maxRetries: retry with exponential backoff (2s, 4s, 6s)
         └── Else: state = (isLoadingMore: false)
+
+  Merge Engine Path (slideshow only):
+    ├── Refill buffers below low-watermark (8 remaining)
+    ├── Load next page from each MediaSource via source.loadNext()
+    ├── Generate new batch from unconsumed items
+    └── State: (hasMorePages = hasMoreSources)
 ```
 
 ---
@@ -1117,16 +1444,20 @@ loadMore() called
 1. **No automated tests** — Only a single smoke test that checks `RedSlideApp` renders
 2. **No internationalization** — `lib/l10n/` is empty, all strings hardcoded in English
 3. **Groups feature** — Only a placeholder screen, `GroupModel` unused, `GroupSource` never instantiated
-4. **Session resume** — `resumeSessionProvider` (defined in `home_screen.dart`) is a stub returning `null`; slideshow session state is not saved across app restarts
+4. **Session resume** — `resumeSessionProvider` is a stub returning `null`; `_saveSession()` is a no-op
 5. **Cache clearing** — Clear cache button triggers a dialog but is a no-op
-6. **Download** — Downloads to temp directory via `Dio().download()`. No user-visible file location, no progress indicator, and files are in a temp directory that may be cleaned up by the OS.
+6. **Download** — Downloads to temp directory via `Dio().download()`. No user-visible file location, no progress indicator, and files are in a temp directory
 7. **Permissions** — `permission_handler` is declared as dependency but never used
-8. **Code generation** — `freezed` and `json_serializable` annotations are present in `pubspec.yaml` models are hand-written with `copyWith`/`toJson`/`fromJson` instead of using generated code
-9. **FTS5 search endpoint** — The app calls `/api/search/reddit` (a Reddit proxy endpoint) instead of the backend's own FTS5 `/api/search` in most paths
-10. **Queue status chip** — The queue indicator in the app bar is a placeholder/debug display, not a polished UI element
+8. **Code generation** — `freezed` and `json_serializable` annotations are present but generators are not run; models are hand-written
+9. **Backend URL validation** — `SettingsNotifier.validateBackendUrl()` only checks for empty string. In `SettingsScreen._validateUrl()`, a raw `ApiClient` is created directly to make `GET /api/health`
+10. **Local search loadMore** — Local mode search returns `after=None` (cursorless), so infinite scroll pagination does not work for local searches; only global mode supports cursor-based `loadMore`
 11. **Search history** — Recent queries are tracked in-memory only (not persisted) and reset on app restart
-12. **Backend URL validation** — `SettingsNotifier.validateBackendUrl()` only checks for empty string (no HTTP call). In `SettingsScreen._validateUrl()`, a **raw `ApiClient`** is created directly (not via `FeedRepository`) to make a `GET /api/health` call. This bypasses the `apiClientProvider` dependency injection pattern.
-13. **Local search loadMore** — Local mode search returns `after=None` (cursorless), so infinite scroll pagination in the search results grid does not work for local searches; only global mode supports cursor-based `loadMore`
+12. **Subreddit sync on startup** — `app.dart` creates a raw `ApiClient` for initial sync, bypassing `apiClientProvider`
+13. **Settings subreddit sync** — `settings_provider.dart` also creates raw `ApiClient` instances, bypassing DI
+14. **Preload system memory** — Preloading uses `CachedNetworkImageProvider.precacheImage()` which adds to `ImageCache`. With aggressive preloading (up to 30 items ahead), memory pressure may be significant on low-end devices
+15. **No `chewie` package** — Despite earlier plans, video playback uses raw `video_player` without `chewie` wrapper
+16. **No `image_loader.dart`** — The previous `loadImageWithRetry` utility was removed. Image loading now uses `CachedNetworkImageProvider` directly
+17. **AdaptivePreloader requires BuildContext injection** — The preloader is created separately from the notifier via `attachPreloaderContext()`, which means preloading only starts after the screen is mounted
 
 ### Backend Referenced
 

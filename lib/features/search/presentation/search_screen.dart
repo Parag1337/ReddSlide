@@ -1,3 +1,4 @@
+import 'dart:math' show max;
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
@@ -59,6 +60,17 @@ class _SearchScreenState extends ConsumerState<SearchScreen> {
     final theme = Theme.of(context);
     final allSubreddits = settings?.subreddits ?? [];
     final hasSearched = _currentQuery.isNotEmpty;
+
+    debugPrint('[TRACE_GRID_BUILD] hasSearched=$hasSearched query="$_currentQuery" '
+        'results=${searchState.results.length} isLoading=${searchState.isLoading} '
+        'isLoadingMore=${searchState.isLoadingMore} hasMore=${searchState.hasMore} '
+        'totalResults=${searchState.totalResults} error=${searchState.error != null}');
+
+    if (searchState.results.length > 0) {
+      final firstIds = searchState.results.take(3).map((e) => e.id).join(',');
+      final lastIds = searchState.results.skip(max(0, searchState.results.length - 3)).map((e) => e.id).join(',');
+      debugPrint('[TRACE_GRID_ITEMS] first3=[$firstIds] last3=[$lastIds]');
+    }
 
     return Scaffold(
       appBar: AppBar(
@@ -260,6 +272,7 @@ class _SearchScreenState extends ConsumerState<SearchScreen> {
 
   Widget _buildResults(SearchState searchState, ThemeData theme, List<String> allSubreddits) {
     final resultCount = searchState.totalResults > 0 ? searchState.totalResults : searchState.results.length;
+    debugPrint('[TRACE_BUILD_RESULTS] totalResults=${searchState.totalResults} results.length=${searchState.results.length} displayCount=$resultCount');
 
     return Column(
       children: [
@@ -339,6 +352,8 @@ class _SearchScreenState extends ConsumerState<SearchScreen> {
   Widget _buildResultsGrid(SearchState searchState, ThemeData theme) {
     final screenWidth = MediaQuery.of(context).size.width;
     final crossAxisCount = screenWidth >= 900 ? 4 : (screenWidth >= 600 ? 3 : 2);
+
+    debugPrint('[TRACE_GRID_RENDER] itemCount=${searchState.results.length} crossAxisCount=$crossAxisCount');
 
     return NotificationListener<ScrollNotification>(
       onNotification: (notification) {

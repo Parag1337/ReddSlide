@@ -20,20 +20,28 @@ class MediaViewer extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    if (asset.isVideo && asset.videoUrl != null) {
-      return VideoViewer(
-        videoUrl: asset.videoUrl!,
-        thumbnailUrl: asset.thumbnailUrl ?? asset.mediaUrl,
-        muted: isMuted,
-        onError: onMediaError,
-      );
+    final buildSw = Stopwatch()..start();
+
+    final widget = asset.isVideo && asset.videoUrl != null
+        ? VideoViewer(
+            videoUrl: asset.videoUrl!,
+            thumbnailUrl: asset.thumbnailUrl ?? asset.mediaUrl,
+            muted: isMuted,
+            onError: onMediaError,
+          )
+        : asset.isGallery && asset.galleryUrls != null && asset.galleryUrls!.isNotEmpty
+            ? ImageViewer(
+                imageUrl: asset.galleryUrls![galleryIndex.clamp(0, asset.galleryUrls!.length - 1)],
+                onError: onMediaError,
+              )
+            : ImageViewer(imageUrl: asset.mediaUrl, onError: onMediaError);
+
+    final buildMs = buildSw.elapsedMilliseconds;
+    if (buildMs > 1) {
+      debugPrint('[RENDER_TIMELINE] MediaViewer.build '
+          'asset=${asset.id} type=${asset.isVideo ? "video" : "image"} buildMs=$buildMs');
     }
 
-    if (asset.isGallery && asset.galleryUrls != null && asset.galleryUrls!.isNotEmpty) {
-      final url = asset.galleryUrls![galleryIndex.clamp(0, asset.galleryUrls!.length - 1)];
-      return ImageViewer(imageUrl: url, onError: onMediaError);
-    }
-
-    return ImageViewer(imageUrl: asset.mediaUrl, onError: onMediaError);
+    return widget;
   }
 }

@@ -24,7 +24,8 @@
 ### Key Design Principles
 - **Client-driven subreddit management**: Backend starts with zero subreddits. The Flutter client syncs subscribed subreddits via `/api/subreddits/sync`.
 - **On-demand + background fetching**: Subreddit content is fetched immediately on first request and refilled in the background every 60 seconds.
-- **Cursor-based pagination**: Fetched media positions are tracked per subreddit+sort combination in `subreddit_configs` to enable incremental refills.
+- **Cursor-based pagination**: All feed pagination is cursor-based on `media_assets` using `(created_utc DESC, reddit_id DESC)` composite cursor. No offset-based pagination is used for feeds.
+- **Flutter-side multi-subreddit merging**: The backend does NOT merge multiple subreddits — it returns 400 if asked to. The Flutter Merge Engine handles multi-subreddit merging client-side.
 - **Provider failover**: Primary provider (Reddit OAuth) falls back to Redlib if failures exceed threshold (circuit breaker pattern).
 - **Quality filtering**: Media assets must meet minimum resolution (400x300) to be stored.
 
@@ -45,6 +46,21 @@
 │  │                    ApiClient (Dio/HTTP)                         │  │
 │  │  FeedRepository · SearchRepository · SettingsRepository       │  │
 │  └─────────────────────────────┬──────────────────────────────────┘  │
+│                                │                                      │
+│  ┌─────────────────────────────▼──────────────────────────────────┐  │
+│  │  MediaSource abstraction (loadNext / hasMore / dispose)        │  │
+│  │  ┌──────────────────┐ ┌──────────────────┐                    │  │
+│  │  │ SubredditMediaSrc│ │ SearchMediaSource│                    │  │
+│  │  │ (FeedRepository) │ │ (SearchRepo)     │                    │  │
+│  │  └────────┬─────────┘ └────────┬─────────┘                    │  │
+│  │           │                    │                               │  │
+│  │  ┌────────▼────────────────────▼──────────────────────────┐  │  │
+│  │  │  MergeEngine (Flutter-side multi-subreddit merger)      │  │  │
+│  │  │  · SourceBuffer per MediaSource (loadNext calls)        │  │  │
+│  │  │  · Round-robin selection with freshness + diversity    │  │  │
+│  │  │  · Auto-refill at low watermark (8 remaining)           │  │  │
+│  │  └─────────────────────────────────────────────────────────┘  │  │
+│  └─────────────────────────────────────────────────────────────────┘  │
 └────────────────────────────────┼──────────────────────────────────────┘
                                  │ HTTP REST
                                  ▼
@@ -53,8 +69,9 @@
 │                                                                         │
 │  ┌──────────────────────────────────────────────────────────────────┐  │
 │  │  FastAPI App (app/main.py)                                       │  │
-│  │  Routers: feed (/api/feed*), search (/api/search*), debug       │  │
-│  │           /api/health, /api/media*, /api/subreddits*             │  │
+│  │  Routers: feed (/api/feed), search (/api/search*),              │  │
+│  │           debug  (/api/health, /api/debug*)                      │  │
+│  │           /api/media*, /api/subreddits*                          │  │
 │  └──────────────────────────┬───────────────────────────────────────┘  │
 │                             │                                           │
 │  ┌──────────────────────────▼───────────────────────────────────────┐  │
@@ -67,12 +84,14 @@
 │  │  │   · Gallery URLs     │  │   · _fetch_redlib() (stub)   │   │  │
 │  │  │   · Subreddit config │  │   · _parse_reddit_response()  │   │  │
 │  │  │   · fetch_and_store()│  │   · validate_media()         │   │  │
+│  │  │   · get_subreddit_assets() (PRIMARY)                     │   │  │
 │  │  └─────────────────────┘  └──────────┬─────────────────────┘   │  │
 │  │                                       │                           │
 │  │  ┌────────────────────────────────────▼────────────────────────┐ │  │
 │  │  │   BackgroundRefreshService (APScheduler)                    │ │  │
 │  │  │   · Refresh job (every 60s): picks subreddit with lowest   │ │  │
-│  │  │     count, fetches next page via cursor, stores in queue    │ │  │
+│  │  │     asset count (< 300), fetches next page via cursor,     │ │  │
+│  │  │     stores in queue, updates cursor                        │ │  │
 │  │  │   · Cleanup job (every 24h): removes queue items >30 days  │ │  │
 │  │  └─────────────────────────────────────────────────────────────┘ │  │
 │  └────────────────────────────────┬──────────────────────────────────┘  │
@@ -105,7 +124,7 @@
 backend/
 ├── main.py                          # Server entry point (uvicorn)
 ├── app/
-│   ├── __init__.py                  # Empty (0 lines)
+│   ├── __init__.py                  # Empty
 │   ├── main.py                      # FastAPI app + lifespan (DB init, OAuth, background svc)
 │   ├── core/
 │   │   ├── database.py              # SQLite schema, migrations, connection helper
@@ -123,7 +142,7 @@ backend/
 │   │   └── background_service.py    # BackgroundRefreshService — APScheduler jobs
 │   └── api/
 │       ├── __init__.py              # Imports feed, debug, search routers
-│       ├── feed.py                  # /api/feed*, /api/media*, /api/subreddits*, /api/search, /api/search/debug
+│       ├── feed.py                  # /api/feed, /api/media*, /api/subreddits*, /api/search*
 │       ├── search.py                # /api/search/reddit (direct Reddit search)
 │       └── debug.py                 # /api/health, /api/debug/*
 ├── data/
@@ -185,8 +204,8 @@ The server starts via `backend/main.py`, which runs `uvicorn` on `app.main:app`.
 
 | Method | Endpoint | Description | Query Params |
 |--------|----------|-------------|--------------|
-| GET | `/api/feed` | Paginated media feed | `limit` (max 100), `after` (offset/cursor), `subreddits` (comma-sep), `sort` |
-| GET | `/api/feed/queue` | Queue status | `limit` |
+| GET | `/api/feed` | Paginated media feed (single subreddit or all) | `limit` (max 100), `after` (cursor), `subreddits` (single only), `sort` |
+| GET | `/api/feed/queue` | Queue status (deprecated) | `limit` |
 | GET | `/api/search` | FTS5 full-text search | `q` (required), `limit`, `page`, `subreddits`, `media_type`, `sort` |
 | GET | `/api/search/debug` | LIKE-based search fallback | `q` (required) |
 | GET | `/api/search/reddit` | Live Reddit search (no cache) | `q`, `mode` (global/local), `limit`, `after`, `subreddits` |
@@ -202,44 +221,26 @@ The server starts via `backend/main.py`, which runs `uvicorn` on `app.main:app`.
 
 #### GET /api/feed
 
-The feed endpoint has two internal code paths controlled by the `SLIDESHOW_SOURCE` environment variable:
-
-**Path A: `SLIDESHOW_SOURCE=assets` (default) — Cursor-based on media_assets**
-Used when a single subreddit is requested. Paginates directly on the `media_assets` table using a composite cursor of `(created_utc DESC, reddit_id DESC)` via `QueueManager.get_subreddit_assets()`. This bypasses `media_queue` entirely.
+The feed endpoint uses cursor-based pagination on `media_assets` table. Multi-subreddit requests are rejected.
 
 ```
 1. Parse query params (limit, after/cursor, subreddits, sort)
-2. If single subreddit requested:
-   → Call get_subreddit_assets(subreddit, limit, after_cursor)
-     → SELECT from media_assets WHERE subreddit=?
+2. Reject multi-subreddit requests with 400:
+     "Multi subreddit handled by Flutter Merge Engine."
+3. Single subreddit or no subreddits:
+   → Call QueueManager.get_subreddit_assets(subreddit, limit, after_cursor)
+     → SELECT from media_assets WHERE subreddit=? (or all if subreddit is None)
        ORDER BY created_utc DESC, reddit_id DESC LIMIT ?+1
      → Cursor format: "created_utc,reddit_id"
      → Returns (items, has_more, new_cursor)
-3. If no items AND first page:
+4. If no items AND single subreddit AND first page:
    → Synchronous on-demand fetch via ensure_subreddit_has_content()
-4. If items < limit:
-   → Fire async background refill for the subreddit
-   → Return has_more=True so frontend keeps polling
+   → Re-query after fetch
 5. Enrich items with gallery URLs via get_gallery_urls()
 6. Return FeedResponse(items, after=cursor, has_more)
 ```
 
-**Path B: `SLIDESHOW_SOURCE=queue` — Offset-based on media_queue**
-Used when multiple subreddits are requested, no subreddits specified, or the env var is set to `"queue"`. Paginates on `media_queue` joined with `media_assets` using LIMIT/OFFSET.
-
-```
-1. Parse query params (limit, after/offset, subreddits, sort)
-2. Call QueueManager.get_queue_items(limit, offset, subreddits)
-   → JOIN media_assets + media_queue, ORDER BY position, LIMIT/OFFSET
-3. If no items AND subreddits requested AND first page (offset=0):
-   → Synchronous on-demand fetch: call ensure_subreddit_has_content() for each
-   → Re-query after fetch
-4. If subreddit-scoped AND items < limit:
-   → Fire async background refill for the subreddit
-   → Always return has_more=True so frontend keeps polling
-5. Enrich items with gallery URLs via get_gallery_urls()
-6. Return FeedResponse(items, after, has_more)
-```
+**Key design decision**: Multiple subreddits are NOT merged server-side. The Flutter Merge Engine fires N parallel requests (one per subreddit) and merges them client-side with round-robin, freshness scoring, and deduplication.
 
 #### POST /api/subreddits/sync
 
@@ -247,9 +248,18 @@ Used when multiple subreddits are requested, no subreddits specified, or the env
 1. Receive subreddit list from Flutter client
 2. Compute diff: added = incoming - current, removed = current - incoming
 3. Insert/update subreddit_configs for added subreddits (enabled=1)
-4. Disable removed subreddits (enabled=0) — background service stops fetching them
+4. Disable removed subreddits (enabled=0) — also deletes their queue items
 5. Fire async ensure_subreddit_has_content() for each added subreddit
-6. Return sync summary
+6. Return sync summary {synced, added, removed, total}
+```
+
+#### POST /api/subreddits/fetch
+
+```
+1. Clean and lower subreddit name
+2. Add/update subreddit_configs (enabled=1)
+3. Call QueueManager.fetch_and_store(subreddit)
+4. Return {subreddit, fetched}
 ```
 
 #### GET /api/search/reddit
@@ -264,10 +274,12 @@ Used when multiple subreddits are requested, no subreddits specified, or the env
    │   within SEARCH_TIME_BUDGET_SECONDS (5s). Uses single Reddit OAuth
    │   search request per page, passes restrict_sr=on if subreddits given.
    │
-   └── Local mode: Calls _search_local_multi() — searches EACH selected
-       subreddit individually via _accumulate_search(), then merges and
-       deduplicates by post id. Bypasses Reddit's multi-subreddit search
-       (r/sub1+sub2/search) which returns 0 results for many queries.
+   └── Local mode: Calls _search_local_multi(query, subreddits, target_results)
+       — searches EACH selected subreddit individually via _accumulate_search()
+       (accepts after parameter but cursor is always returned as None in local
+       mode, preventing incremental pagination), then merges and deduplicates
+       by post id. Bypasses Reddit's multi-subreddit search bug
+       (r/sub1+sub2/search returns 0 results for many queries).
        Passes include_over_18=on for NSFW content.
 
 4. _parse_post() converts raw dicts → MediaAsset objects
@@ -275,6 +287,8 @@ Used when multiple subreddits are requested, no subreddits specified, or the env
 6. _asset_to_response() enriches with gallery URLs
 7. Return FeedResponse (NO storage in search_results table)
 ```
+
+**Error handling**: The entire `search_reddit()` call is wrapped in try/except. On any exception, returns `FeedResponse(items=[], after=None, has_more=False)`.
 
 #### GET /api/search (FTS5)
 
@@ -309,6 +323,7 @@ Used when multiple subreddits are requested, no subreddits specified, or the env
   "width": "integer|null",
   "height": "integer|null",
   "duration": "integer|null",
+  "created_utc": "integer|null",
   "gallery_urls": "string[]|null"
 }
 
@@ -347,31 +362,35 @@ Used when multiple subreddits are requested, no subreddits specified, or the env
 
 The central service for queue and subreddit management.
 
-**Queue thresholds:**
+**Note on deprecation**: The `media_queue`-based approach (slide show sourced from queue) is deprecated. The primary feed path uses cursor-based pagination directly on `media_assets` via `get_subreddit_assets()`. Queue methods (`get_queue_items()`, `manage_queue()`, `_refill_queue()`) are marked as deprecated and no longer used by the slideshow.
+
+**Queue thresholds (used only by background service for per-subreddit refill):**
 | Threshold | Value | Action |
 |-----------|-------|--------|
-| MAX | 1000 | Trim excess |
+| MAX | 1000 | Trim excess (deprecated) |
 | MIN | 500 | — |
 | REFILL | 300 | Refill when below |
-| EMERGENCY | 100 | Emergency refill (200 items) |
+| EMERGENCY | 100 | Emergency refill (200 items) (deprecated) |
 
 **Key methods:**
 
 | Method | Purpose |
 |--------|---------|
-| `get_queue_items(limit, offset, subreddits)` | Fetch queue with optional subreddit filter. Returns `(items, has_more)` |
-| `get_subreddit_assets(subreddit, limit, after_cursor)` | Cursor-based pagination on `media_assets` by `(created_utc DESC, reddit_id DESC)` for single subreddit. Used when `SLIDESHOW_SOURCE=assets` (default). Returns `(items, has_more, new_cursor)` with cursor format `"created_utc,reddit_id"` |
+| `get_subreddit_assets(subreddit, limit, after_cursor)` | **PRIMARY** — Cursor-based pagination on `media_assets` by `(created_utc DESC, reddit_id DESC)`. If `subreddit` is None, returns assets from all subreddits. Returns `(items, next_cursor, has_more)` with cursor format `"created_utc,reddit_id"` |
+| `get_queue_items(limit, offset, subreddits)` | DEPRECATED — Queue-based pagination. Returns `(items, has_more)` |
 | `add_to_queue(asset)` | Insert asset into `media_assets` + `media_queue` + `gallery_items`. Dedup by `reddit_post_id` |
 | `remove_from_queue(reddit_post_id)` | Delete from queue |
 | `clear_queue()` | Truncate queue |
 | `search(query, limit, offset, ...)` | FTS5 search with filters (subreddits, media_type, sort) |
 | `get_gallery_urls(reddit_ids)` | Fetch gallery item URLs for given IDs |
-| `fetch_and_store(subreddit, ...)` | Create RedditClient, fetch media, store in queue, register subreddit |
+| `fetch_and_store(subreddit, limit, sort, after)` | Create RedditClient, fetch media, store in queue, register subreddit |
 | `ensure_subreddit_has_content(subreddit, sort)` | Cursor-based paginated fetch — reads stored cursor, fetches next page, stores new cursor. Resets cursor on empty response |
-| `manage_queue()` | Called by background service — checks thresholds, triggers refill/trim |
+| `manage_queue()` | DEPRECATED — No longer used by slideshow |
+| `_refill_queue(count)` | DEPRECATED — Stub |
+| `_trim_queue(max_size)` | Trim excess queue items |
 | `add_or_update_subreddit_config(subreddit)` | Insert/update with `enabled=1` |
 | `get_enabled_subreddits()` | List all enabled subreddits |
-| `disable_subreddit(subreddit)` | Set `enabled=0` |
+| `disable_subreddit(subreddit)` | Set `enabled=0`, delete all queue items for this subreddit |
 | `get_stored_cursor / set_stored_cursor` | Persist Reddit pagination cursors per subreddit+sort |
 | `count_subreddit_items(subreddit)` | Count assets for a subreddit |
 | `cleanup_old_assets(days)` | DELETE media_assets older than N days |
@@ -397,7 +416,7 @@ from a single subreddit for the queue/background refresh pipeline, using
 
 `_fetch_redlib` is a **stub** — returns `[], None`.
 
-#### Live Reddit Search (v3 / v4.1)
+#### Live Reddit Search (v4.1)
 
 Three-tier architecture that replaced the original single-page search:
 
@@ -405,7 +424,7 @@ Three-tier architecture that replaced the original single-page search:
 search_reddit()
   │
   ├── Local mode + subreddits present:
-  │     └── _search_local_multi(query, subreddits, target_results)
+  │     └── _search_local_multi(query, subreddits, target_results, after)
   │           ├── for each subreddit:
   │           │     └── _accumulate_search(query, [subreddit], mode="local")
   │           │           └── _search_oauth() → page loop up to 20 pages
@@ -429,7 +448,7 @@ search_reddit()
 | Method | Purpose |
 |--------|---------|
 | `search_reddit(query, limit, after, subreddits, mode)` | Entry point. Delegates to `_search_local_multi` (local) or `_accumulate_search` (global). Returns `(list[dict], cursor)` |
-| `_search_local_multi(query, subreddits, target_results)` | Iterates subreddits individually, calls `_accumulate_search` per subreddit, merges, deduplicates by `id`. Budget: `SEARCH_TIME_BUDGET_SECONDS × 1.5`. Returns `(merged_list, None)` |
+| `_search_local_multi(query, subreddits, target_results, after)` | Iterates subreddits individually, calls `_accumulate_search` per subreddit, merges, deduplicates by `id`. Accepts `after` parameter but cursor is always returned as `None`, preventing incremental pagination. Budget: `SEARCH_TIME_BUDGET_SECONDS × 1.5`. Returns `(merged_list, None)` |
 | `_accumulate_search(query, subreddits, mode, target_results)` | Accumulation loop: fetches pages of 25 via `_search_oauth` until target reached, pages exhausted, or time budget exceeded. Returns `(results, last_cursor, SearchAuditResult)` |
 | `_search_oauth(query, limit, after, subreddits, mode)` | Single Reddit OAuth search HTTP request. Builds URL (`r/sub/search` for local, `search` for global). Adds `restrict_sr=on` + `include_over_18=on` for local mode. Returns raw post dicts |
 
@@ -476,12 +495,15 @@ searching each subreddit separately and deduplicating the merged results.
 
 ### BackgroundRefreshService (`app/services/background_service.py`)
 
-Runs on APScheduler with two periodic jobs:
+Runs on APScheduler with two periodic jobs. Creates its own `OAuthManager`,
+`ProviderManager`, and `RedditClient` instances (not shared with API routers).
 
 | Job | Interval | Logic |
 |-----|----------|-------|
-| `_refresh_job` | 60 seconds | 1. Call `manage_queue()` for global thresholds. 2. Find subreddits below QUEUE_REFILL (300). 3. Pick the lowest-count subreddit. 4. Fetch next page via cursor. 5. Store assets in queue. 6. Update cursor. |
+| `_refresh_job` | 60 seconds | 1. Get all enabled subreddits from subreddit_configs. 2. Find subreddits with asset count < QUEUE_REFILL (300). 3. Sort by count ascending. 4. Pick the lowest-count subreddit. 5. Read stored cursor. 6. Fetch next page from Reddit OAuth (limit=50). 7. Store assets in queue. 8. Update cursor (reset to None if no items returned). |
 | `_cleanup_job` | 86400 seconds (24h) | DELETE from `media_queue` where `added_at < 30 days ago` |
+
+**Note**: The background service no longer calls `manage_queue()` for global queue thresholds. Each tick checks per-subreddit counts and refills the lowest-count subreddit that falls below the threshold.
 
 ---
 
@@ -491,7 +513,7 @@ Runs on APScheduler with two periodic jobs:
 
 Manages Reddit OAuth token lifecycle.
 
-**Note on instance sharing:** The `OAuthManager` instance created during startup in `app/main.py` is not shared with API routers. Each endpoint that needs OAuth (e.g., `/api/search/reddit` in `search.py`, `QueueManager.fetch_and_store()` in `feed.py`) creates its own fresh `OAuthManager` and `ProviderManager` instances, loading the token from the database again. This means the startup initialization is effectively redundant for API requests.
+**Note on instance sharing:** The `OAuthManager` instance created during startup in `app/main.py` is not shared with API routers or the background service. Each endpoint that needs OAuth (e.g., `/api/search/reddit` in `search.py`, `QueueManager.fetch_and_store()` in `feed.py`, `BackgroundRefreshService` in `background_service.py`) creates its own fresh instances, loading the token from the database again.
 
 **Token acquisition flow:**
 1. On `initialize()`: Load token from `oauth_tokens` table
@@ -666,17 +688,18 @@ compatibility but is not populated by any active code path.
 ### Key SQL Queries
 
 ```sql
--- Get queue items (paginated, optionally filtered by subreddits)
+-- Get subreddit assets (cursor-based — PRIMARY feed path)
+SELECT ma.* FROM media_assets ma
+WHERE ma.subreddit = ?                     -- optional (None = all subreddits)
+  AND (ma.created_utc < ? OR (ma.created_utc = ? AND ma.reddit_id < ?))  -- cursor
+ORDER BY ma.created_utc DESC, ma.reddit_id DESC
+LIMIT ?;
+
+-- Get queue items (paginated, optionally filtered by subreddits — DEPRECATED)
 SELECT ma.* FROM media_assets ma
 JOIN media_queue mq ON ma.reddit_id = mq.reddit_post_id
 ORDER BY mq.position ASC
 LIMIT ? OFFSET ?;
-
--- Get subreddit assets (cursor-based, used when SLIDESHOW_SOURCE=assets)
-SELECT ma.* FROM media_assets ma
-WHERE ma.subreddit = ?
-ORDER BY ma.created_utc DESC, ma.reddit_id DESC
-LIMIT ?;
 
 -- FTS5 search with filters
 SELECT ma.* FROM media_assets ma
@@ -704,7 +727,7 @@ All models in `app/models/schemas.py`:
 | Model | Purpose |
 |-------|---------|
 | `MediaAsset` | Internal model for representing a Reddit post's media |
-| `MediaAssetResponse` | API response model (adds `gallery_urls` field) |
+| `MediaAssetResponse` | API response model (adds `gallery_urls`, `created_utc` fields) |
 | `FeedResponse` | Wrapper for feed/search results (`items`, `after`, `has_more`) |
 | `QueueResponse` | Queue status (`items`, `total`, `pending`) |
 | `SearchResponse` | Search results with `page`, `limit`, `total_results` |
@@ -722,17 +745,13 @@ All models in `app/models/schemas.py`:
 ```
 _refresh_job()  (every 60s)
   │
-  ├── manage_queue() → check global thresholds
-  │   (trim if > 1000, but _refill_queue is a stub — actual refill
-  │    happens in the per-subreddit logic below)
-  │
-  └── get_subreddits_needing_refill()
+  └── _get_subreddits_needing_refill()
       │ Query enabled subreddits from subreddit_configs
       │ For each: count_subreddit_items() < 300
       │ Sort ascending by count
       │ Pick the first (lowest-count) subreddit
       │
-      └── fetch_and_store() via RedditClient
+      └── QueueManager.fetch_and_store() via RedditClient.fetch_subreddit_media()
           ├── Read stored cursor for this subreddit+sort
           ├── Fetch next page from Reddit OAuth (limit=50)
           ├── Parse & validate media assets
@@ -755,129 +774,36 @@ Note: `media_assets` are not auto-cleaned. Only `media_queue` entries are pruned
 
 ## Frontend Integration
 
-### Architecture
+### Flutter Merge Engine
+
+The backend rejects multi-subreddit requests. The Flutter Merge Engine
+(`lib/features/slideshow/domain/merge_engine.dart`) handles this client-side
+using the `MediaSource` abstraction:
 
 ```
-lib/
-├── main.dart                           # Entry point, ProviderScope
-├── app.dart                            # RedSlideApp — MaterialApp.router, theme, subreddit sync
-├── core/
-│   ├── constants/
-│   │   ├── api_constants.dart          # API endpoint paths
-│   │   └── app_constants.dart          # Pagination size, preload counts, etc.
-│   ├── network/
-│   │   ├── api_client.dart             # Dio-based HTTP client (GET/POST with Result<>)
-│   │   └── result.dart                 # Success/Failure result type
-│   ├── router/
-│   │   └── app_router.dart             # GoRouter with shell + routes
-│   ├── media/
-│   │   ├── safe_network_image.dart     # Image widget with error handling
-│   │   ├── image_loader.dart           # Preloading/caching logic
-│   │   └── media_error.dart            # Media error state
-│   └── errors/
-│       └── app_error.dart              # Error types (NetworkError, ServerError, etc.)
-├── features/
-│   ├── settings/
-│   │   ├── domain/settings_model.dart  # Backend URL, NSFW, theme, interval, subreddits list
-│   │   ├── data/settings_repository.dart # SharedPreferences persistence + health check
-│   │   ├── providers/settings_provider.dart # AsyncNotifier — settings CRUD + sync subreddits
-│   │   └── presentation/settings_screen.dart # UI
-│   ├── feed/
-│   │   ├── domain/media_asset.dart     # MediaAsset model (mirrors backend response)
-│   │   ├── data/feed_repository.dart   # Gets feed/queue/media from API
-│   │   ├── providers/feed_provider.dart # StateNotifier — pagination, refresh, load more
-│   │   ├── presentation/home_screen.dart   # Main feed view
-│   │   ├── presentation/subreddit_screen.dart # Per-subreddit feed
-│   │   └── presentation/widgets/ (media_card, media_grid, shimmer_card, subreddit_card)
-│   ├── search/
-│   │   ├── data/search_repository.dart # FTS5 search + Reddit live search
-│   │   ├── providers/search_provider.dart
-│   │   ├── presentation/search_screen.dart
-│   │   └── presentation/widgets/ (result_card, result_tile, filter_sheet, etc.)
-│   └── slideshow/
-│       ├── domain/slideshow_state.dart
-│       ├── domain/slideshow_source.dart
-│       ├── providers/slideshow_provider.dart
-│       ├── presentation/slideshow_screen.dart
-│       └── presentation/widgets/ (controls, overlay, media_viewer, image_viewer, video_viewer)
-```
-
-### Data Flow
-
-#### Feed Loading
-
-```
-HomeScreen loads
+User selects multiple subreddits for slideshow
   │
-  └── FeedNotifier.loadInitial()
+  └── SlideshowNotifier._buildMediaSources()
+      ├── Maps SlideshowSource → List<MediaSource>
+      │     SubredditSource → [SubredditMediaSource]
+      │     MultiSubredditSource → [SubredditMediaSource × N]
+      │     GlobalFeedSource → [SubredditMediaSource × allConfigured]
+      │     SearchSource → [SearchMediaSource]
+      │     GroupSource → [SubredditMediaSource × groupSubreddits]
       │
-      └── FeedRepository.getFeed(limit=50, subreddits=null, sort=null)
-          │
-          └── ApiClient.get("/api/feed?limit=50")
+      └── MergeEngine.initialize()
+          ├── Creates N SourceBuffers (one per MediaSource)
+          ├── Fires N parallel loadNext() calls
+          ├── Each buffer fetches cursor-based pages
+          └── generateBatch() → round-robin merge with freshness+diversity scoring
               │
-              └── Backend: get_feed()
-                  ├── Single subreddit: QueueManager.get_subreddit_assets()
-                  │   (cursor-based on media_assets, SLIDESHOW_SOURCE=assets default)
-                  ├── Multiple/no subreddits: QueueManager.get_queue_items()
-                  │   (offset-based on media_queue)
-                  ├── If empty → trigger on-demand fetch
-                  └── Return FeedResponse
+              ├── Freshness: 35% weight based on post age (max 7 days)
+              ├── Diversity: 20% weight (penalizes consecutive same-buffer,
+              │     same-author, same-domain)
+              └── Randomness: 45% weight for variety
 ```
 
-#### Subreddit Sync Flow
-
-```
-App startup: User has subreddits configured in settings
-  │
-  └── _syncSubreddits(settings)
-      │
-      └── ApiClient.post("/api/subreddits/sync", {subreddits: [...]})
-          │
-          └── Backend: sync_subreddits()
-              ├── Compute diff (added/removed)
-              ├── Update subreddit_configs table
-              └── Fire async ensure_subreddit_has_content() for each new subreddit
-```
-
-#### Search Flow
-
-```
-User searches in SearchScreen
-  │
-  └── Options:
-      │
-      ├── FTS5 local search:
-      │   ApiClient.get("/api/search?q=...")
-      │   → Backend: QueueManager.search() → MATCH media_search FTS5
-      │
-      └── Live Reddit search:
-          ApiClient.get("/api/search/reddit?q=...&mode=global")
-          → Backend: RedditClient.search_reddit() → OAuth Reddit API
-```
-
-#### Slideshow Flow
-
-```
-User taps play → SlideshowScreen(source, startIndex)
-  │
-  └── SlideshowProvider
-      ├── Media loaded from feed state (no additional API call)
-      ├── Preloading: Tier 1 (10 images), Tier 2 (20 images)
-      ├── Fullscreen overlay with auto-hide (3s)
-      └── Controls: play/pause, prev/next, queue indicator
-```
-
-### Key Frontend Packages
-
-| Package | Usage |
-|---------|-------|
-| `flutter_riverpod` | State management (AsyncNotifier, StateNotifier, Provider) |
-| `go_router` | Declarative routing with shell routes |
-| `dio` | HTTP client with interceptors, timeouts |
-| `shared_preferences` | Settings persistence |
-| `google_fonts` | Inter font family |
-| `cached_network_image` | Image loading/caching |
-| `video_player` / `chewie` | Video playback |
+For architecture details on the Merge Engine, slideshow, and preloading, see `frontend.md`.
 
 ---
 
@@ -890,7 +816,6 @@ REDDIT_CLIENT_ID=your_client_id
 REDDIT_CLIENT_SECRET=your_client_secret
 REDDIT_USER_AGENT=RedSlide/1.0 by u/your_username
 DATABASE_PATH=./data/redslide.db
-SLIDESHOW_SOURCE=assets  # "assets" (default): cursor-based on media_assets table; "queue": offset-based on media_queue
 ```
 
 **Note:** `praw` (Reddit Python wrapper) is listed in `requirements.txt` but is **not used** anywhere in the codebase. All Reddit API calls use raw `httpx` requests.
@@ -924,15 +849,25 @@ python main.py  # uvicorn on 0.0.0.0:8000
 
 ## Error Handling Patterns
 
+### Multi-Subreddit Rejection
+`feed.py` — Explicit 400 to force Flutter-side merging:
+```python
+if subreddit_list and len(subreddit_list) > 1:
+    raise HTTPException(
+        status_code=400,
+        detail="Multi subreddit handled by Flutter Merge Engine.",
+    )
+```
+
 ### Media Not Found
-`feed.py:205` — Single endpoint with explicit 404:
+`feed.py` — Single endpoint with explicit 404:
 ```python
 if not row:
     raise HTTPException(status_code=404, detail="Media not found")
 ```
 
 ### Queue Insert Failure
-`queue_manager.py:89` — Silently returns `False`:
+`queue_manager.py` — Silently returns `False`:
 ```python
 try:
     await db.execute(...)
@@ -943,7 +878,7 @@ except Exception:
 ```
 
 ### OAuth Provider 401
-`reddit_client.py:70-73` — Auto-refresh + fallback:
+`reddit_client.py` — Auto-refresh + fallback:
 ```python
 if response.status_code == 401:
     await self.oauth.refresh_token()
@@ -952,17 +887,27 @@ if response.status_code == 401:
 ```
 
 ### Background Job Errors
-`background_service.py:132-134` — Caught and logged, job continues:
+`background_service.py` — Caught and logged, job continues:
 ```python
 except Exception as e:
     print(f"Error fetching from {subreddit}: {e}")
 ```
 
 ### Pagination Cursor Reset
-`queue_manager.py:385-389` — On empty response, cursor resets to None:
+`queue_manager.py` — On empty response, cursor resets to None:
 ```python
 if added == 0 and new_cursor is None:
     await self.set_stored_cursor(subreddit, sort, None)
+```
+
+### Search Error Handling
+`search.py` — Entire search wrapped in try/except:
+```python
+try:
+    items, new_after = await client.search_reddit(...)
+except Exception as e:
+    print(f"[SEARCH_ERROR] query={q} error={e}")
+    return FeedResponse(items=[], after=None, has_more=False)
 ```
 
 ---
@@ -974,11 +919,12 @@ if added == 0 and new_cursor is None:
 3. **SQLite single-instance** — not suitable for horizontal scaling (use PostgreSQL for production)
 4. **FTS5 token-level matching** — "city" won't match "cityscape" (use `/api/search/debug` for substring LIKE fallback)
 5. **No CASCADE DELETE** — `media_queue` and `gallery_items` rows for deleted `media_assets` must be cleaned up manually
-6. **`_refill_queue` is a stub** — the actual per-subreddit refill happens in `BackgroundRefreshService._refresh_job()`
-7. **Cleanup only prunes `media_queue`** — `media_assets` and `gallery_items` are not auto-cleaned beyond 30 days
-8. **OAuth token has no public setup endpoint** — must be configured via `.env` before first startup
-9. **Local search budget is 1.5× global budget** — `_search_local_multi` uses `SEARCH_TIME_BUDGET_SECONDS × 1.5` to accommodate N subreddits, which may still time out if many subreddits are selected
-10. **`_search_local_multi` ignores incoming `after` cursor** — each call starts fresh; cursor is always returned as `None`, preventing incremental pagination for local search
-11. **OAuth initialized twice on startup** — both `app/main.py` lifespan and `BackgroundRefreshService.start()` call `OAuthManager.initialize()` on separate instances
-12. **Global instances not shared with routers** — the `oauth_manager` and `background_service` globals in `app/main.py` are never passed to API endpoints; each request creates fresh `OAuthManager` instances
-13. **`praw` dependency unused** — `praw>=7.8.0` is in `requirements.txt` but no code imports it
+6. **Cleanup only prunes `media_queue`** — `media_assets` and `gallery_items` are not auto-cleaned beyond 30 days
+7. **OAuth token has no public setup endpoint** — must be configured via `.env` before first startup
+8. **Local search budget is 1.5× global budget** — `_search_local_multi` uses `SEARCH_TIME_BUDGET_SECONDS × 1.5` to accommodate N subreddits, which may still time out if many subreddits are selected
+9. **`_search_local_multi` ignores incoming `after` cursor** — each call starts fresh; cursor is always returned as `None`, preventing incremental pagination for local search
+10. **OAuth initialized multiple times** — startup lifespan, BackgroundRefreshService, and every API call all create separate `OAuthManager` instances calling `initialize()`
+11. **Global instances not shared with routers** — the `oauth_manager` and `background_service` globals in `app/main.py` are never passed to API endpoints; each request creates fresh instances
+12. **`praw` dependency unused** — `praw>=7.8.0` is in `requirements.txt` but no code imports it
+13. **`media_queue`-based feed is deprecated** — `get_queue_items()`, `manage_queue()`, `_refill_queue()` are stubs marked for future removal. The slideshow exclusively uses `get_subreddit_assets()` cursor-based pagination
+14. **Multi-subreddit merging is Flutter-only** — the backend returns 400 for multi-subreddit requests, putting all merge complexity on the client

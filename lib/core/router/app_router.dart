@@ -66,13 +66,18 @@ final routerProvider = Provider<GoRouter>((ref) {
           if (extra is SlideshowRouteExtra) {
             source = extra.source;
             startIndex = extra.startIndex;
+          } else if (extra is SlideshowSource) {
+            source = extra;
           } else {
             source = extra as SlideshowSource? ?? const GlobalFeedSource();
           }
           return CustomTransitionPage(
             key: state.pageKey,
             fullscreenDialog: true,
-            child: SlideshowScreen(source: source, startIndex: startIndex),
+            child: SlideshowScreen(
+              source: source,
+              startIndex: startIndex,
+            ),
             transitionsBuilder: (context, animation, secondaryAnimation, child) {
               return FadeTransition(opacity: animation, child: child);
             },

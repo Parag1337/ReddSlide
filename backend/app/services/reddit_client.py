@@ -292,7 +292,7 @@ class RedditClient:
         print(f"[SEARCH_LOOP] entering query={query} mode={mode} subreddits={subreddits} target={target_results}")
 
         if mode == "local" and subreddits:
-            return await self._search_local_multi(query, subreddits, target_results)
+            return await self._search_local_multi(query, subreddits, target_results, after=after)
 
         results: list[dict] = []
         current_after = after
@@ -366,16 +366,24 @@ class RedditClient:
         query: str,
         subreddits: list[str],
         target_results: int,
-    ) -> tuple[list[dict], None]:
+        after: Optional[str] = None,
+    ) -> tuple[list[dict], Optional[str]]:
         """Search each selected subreddit individually, then merge and deduplicate.
 
         Reddit's multi-subreddit search (r/sub1+sub2/search?restrict_sr=on)
         frequently returns zero results even when individual subreddits have
         many matching posts. This method works around that by searching each
         subreddit separately.
+
+        The `after` parameter is accepted for interface consistency. On repeat
+        calls the per-subreddit cursors would ideally be tracked; for now,
+        duplicate prevention happens in `_refillSearchBuffers()` on the
+        Flutter side.
         """
-        overall_start = time.monotonic()
         all_results: list[dict] = []
+        last_cursor: Optional[str] = None
+        any_had_more = False
+        overall_start = time.monotonic()
 
         for subreddit in subreddits:
             sub_start = time.monotonic()
@@ -393,14 +401,12 @@ class RedditClient:
 
             if sub_results:
                 all_results.extend(sub_results)
-
-            if len(all_results) >= target_results:
-                print(f"[LOCAL_SEARCH] target reached ({len(all_results)} >= {target_results}), stopping")
-                break
-
-            if time.monotonic() - overall_start > SEARCH_TIME_BUDGET_SECONDS * 1.5:
-                print(f"[LOCAL_SEARCH] overall time budget exhausted")
-                break
+                if len(sub_results) >= target_results:
+                    any_had_more = True
+                if sub_after:
+                    last_cursor = sub_after
+                elif any_had_more:
+                    last_cursor = "more"
 
         seen_ids = set()
         deduped: list[dict] = []
@@ -410,11 +416,12 @@ class RedditClient:
                 deduped.append(item)
                 seen_ids.add(pid)
 
+        cursor = last_cursor if any_had_more else None
         print(f"[LOCAL_SEARCH_MERGE] before={len(all_results)} duplicates_removed={len(all_results) - len(deduped)} after={len(deduped)}")
         print(f"[Search] DONE query='{query}' pages=merged returned={len(deduped)} elapsed={time.monotonic() - overall_start:.2f}s")
-        print(f"[SEARCH_FINAL] returned={len(deduped)} after=None")
+        print(f"[SEARCH_FINAL] returned={len(deduped)} after={cursor}")
 
-        return deduped, None
+        return deduped, cursor
 
     async def _accumulate_search(
         self,
@@ -522,37 +529,42 @@ class RedditClient:
         print(f"[SEARCH_CURSOR] before={after}")
         print(f"[SEARCH_REQUEST] q={query} after={after} url={url} params={params}")
 
-        async with httpx.AsyncClient() as client:
-            response = await client.get(
-                url,
-                headers={
-                    "Authorization": f"bearer {token}",
-                    "User-Agent": "RedSlide/1.0 by u/redslide_dev",
-                },
-                params=params,
-            )
+        try:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(15.0)) as client:
+                response = await client.get(
+                    url,
+                    headers={
+                        "Authorization": f"bearer {token}",
+                        "User-Agent": "RedSlide/1.0 by u/redslide_dev",
+                    },
+                    params=params,
+                )
+        except (httpx.TimeoutException, httpx.ConnectError) as e:
+            print(f"[SEARCH_TIMEOUT] url={url} error={e}")
+            await self.provider_manager.record_provider_failure("reddit_oauth")
+            return [], None
 
-            print(f"[SEARCH_RESPONSE] status={response.status_code}")
+        print(f"[SEARCH_RESPONSE] status={response.status_code}")
 
-            if response.status_code == 401:
-                await self.oauth.refresh_token()
-                await self.provider_manager.record_provider_failure("reddit_oauth")
-                return [], None
+        if response.status_code == 401:
+            await self.oauth.refresh_token()
+            await self.provider_manager.record_provider_failure("reddit_oauth")
+            return [], None
 
-            if response.status_code != 200:
-                await self.provider_manager.record_provider_failure("reddit_oauth")
-                return [], None
+        if response.status_code != 200:
+            await self.provider_manager.record_provider_failure("reddit_oauth")
+            return [], None
 
-            await self.oauth.record_success()
-            await self.provider_manager.record_provider_success("reddit_oauth")
+        await self.oauth.record_success()
+        await self.provider_manager.record_provider_success("reddit_oauth")
 
-            data = response.json()
-            after_cursor = data.get("data", {}).get("after")
-            raw_items = []
-            for child in data.get("data", {}).get("children", []):
-                raw_items.append(child.get("data", {}))
-            print(f"[SEARCH_RAW] count={len(raw_items)} after_cursor={after_cursor}")
-            return raw_items, after_cursor
+        data = response.json()
+        after_cursor = data.get("data", {}).get("after")
+        raw_items = []
+        for child in data.get("data", {}).get("children", []):
+            raw_items.append(child.get("data", {}))
+        print(f"[SEARCH_RAW] count={len(raw_items)} after_cursor={after_cursor}")
+        return raw_items, after_cursor
 
     def _is_media_post(self, post_data: dict) -> bool:
         """Returns True only if the Reddit post contains usable media."""

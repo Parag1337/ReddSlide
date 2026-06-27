@@ -1,0 +1,31 @@
+Changing current working directory to: /home/parag/Projects/Application/redslide
+Launching lib/main.dart on sdk gphone16k x86 64 in debug mode...
+Running Gradle task 'assembleDebug'...                          
+I/flutter (16629): [TAP] event=82 ts=1782495430853 index=40 targetIndex=40 url=https://preview.redd.it/ma0cj6g4fv8h1.jpg?width=1080&format=pjpg&auto=webp&s=263a466525b1ee744931063e1570b1f12a9af4f6
+I/flutter (16629): [STATE_CHANGE] event=82 type=gallerySubIndex value=2
+I/flutter (16629): [TAP] event=83 ts=1782495475573 index=40 targetIndex=40 url=https://preview.redd.it/bpm0i6g4fv8h1.jpg?width=1080&format=pjpg&auto=webp&s=3c80caa61a28da79cca6bc7501a0d3b16f3d31e2
+I/flutter (16629): [STATE_CHANGE] event=83 type=gallerySubIndex value=3
+I/flutter (16629): [IMG_LOADING] url=https://preview.redd.it/bpm0i6g4fv8h1.jpg?width=1080&format=pjpg&auto=webp&s=3c80caa61a28da79cca6bc7501a0d3b16f3d31e2 source=frameBuilder
+I/flutter (16629): [IMAGE_READY] url=https://preview.redd.it/bpm0i6g4fv8h1.jpg?width=1080&format=pjpg&auto=webp&s=3c80caa61a28da79cca6bc7501a0d3b16f3d31e2 widgetToReady=463ms buildToReady=463ms wasSynchronous=false
+I/flutter (16629): [SLIDE_DONE] url=https://preview.redd.it/bpm0i6g4fv8h1.jpg?width=1080&format=pjpg&auto=webp&s=3c80caa61a28da79cca6bc7501a0d3b16f3d31e2 source=CachedNetworkImageProvider
+I/flutter (16629): [IMAGE_VISIBLE] url=https://preview.redd.it/bpm0i6g4fv8h1.jpg?width=1080&format=pjpg&auto=webp&s=3c80caa61a28da79cca6bc7501a0d3b16f3d31e2 readyToVisible=2ms
+I/flutter (16629): [TAP] event=84 ts=1782495480575 index=40 targetIndex=40 url=https://preview.redd.it/e66nqwi4fv8h1.jpg?width=1080&format=pjpg&auto=webp&s=d4d03997bb3470c59141406a79a4a1029fdcb578
+I/flutter (16629): [STATE_CHANGE] event=84 type=gallerySubIndex value=4
+I/flutter (16629): [TAP] event=85 ts=1782495492607 index=40 targetIndex=40 url=https://preview.redd.it/b1kr14j4fv8h1.jpg?width=1080&format=pjpg&auto=webp&s=f23ed514cf83ce2703ff190420cbd619a5f33e5f
+I/flutter (16629): [STATE_CHANGE] event=85 type=gallerySubIndex value=5
+I/flutter (16629): [TAP] event=86 ts=1782495509682 index=40 targetIndex=41 url=https://i.redd.it/bktv4tcw819h1.jpeg
+I/flutter (16629): [STATE_CHANGE] event=86 type=currentIndex value=41 url=https://i.redd.it/bktv4tcw819h1.jpeg tapToState=22198ms ts=1782495509682
+I/flutter (16629): [PIPELINE] next event=86 index=41 tapToState=22198ms url=https://i.redd.it/bktv4tcw819h1.jpeg
+I/flutter (16629): [PRELOAD_TRIGGER] currentIndex=41 totalItems=80 remaining=39 mergedRemaining=0 effectiveRemaining=39 threshold=30 willLoad=false
+I/flutter (16629): [TAP] event=87 ts=1782495539806 index=41 targetIndex=42 url=https://i.redd.it/gy6r721lu19h1.jpeg
+I/flutter (16629): [STATE_CHANGE] event=87 type=currentIndex value=42 url=https://i.redd.it/gy6r721lu19h1.jpeg tapToState=1ms ts=1782495539807
+I/flutter (16629): [PIPELINE] next event=87 index=42 tapToState=1ms url=https://i.redd.it/gy6r721lu19h1.jpeg
+I/flutter (16629): [PRELOAD_TRIGGER] currentIndex=42 totalItems=80 remaining=38 mergedRemaining=0 effectiveRemaining=38 threshold=30 willLoad=false
+I/flutter (16629): [TAP] event=88 ts=1782495554674 index=42 targetIndex=43 url=https://i.redd.it/driztb63q79h1.gif
+I/flutter (16629): [STATE_CHANGE] event=88 type=currentIndex value=43 url=https://i.redd.it/driztb63q79h1.gif tapToState=0ms ts=1782495554674
+I/flutter (16629): [PIPELINE] next event=88 index=43 tapToState=0ms url=https://i.redd.it/driztb63q79h1.gif
+I/flutter (16629): [PRELOAD_TRIGGER] currentIndex=43 totalItems=80 remaining=37 mergedRemaining=0 effectiveRemaining=37 threshold=30 willLoad=false
+I/flutter (16629): [TAP] event=89 ts=1782495567509 index=43 targetIndex=44 url=https://i.redd.it/1utuwy8ym79h1.gif
+I/flutter (16629): [STATE_CHANGE] event=89 type=currentIndex value=44 url=https://i.redd.it/1utuwy8ym79h1.gif tapToState=0ms ts=1782495567509
+I/flutter (16629): [PIPELINE] next event=89 index=44 tapToState=0ms url=https://i.redd.it/1utuwy8ym79h1.gif
+I/flutter (16629): [PRELOAD_TRIGGER] currentIndex=44 totalItems=80 remaining=36 mergedRemaining=0 effectiveRemaining=36 threshold=30 willLoad=false

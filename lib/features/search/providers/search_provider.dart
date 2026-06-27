@@ -1,3 +1,4 @@
+import 'dart:math' show max;
 import 'package:flutter/foundation.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../../../core/errors/app_error.dart';
@@ -6,6 +7,22 @@ import '../../feed/domain/media_asset.dart';
 import '../../settings/providers/settings_provider.dart';
 import '../../slideshow/domain/slideshow_source.dart';
 import '../data/search_repository.dart';
+
+void _trace(String stage, List<MediaAsset> items, {String? cursor, bool? hasMore, String? label}) {
+  final firstIds = items.take(5).map((e) => e.id).join(',');
+  final lastIds = items.skip(max(0, items.length - 5)).map((e) => e.id).join(',');
+  final buf = StringBuffer();
+  buf.writeln('');
+  buf.writeln('╔══════════════════════════════════════════════════');
+  buf.writeln('║ TRACE: $stage${label != null ? ' ($label)' : ''}');
+  buf.writeln('║ items=${items.length} cursor=${cursor ?? "null"} hasMore=${hasMore ?? "?"}');
+  if (items.isNotEmpty) {
+    buf.writeln('║ first5=[$firstIds]');
+    buf.writeln('║ last5=[$lastIds]');
+  }
+  buf.writeln('╚══════════════════════════════════════════════════');
+  debugPrint(buf.toString());
+}
 
 final searchProvider = StateNotifierProvider<SearchNotifier, SearchState>((ref) {
   final searchRepository = ref.watch(searchRepositoryProvider);
@@ -89,15 +106,11 @@ class SearchNotifier extends StateNotifier<SearchState> {
   })  : _ref = ref,
         super(SearchState(
           selectedSubreddits: ref.read(settingsProvider).valueOrNull?.subreddits ?? [],
-        )) {
-    final subs = ref.read(settingsProvider).valueOrNull?.subreddits ?? [];
-    debugPrint('[SEARCH_PROVIDER] init selectedSubreddits=$subs');
-  }
+        ));
 
   void setMode(SearchMode mode) {
     syncSelectedSubreddits();
     state = state.copyWith(mode: mode);
-    debugPrint('[SEARCH] mode=${mode == SearchMode.local ? "local" : "global"}');
   }
 
   void setSelectedSubreddits(List<String> subreddits) {
@@ -124,11 +137,8 @@ class SearchNotifier extends StateNotifier<SearchState> {
   void syncSelectedSubreddits() {
     final allSubs = _ref.read(settingsProvider).valueOrNull?.subreddits ?? [];
     final currentSelected = state.selectedSubreddits;
-    final allSet = allSubs.toSet();
-    final selectedSet = currentSelected.toSet();
-    final synced = selectedSet.intersection(allSet).toList();
-    if (synced.length != currentSelected.length || synced.toSet() != currentSelected.toSet()) {
-      debugPrint('[SEARCH_PROVIDER] sync selectedSubreddits ${currentSelected.length}\u2192${synced.length}');
+    final synced = currentSelected.where((s) => allSubs.contains(s)).toList();
+    if (synced.length != currentSelected.length) {
       state = state.copyWith(selectedSubreddits: synced);
     }
   }
@@ -150,8 +160,6 @@ class SearchNotifier extends StateNotifier<SearchState> {
       totalResults: 0,
     );
 
-    debugPrint('[SEARCH] query=$query mode=${state.mode == SearchMode.local ? "local" : "global"}');
-
     final result = await _searchRepository.searchReddit(
       query: query,
       mode: state.mode,
@@ -162,7 +170,8 @@ class SearchNotifier extends StateNotifier<SearchState> {
 
     result.when(
       (data) {
-        debugPrint('[SEARCH_RESULTS] fetched=${data.items.length} after=${data.after} hasMore=${data.hasMore}');
+        _trace('search results', data.items, cursor: data.after, hasMore: data.hasMore);
+
         state = state.copyWith(
           results: data.items,
           isLoading: false,
@@ -170,24 +179,19 @@ class SearchNotifier extends StateNotifier<SearchState> {
           afterCursor: data.after,
           totalResults: data.items.length,
         );
+
         _addRecentQuery(query);
       },
       (error) {
-        debugPrint('[SEARCH] error=$error');
         state = state.copyWith(isLoading: false, error: error);
       },
     );
   }
 
   Future<void> loadMore() async {
-    if (state.isLoadingMore || !state.hasMore || state.afterCursor == null) {
-      debugPrint('[SEARCH_LOAD_MORE] SKIP isLoadingMore=${state.isLoadingMore} hasMore=${state.hasMore} afterCursor=${state.afterCursor}');
-      return;
-    }
+    if (state.isLoadingMore || !state.hasMore || state.afterCursor == null) return;
 
     state = state.copyWith(isLoadingMore: true);
-    final beforeCount = state.results.length;
-    debugPrint('[SEARCH_LOAD_MORE] beforeCount=$beforeCount after=${state.afterCursor}');
 
     final result = await _searchRepository.searchReddit(
       query: state.query,
@@ -201,13 +205,10 @@ class SearchNotifier extends StateNotifier<SearchState> {
       (data) {
         final existingIds = state.results.map((e) => e.id).toSet();
         final newItems = data.items.where((e) => !existingIds.contains(e.id)).toList();
-
         final combined = [...state.results, ...newItems];
         final capped = combined.length > 1000
             ? combined.sublist(combined.length - 1000)
             : combined;
-
-        debugPrint('[Search] before=${state.results.length} fetched=${data.items.length} dupes=${data.items.length - newItems.length} appended=${newItems.length} after=${capped.length}');
 
         state = state.copyWith(
           results: capped,
@@ -218,7 +219,6 @@ class SearchNotifier extends StateNotifier<SearchState> {
         );
       },
       (error) {
-        debugPrint('[SEARCH_LOAD_MORE] error=$error');
         state = state.copyWith(isLoadingMore: false);
       },
     );

@@ -42,6 +42,7 @@ def _asset_to_response(asset) -> MediaAssetResponse:
         width=asset.width,
         height=asset.height,
         duration=asset.duration,
+        created_utc=asset.created_utc,
         gallery_urls=gallery_urls,
     )
 
@@ -74,13 +75,17 @@ async def search_reddit(
     client = _get_reddit_client()
     await client.oauth.initialize()
 
-    items, new_after = await client.search_reddit(
-        query=q,
-        limit=limit,
-        after=after,
-        subreddits=subreddit_list,
-        mode=mode,
-    )
+    try:
+        items, new_after = await client.search_reddit(
+            query=q,
+            limit=limit,
+            after=after,
+            subreddits=subreddit_list,
+            mode=mode,
+        )
+    except Exception as e:
+        print(f"[SEARCH_ERROR] query={q} error={e}")
+        return FeedResponse(items=[], after=None, has_more=False)
 
     parsed = []
     rejected = 0
@@ -98,8 +103,8 @@ async def search_reddit(
         item = _asset_to_response(asset)
         enriched_items.append(item)
 
-    has_more = new_after is not None and len(enriched_items) > 0
-    print(f"[SEARCH_LOAD_MORE] fetched={len(enriched_items)} has_more={has_more}")
+    has_more = new_after is not None
+    print(f"[SEARCH_LOAD_MORE] fetched={len(enriched_items)} has_more={has_more} after={new_after}")
 
     return FeedResponse(
         items=enriched_items,
