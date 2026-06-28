@@ -16,6 +16,7 @@ async def init_db():
         os.makedirs(db_dir, exist_ok=True)
     
     async with aiosqlite.connect(DATABASE_PATH) as db:
+        await db.execute("PRAGMA journal_mode=WAL")
         await db.executescript("""
             CREATE TABLE IF NOT EXISTS oauth_tokens (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -61,6 +62,7 @@ async def init_db():
             CREATE INDEX IF NOT EXISTS idx_subreddit_created ON media_assets(subreddit, created_utc DESC);
             CREATE INDEX IF NOT EXISTS idx_created_utc ON media_assets(created_utc DESC);
             CREATE INDEX IF NOT EXISTS idx_source_provider ON media_assets(source_provider);
+            CREATE INDEX IF NOT EXISTS idx_created_at ON media_assets(created_at);
             CREATE INDEX IF NOT EXISTS idx_quality ON media_assets(quality_score DESC);
             
             CREATE TABLE IF NOT EXISTS gallery_items (

@@ -1,6 +1,5 @@
-import asyncio
-import time
-import os
+import logging
+
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 from ..core.database import get_db
@@ -9,27 +8,28 @@ from .reddit_client import RedditClient
 from ..managers.oauth import OAuthManager
 from ..managers.provider import ProviderManager
 
+logger = logging.getLogger(__name__)
+
 
 class BackgroundRefreshService:
     """Background service for queue management.
 
     Operates solely from subreddit_configs table — no hardcoded subreddits.
     Waits for client sync before fetching any content.
+
+    Uses shared OAuthManager and ProviderManager singletons injected from
+    application lifespan. There is exactly one lifecycle for each.
     """
 
     REFRESH_INTERVAL = 60  # 1 minute
     FETCH_BATCH_SIZE = 50
     CLEANUP_INTERVAL = 86400  # 24 hours
 
-    def __init__(self):
+    def __init__(self, oauth_manager: OAuthManager, provider_manager: ProviderManager):
         self.scheduler = AsyncIOScheduler()
         self.queue_manager = QueueManager()
-        self.oauth_manager = OAuthManager(
-            client_id=os.getenv("REDDIT_CLIENT_ID", ""),
-            client_secret=os.getenv("REDDIT_CLIENT_SECRET", ""),
-            user_agent=os.getenv("REDDIT_USER_AGENT", "RedSlide/1.0")
-        )
-        self.provider_manager = ProviderManager()
+        self.oauth_manager = oauth_manager
+        self.provider_manager = provider_manager
         self.reddit_client = RedditClient(
             oauth_manager=self.oauth_manager,
             provider_manager=self.provider_manager
@@ -48,7 +48,7 @@ class BackgroundRefreshService:
 
         self._is_running = True
         await self.queue_manager.initialize()
-        await self.oauth_manager.initialize()
+        # Shared oauth_manager is already initialized by lifespan
 
         self.scheduler.add_job(
             self._refresh_job,
@@ -126,24 +126,19 @@ class BackgroundRefreshService:
                 else:
                     await self.queue_manager.set_stored_cursor(subreddit, sort, new_cursor)
                 if added > 0:
-                    print(f"Refill: {subreddit} ({count} before) — added {added} assets")
+                    logger.info("Refill: %s (%s before) — added %s assets", subreddit, count, added)
             except Exception as e:
-                import traceback
-                print(f"[REFRESH_ERROR] subreddit={subreddit}: {e}\n{traceback.format_exc()}")
+                logger.exception("Refresh error for subreddit=%s: %s", subreddit, e)
         except Exception as e:
-            import traceback
-            print(f"[REFRESH_JOB_ERROR] {e}\n{traceback.format_exc()}")
+            logger.exception("Refresh job failed: %s", e)
 
     async def _cleanup_job(self):
-        """Clean up old assets."""
+        """Clean up old assets using QueueManager's transactional cleanup.
+
+        Removes gallery_items, media_queue, and media_assets older than 30 days.
+        """
         try:
-            thirty_days_ago = int(time.time()) - (30 * 24 * 3600)
-            async with get_db() as db:
-                await db.execute(
-                    "DELETE FROM media_queue WHERE added_at < ?",
-                    (thirty_days_ago,)
-                )
-                await db.commit()
+            await self.queue_manager.cleanup_old_assets(days=30)
+            logger.info("Cleanup completed successfully")
         except Exception as e:
-            import traceback
-            print(f"[CLEANUP_JOB_ERROR] {e}\n{traceback.format_exc()}")
+            logger.exception("Cleanup job failed: %s", e)

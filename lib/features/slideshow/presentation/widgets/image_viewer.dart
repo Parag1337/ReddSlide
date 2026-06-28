@@ -2,11 +2,12 @@ import 'package:cached_network_image/cached_network_image.dart';
 import 'package:flutter/material.dart';
 import '../../../../core/media/media_error.dart';
 import '../../../slideshow/domain/prepared_media_handle.dart';
+import '../../../slideshow/domain/slide_profiler.dart'; // TEMPORARY — Phase 7.2A
 
 class ImageViewer extends StatefulWidget {
   final PreparedMediaHandle handle;
   final void Function(MediaErrorType errorType)? onError;
-  final void Function(String url)? onFirstFrameDecoded;
+  final void Function(String url, {required bool wasCached})? onFirstFrameDecoded;
 
   const ImageViewer({
     super.key,
@@ -33,7 +34,7 @@ class _ImageViewerState extends State<ImageViewer> with SingleTickerProviderStat
     _fadeController = AnimationController(
       vsync: this,
       duration: const Duration(milliseconds: 200),
-    );
+    )..value = 1.0;
     _fadeAnimation = CurvedAnimation(
       parent: _fadeController,
       curve: Curves.easeIn,
@@ -61,6 +62,7 @@ class _ImageViewerState extends State<ImageViewer> with SingleTickerProviderStat
 
   @override
   Widget build(BuildContext context) {
+    SlideProfiler.recordImageViewerBuild(); // TEMPORARY — Phase 7.2A
     final state = widget.handle.state;
 
     if (state == MediaState.failed) {
@@ -100,7 +102,7 @@ class _ImageViewerState extends State<ImageViewer> with SingleTickerProviderStat
       );
     }
 
-    final decodeWidth = widget.handle.decodeSize?.width;
+    final decodeSize = widget.handle.decodeSize;
 
     return RepaintBoundary(
       child: FadeTransition(
@@ -114,15 +116,24 @@ class _ImageViewerState extends State<ImageViewer> with SingleTickerProviderStat
             boundaryMargin: const EdgeInsets.all(20),
             child: Image(
               image: ResizeImage.resizeIfNeeded(
-                decodeWidth,
-                null,
+                decodeSize?.width,
+                decodeSize?.height,
                 CachedNetworkImageProvider(widget.handle.displayUrl),
               ),
               fit: BoxFit.contain,
               gaplessPlayback: true,
               loadingBuilder: (context, child, loadingProgress) {
                 if (loadingProgress == null) return child;
-                return child;
+                return Center(
+                  child: SizedBox(
+                    width: 24,
+                    height: 24,
+                    child: CircularProgressIndicator(
+                      strokeWidth: 2,
+                      color: Colors.white38,
+                    ),
+                  ),
+                );
               },
               errorBuilder: (context, error, stackTrace) {
                 if (!_reportedFailure) {
@@ -141,10 +152,22 @@ class _ImageViewerState extends State<ImageViewer> with SingleTickerProviderStat
                 );
               },
               frameBuilder: (context, child, frame, wasSynchronouslyLoaded) {
+                if (wasSynchronouslyLoaded) {
+                  if (!_hasDecodedFrame) {
+                    _hasDecodedFrame = true;
+                    _fadeController.value = 1.0;
+                    SlideProfiler.recordFirstPaint(widget.handle.displayUrl, wasCached: true); // TEMPORARY — Phase 7.2A
+                    SlideProfiler.recordCacheHit(widget.handle.displayUrl); // TEMPORARY — Phase 7.2A
+                    widget.onFirstFrameDecoded?.call(widget.handle.displayUrl, wasCached: true);
+                  }
+                  return child;
+                }
                 if (frame != null && !_hasDecodedFrame) {
                   _hasDecodedFrame = true;
-                  _fadeController.forward();
-                  widget.onFirstFrameDecoded?.call(widget.handle.displayUrl);
+                  _fadeController.value = 1.0;
+                  SlideProfiler.recordFirstPaint(widget.handle.displayUrl, wasCached: false); // TEMPORARY — Phase 7.2A
+                  SlideProfiler.recordCacheMiss(widget.handle.displayUrl); // TEMPORARY — Phase 7.2A
+                  widget.onFirstFrameDecoded?.call(widget.handle.displayUrl, wasCached: false);
                 }
                 return child;
               },

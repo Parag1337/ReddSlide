@@ -8,6 +8,7 @@ import 'metrics_collector.dart';
 import 'playlist_manager.dart';
 import 'preparation_policy.dart';
 import 'prepared_media_handle.dart';
+import 'slide_profiler.dart'; // TEMPORARY — Phase 7.2A
 import 'video_preparation_service.dart';
 
 class MediaPreparationEngine {
@@ -23,10 +24,13 @@ class MediaPreparationEngine {
   final Set<String> _preparedItemIds = {};
   final Set<String> _confirmedReadyUrls = {};
   final Set<String> _preparingUrls = {};
+  final Set<String> _failedUrls = {};
   static const int _maxConfirmedReadyUrls = 1000;
+  VoidCallback? _onReadinessChanged;
 
   void _onUrlStarted(String url) {
     _preparingUrls.add(url);
+    _onReadinessChanged?.call();
   }
 
   void _onUrlReady(String url) {
@@ -37,6 +41,13 @@ class MediaPreparationEngine {
       final toRemove = _confirmedReadyUrls.take(excess).toList();
       _confirmedReadyUrls.removeAll(toRemove);
     }
+    _onReadinessChanged?.call();
+  }
+
+  void _onUrlFailed(String url) {
+    _preparingUrls.remove(url);
+    _failedUrls.add(url);
+    _onReadinessChanged?.call();
   }
 
   MediaPreparationEngine({
@@ -58,6 +69,7 @@ class MediaPreparationEngine {
       mode: displayQualityMode,
     );
     _defaultDecodeSize = policy.getDecodeSize();
+    _onReadinessChanged = onReadinessChanged;
     _preloader = AdaptivePreloader(
       playlist: _playlist,
       onLoadMore: _onLoadMore,
@@ -66,7 +78,8 @@ class MediaPreparationEngine {
       displayQualityMode: displayQualityMode,
     )
       ..onUrlReady = _onUrlReady
-      ..onUrlStarted = _onUrlStarted;
+      ..onUrlStarted = _onUrlStarted
+      ..onUrlFailed = _onUrlFailed;
     if (onReadinessChanged != null) {
       _videoService.onReadinessChanged = onReadinessChanged;
     }
@@ -159,16 +172,21 @@ class MediaPreparationEngine {
       final url = asset.isGallery && asset.galleryUrls != null && asset.galleryUrls!.isNotEmpty
           ? resolvedUrl
           : asset.mediaUrl;
+      SlideProfiler.recordWidgetRequest(url); // TEMPORARY — Phase 7.2A
       if (_confirmedReadyUrls.contains(url)) {
         state = MediaState.ready;
       } else if (_preparingUrls.contains(url)) {
         state = MediaState.preparing;
+      } else if (_failedUrls.contains(url)) {
+        state = MediaState.failed;
       } else if (_preparedItemIds.contains(asset.id)) {
         state = MediaState.queued;
       } else {
         state = MediaState.notRequested;
       }
     }
+
+    SlideProfiler.recordStateTransition(resolvedUrl, state.name); // TEMPORARY — Phase 7.2A
 
     return PreparedMediaHandle(
       asset: asset.copyWith(mediaUrl: resolvedUrl),
@@ -206,6 +224,7 @@ class MediaPreparationEngine {
     _preparedItemIds.clear();
     _confirmedReadyUrls.clear();
     _preparingUrls.clear();
+    _failedUrls.clear();
     _lastReconciledIndex = -1;
   }
 }

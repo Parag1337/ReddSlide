@@ -71,6 +71,20 @@ class SearchResponse(BaseModel):
     after: Optional[str] = None
 
 
+class ProgressiveSearchResponse(BaseModel):
+    """Progressive search response with session support.
+
+    When session_id is set, the frontend should poll /api/search/reddit/poll
+    to retrieve additional batches. HasMore indicates whether more
+    results exist (regardless of polling).
+    """
+    items: list[MediaAssetResponse]
+    has_more: bool
+    after: Optional[str] = None
+    session_id: Optional[str] = None
+    done: bool = False
+
+
 class SubredditConfig(BaseModel):
     subreddit: str
     enabled: bool = True

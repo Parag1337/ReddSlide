@@ -75,14 +75,45 @@ class SearchAuditResult:
 
 
 class RedditClient:
-    """Reddit API client with quality validation and deduplication."""
+    """Reddit API client with quality validation and deduplication.
+    
+    Concurrency model: Uses a per-page semaphore (not per-worker) so that
+    subreddit page fetches are interleaved rather than serialized within
+    each worker. This prevents a slow subreddit from blocking other
+    subreddits' page fetches.
+    
+    Lifecycle diagram (6.1.3):
+      SearchCoordinator._run_workers()
+        │
+        ├── For each subreddit, create an async worker
+        │   └── worker() calls _accumulate_search()
+        │        │
+        │        └── Page loop (up to SEARCH_MAX_PAGES):
+        │             └── _search_oauth()
+        │                  ├── async with _search_semaphore  ← granular, per-page
+        │                  │   └── HTTP GET to Reddit API
+        │                  └── Return raw post dicts
+        │
+        └── asyncio.gather() — all workers interleave at page granularity
+    """
     
     QUALITY_MIN_WIDTH = 400
     QUALITY_MIN_HEIGHT = 300
     
-    def __init__(self, oauth_manager: OAuthManager, provider_manager: ProviderManager):
+    def __init__(self, oauth_manager: OAuthManager, provider_manager: ProviderManager,
+                 search_concurrency: int = 5):
         self.oauth = oauth_manager
         self.provider_manager = provider_manager
+        self._search_semaphore = asyncio.Semaphore(search_concurrency)
+        self._semaphore_wait_ms = 0.0
+        # HTTP-level instrumentation (reset per search)
+        self._http_request_count = 0
+        self._http_failure_count = 0
+        self._http_latency_sum = 0.0
+        self._http_latency_min = 0.0
+        self._http_latency_max = 0.0
+        self._json_parse_sum = 0.0
+        self._oauth_lookup_sum = 0.0
     
     async def fetch_subreddit_media(
         self,
@@ -345,8 +376,15 @@ class RedditClient:
         mode: str,
         target_results: int,
         after: Optional[str] = None,
+        ctx: Optional[object] = None,
     ) -> tuple[list[dict], Optional[str], SearchAuditResult]:
-        """Accumulate search results across pages for a given query/subreddit/mode combination."""
+        """Accumulate search results across pages for a given query/subreddit/mode combination.
+
+        Cancellation (6.1.5):
+          If `ctx` is provided and has a truthy `cancelled` attribute, the page
+          loop exits early. Pages already fetched are returned; no new pages
+          are fetched after cancellation.
+        """
         results: list[dict] = []
         current_after = after
         pages_scanned = 0
@@ -355,6 +393,10 @@ class RedditClient:
         audit = SearchAuditResult(query=query, mode=mode)
 
         while True:
+            if ctx and getattr(ctx, "cancelled", False):
+                print(f"[SEARCH_CANCEL] query={query} breaking page loop "
+                      f"after {pages_scanned} pages")
+                break
             if len(results) >= target_results:
                 break
             if pages_scanned >= SEARCH_MAX_PAGES:
@@ -430,48 +472,48 @@ class RedditClient:
         subreddits: Optional[list[str]],
         mode: str = "global",
     ) -> tuple[list[dict], Optional[str]]:
-        """Search Reddit via OAuth. Returns raw post_data dicts (not parsed MediaAsset objects)."""
-        token = await self.oauth.get_valid_token()
+        """Search Reddit via OAuth. Returns raw post_data dicts (not parsed MediaAsset objects).
+        
+        Concurrency: Each call acquires the _search_semaphore, limiting concurrent
+        page fetches across all subreddit workers. The semaphore wait time is
+        tracked in _semaphore_wait_ms for metrics.
+        """
+        t0 = time.monotonic()
+        async with self._search_semaphore:
+            self._semaphore_wait_ms += (time.monotonic() - t0) * 1000
 
-        if subreddits and mode == "local":
-            subreddit_str = "+".join(s.strip().lower() for s in subreddits if s.strip())
-            url = f"https://oauth.reddit.com/r/{subreddit_str}/search"
-        else:
-            url = "https://oauth.reddit.com/search"
-
-        params: dict = {"q": query, "limit": limit}
-        if after:
-            params["after"] = after
-        if subreddits and mode == "local":
-            params["restrict_sr"] = "on"
-            params["include_over_18"] = "on"
-
-        print(f"[SEARCH_CURSOR] before={after}")
-        print(f"[SEARCH_REQUEST] q={query} after={after} url={url} params={params}")
-
-        try:
-            async with httpx.AsyncClient(timeout=httpx.Timeout(15.0)) as client:
-                response = await client.get(
-                    url,
-                    headers={
-                        "Authorization": f"bearer {token}",
-                        "User-Agent": "RedSlide/1.0 by u/redslide_dev",
-                    },
-                    params=params,
-                )
-        except (httpx.TimeoutException, httpx.ConnectError) as e:
-            print(f"[SEARCH_TIMEOUT] url={url} error={e}")
-            await self.provider_manager.record_provider_failure("reddit_oauth")
-            return [], None
-
-        print(f"[SEARCH_RESPONSE] status={response.status_code}")
-
-        if response.status_code == 401:
-            await self.oauth.refresh_token()
+            t_oauth = time.monotonic()
             token = await self.oauth.get_valid_token()
+            self._oauth_lookup_sum += time.monotonic() - t_oauth
+
+            if subreddits and mode == "local":
+                subreddit_str = "+".join(s.strip().lower() for s in subreddits if s.strip())
+                url = f"https://oauth.reddit.com/r/{subreddit_str}/search"
+            else:
+                url = "https://oauth.reddit.com/search"
+
+            params: dict = {"q": query, "limit": limit}
+            if after:
+                params["after"] = after
+            if subreddits and mode == "local":
+                params["restrict_sr"] = "on"
+                params["include_over_18"] = "on"
+
+            print(f"[SEARCH_CURSOR] before={after}")
+            print(f"[SEARCH_REQUEST] q={query} after={after} url={url} params={params}")
+
+            def _record_http(elapsed: float):
+                self._http_request_count += 1
+                self._http_latency_sum += elapsed
+                if self._http_latency_min == 0.0 or elapsed < self._http_latency_min:
+                    self._http_latency_min = elapsed
+                if elapsed > self._http_latency_max:
+                    self._http_latency_max = elapsed
+
             try:
-                async with httpx.AsyncClient(timeout=httpx.Timeout(15.0)) as retry_client:
-                    retry_response = await retry_client.get(
+                t_http = time.monotonic()
+                async with httpx.AsyncClient(timeout=httpx.Timeout(15.0)) as client:
+                    response = await client.get(
                         url,
                         headers={
                             "Authorization": f"bearer {token}",
@@ -479,35 +521,64 @@ class RedditClient:
                         },
                         params=params,
                     )
+                _record_http(time.monotonic() - t_http)
+            except (httpx.TimeoutException, httpx.ConnectError) as e:
+                self._http_failure_count += 1
+                print(f"[SEARCH_TIMEOUT] url={url} error={e}")
+                await self.provider_manager.record_provider_failure("reddit_oauth")
+                return [], None
+
+            print(f"[SEARCH_RESPONSE] status={response.status_code}")
+
+            if response.status_code == 401:
+                await self.oauth.refresh_token()
+                token = await self.oauth.get_valid_token()
+                try:
+                    t_http = time.monotonic()
+                    async with httpx.AsyncClient(timeout=httpx.Timeout(15.0)) as retry_client:
+                        retry_response = await retry_client.get(
+                            url,
+                            headers={
+                                "Authorization": f"bearer {token}",
+                                "User-Agent": "RedSlide/1.0 by u/redslide_dev",
+                            },
+                            params=params,
+                        )
+                    _record_http(time.monotonic() - t_http)
                     if retry_response.status_code == 200:
                         await self.oauth.record_success()
                         await self.provider_manager.record_provider_success("reddit_oauth")
+                        t_parse = time.monotonic()
                         data = retry_response.json()
+                        self._json_parse_sum += time.monotonic() - t_parse
                         after_cursor = data.get("data", {}).get("after")
                         raw_items = []
                         for child in data.get("data", {}).get("children", []):
                             raw_items.append(child.get("data", {}))
                         print(f"[SEARCH_RAW] count={len(raw_items)} after_cursor={after_cursor}")
                         return raw_items, after_cursor
-            except (httpx.TimeoutException, httpx.ConnectError) as e:
-                print(f"[SEARCH_TIMEOUT_RETRY] url={url} error={e}")
-            await self.provider_manager.record_provider_failure("reddit_oauth")
-            return [], None
+                except (httpx.TimeoutException, httpx.ConnectError) as e:
+                    self._http_failure_count += 1
+                    print(f"[SEARCH_TIMEOUT_RETRY] url={url} error={e}")
+                await self.provider_manager.record_provider_failure("reddit_oauth")
+                return [], None
 
-        if response.status_code != 200:
-            await self.provider_manager.record_provider_failure("reddit_oauth")
-            return [], None
+            if response.status_code != 200:
+                await self.provider_manager.record_provider_failure("reddit_oauth")
+                return [], None
 
-        await self.oauth.record_success()
-        await self.provider_manager.record_provider_success("reddit_oauth")
+            await self.oauth.record_success()
+            await self.provider_manager.record_provider_success("reddit_oauth")
 
-        data = response.json()
-        after_cursor = data.get("data", {}).get("after")
-        raw_items = []
-        for child in data.get("data", {}).get("children", []):
-            raw_items.append(child.get("data", {}))
-        print(f"[SEARCH_RAW] count={len(raw_items)} after_cursor={after_cursor}")
-        return raw_items, after_cursor
+            t_parse = time.monotonic()
+            data = response.json()
+            self._json_parse_sum += time.monotonic() - t_parse
+            after_cursor = data.get("data", {}).get("after")
+            raw_items = []
+            for child in data.get("data", {}).get("children", []):
+                raw_items.append(child.get("data", {}))
+            print(f"[SEARCH_RAW] count={len(raw_items)} after_cursor={after_cursor}")
+            return raw_items, after_cursor
 
     def _unwrap_crosspost(self, post_data: dict) -> dict:
         """Detect and unwrap crossposted Reddit posts.

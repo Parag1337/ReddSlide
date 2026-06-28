@@ -8,7 +8,7 @@ class MediaViewer extends StatelessWidget {
   final PreparedMediaHandle handle;
   final bool isMuted;
   final void Function(MediaErrorType errorType)? onMediaError;
-  final void Function(String url)? onImageDecoded;
+  final void Function(String url, {required bool wasCached})? onImageDecoded;
   final void Function(String url)? onVideoFirstFrame;
 
   const MediaViewer({

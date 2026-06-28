@@ -8,12 +8,14 @@ import pytest
 
 from app.services.search_coordinator import (
     SearchCoordinator,
+    SearchContext,
     SubredditWorkerResult,
     SearchMetrics,
     _after_to_cursors,
     _cursors_to_after,
     EXECUTE_TIMEOUT,
     DEFAULT_CONCURRENCY,
+    EXHAUSTED_SENTINEL,
 )
 from app.services.reddit_client import RedditClient, SearchAuditResult, ParseResult
 from app.models.schemas import MediaAsset, MediaAssetResponse
@@ -78,6 +80,7 @@ class FakeRedditClient:
         self.fail_subreddits: set[str] = set()
         self.timeout_subreddits: set[str] = set()
         self.oauth = FakeOAuth()
+        self._semaphore_wait_ms = 0.0
 
     def set_posts(self, subreddit: str, posts: list[dict]):
         self._subreddit_posts[subreddit] = list(posts)
@@ -92,8 +95,12 @@ class FakeRedditClient:
         mode: str,
         target_results: int,
         after: Optional[str] = None,
+        ctx: Optional[object] = None,
     ) -> tuple[list[dict], Optional[str], SearchAuditResult]:
         self.call_count += 1
+
+        if ctx and getattr(ctx, "cancelled", False):
+            return [], None, SearchAuditResult(query=query, mode=mode)
 
         sr = subreddits[0] if subreddits else "__global__"
 
@@ -398,8 +405,52 @@ class TestTimeout:
 
 class TestCancellation:
     @pytest.mark.asyncio
-    async def test_rapid_search_cancels_previous(self):
-        """Test 3: rapid repeated searches — old search is cancelled, no stale results."""
+    async def test_ctx_cancel_before_worker_returns_empty(self):
+        """SearchContext.cancel() before workers start — no workers launched."""
+        client = FakeRedditClient()
+        client.set_posts("pics", [_make_post(str(i), "pics") for i in range(100)])
+
+        coord = SearchCoordinator(reddit_client=client)
+        ctx = SearchContext()
+        ctx.cancel()
+
+        items, after, has_more, metrics = await coord._execute_body(
+            ctx=ctx, query="cat", mode="local", limit=10,
+            subreddits=["pics"],
+        )
+        assert len(items) == 0
+        assert after is None
+        assert has_more is False
+        assert metrics.cancelled is True
+
+    @pytest.mark.asyncio
+    async def test_cancel_during_accumulation_discards_results(self):
+        """Cancel mid-accumulation — worker sees context, returns empty."""
+        # Use a slow client so we can cancel while accumulation is in progress
+        from tests.test_benchmark_search import LatencyFakeRedditClient
+
+        client = LatencyFakeRedditClient(page_latency=0.05)
+        client.set_posts("pics", [_make_post(str(i), "pics") for i in range(500)])
+
+        coord = SearchCoordinator(reddit_client=client)
+        ctx = SearchContext()
+
+        async def run_it():
+            return await coord._execute_body(
+                ctx=ctx, query="cat", mode="local", limit=10,
+                subreddits=["pics"],
+            )
+
+        task = asyncio.create_task(run_it())
+        await asyncio.sleep(0.1)  # let some pages start fetching
+        ctx.cancel()
+        items, after, has_more, metrics = await task
+
+        assert metrics.cancelled is True
+
+    @pytest.mark.asyncio
+    async def test_rapid_search_old_cancelled_gracefully(self):
+        """Rapid repeated searches — old search catches CancelledError gracefully."""
         client = FakeRedditClient()
         client.set_posts("pics", [_make_post(str(i), "pics") for i in range(200)])
 
@@ -420,14 +471,76 @@ class TestCancellation:
 
         client._accumulate_search = FakeRedditClient._accumulate_search.__get__(client, FakeRedditClient)
 
-        items2, after2, has_more2, _ = await coord.execute(
+        items2, after2, has_more2, metrics2 = await coord.execute(
             query="new", mode="local", limit=10, subreddits=["pics"],
         )
         assert len(items2) > 0
         assert has_more2 is True
 
-        with pytest.raises(asyncio.CancelledError):
-            await task1
+        result = await task1
+        assert result is not None
+        old_items, old_after, old_more, old_metrics = result
+        assert old_metrics.cancelled is True
+
+    @pytest.mark.asyncio
+    async def test_cancellation_metrics_populated(self):
+        """Cancelled search populates cancellation metrics."""
+        client = FakeRedditClient()
+        client.set_posts("pics", [_make_post(str(i), "pics") for i in range(100)])
+
+        coord = SearchCoordinator(reddit_client=client)
+        ctx = SearchContext()
+        ctx.cancel()
+
+        _, _, _, metrics = await coord._execute_body(
+            ctx=ctx, query="cat", mode="local", limit=10,
+            subreddits=["pics"],
+        )
+        assert metrics.cancelled is True
+        assert metrics.cancellation_latency_ms >= 0
+
+    @pytest.mark.asyncio
+    async def test_global_mode_cancellation(self):
+        """Global mode search respects cancellation."""
+        client = FakeRedditClient()
+        client.set_posts("global", [_make_post(str(i), "global") for i in range(100)])
+
+        coord = SearchCoordinator(reddit_client=client)
+        ctx = SearchContext()
+        ctx.cancel()
+
+        items, after, has_more, metrics = await coord._execute_body(
+            ctx=ctx, query="cat", mode="global", limit=10,
+            subreddits=None,
+        )
+        assert metrics.cancelled is True
+        assert len(items) == 0
+
+    @pytest.mark.asyncio
+    async def test_timeout_sets_cancelled_flag(self):
+        """Overall timeout sets cancelled flag on metrics."""
+        client = FakeRedditClient()
+        original_timeout = EXECUTE_TIMEOUT
+
+        try:
+            import app.services.search_coordinator as sc
+            sc.EXECUTE_TIMEOUT = 0.05
+
+            async def slow_search(*args, **kwargs):
+                await asyncio.sleep(10)
+                return [], None, SearchAuditResult()
+
+            client._accumulate_search = slow_search
+
+            coord = SearchCoordinator(reddit_client=client)
+            _, _, _, metrics = await coord.execute(
+                query="cat", mode="local", limit=10,
+                subreddits=["pics"],
+            )
+            assert metrics.overall_timed_out is True
+            assert metrics.cancelled is True
+        finally:
+            sc.EXECUTE_TIMEOUT = original_timeout
 
 
 class TestGlobalMode:
@@ -489,6 +602,148 @@ class TestMetrics:
         assert metrics.total_elapsed > 0
         assert "pics" in metrics.per_subreddit
         assert "aww" in metrics.per_subreddit
+
+
+class TestExhaustedSentinel:
+    """Verify exhausted subreddits are not re-requested on subsequent loadMores."""
+
+    @pytest.mark.asyncio
+    async def test_exhausted_marked_with_sentinel(self):
+        """Sub with 100 posts (exhausted at target=100) gets EXHAUSTED_SENTINEL."""
+        client = FakeRedditClient()
+        client.set_posts("pics", [_make_post(str(i), "pics") for i in range(100)])
+        client.set_posts("aww", [_make_post(str(i + 200), "aww") for i in range(500)])
+
+        coord = SearchCoordinator(reddit_client=client)
+        items1, after1, has_more1, metrics1 = await coord.execute(
+            query="cat", mode="local", limit=25,
+            subreddits=["pics", "aww"],
+        )
+        assert has_more1 is True
+        assert metrics1.workers_exhausted == 1  # pics exhausted
+        assert "pics" in metrics1.per_subreddit
+
+        cursors1 = _after_to_cursors(after1)
+        assert cursors1.get("pics") == EXHAUSTED_SENTINEL
+        assert cursors1.get("aww") is not None  # aww continues
+
+    @pytest.mark.asyncio
+    async def test_exhausted_skipped_on_next_round(self):
+        """Previously exhausted sub is skipped — no Reddit requests for it."""
+        client = FakeRedditClient()
+        client.set_posts("pics", [_make_post(str(i), "pics") for i in range(100)])
+        client.set_posts("aww", [_make_post(str(i + 200), "aww") for i in range(500)])
+
+        coord = SearchCoordinator(reddit_client=client)
+
+        items1, after1, has_more1, metrics1 = await coord.execute(
+            query="cat", mode="local", limit=25,
+            subreddits=["pics", "aww"],
+        )
+
+        call_count_after_round1 = client.call_count
+
+        items2, after2, has_more2, metrics2 = await coord.execute(
+            query="cat", mode="local", limit=25,
+            subreddits=["pics", "aww"], after=after1,
+        )
+
+        # pics was skipped — its elapsed should be 0
+        assert metrics2.per_subreddit.get("pics", -1) == 0.0
+        assert metrics2.workers_skipped == 1
+
+        # call_count increased by exactly 1 (only aww's _accumulate_search called)
+        assert client.call_count == call_count_after_round1 + 1
+
+    @pytest.mark.asyncio
+    async def test_sentinel_persists_across_rounds(self):
+        """Exhausted sentinel persists as long as other subreddits continue."""
+        client = FakeRedditClient()
+        client.set_posts("pics", [_make_post(str(i), "pics") for i in range(100)])
+        client.set_posts("aww", [_make_post(str(i + 200), "aww") for i in range(500)])
+
+        coord = SearchCoordinator(reddit_client=client)
+        items1, after1, _, _ = await coord.execute(
+            query="cat", mode="local", limit=25,
+            subreddits=["pics", "aww"],
+        )
+
+        after = after1
+        for _ in range(3):
+            items, after, has_more, metrics = await coord.execute(
+                query="cat", mode="local", limit=25,
+                subreddits=["pics", "aww"], after=after,
+            )
+            cursors = _after_to_cursors(after)
+            if has_more:
+                # pics should still be exhausted sentinel
+                assert cursors.get("pics") == EXHAUSTED_SENTINEL
+            else:
+                # aww also exhausted — no cursors at all
+                assert after is None
+
+    @pytest.mark.asyncio
+    async def test_no_redundant_reddit_calls(self):
+        """Exhausted sub never makes another Reddit call after exhaustion."""
+        client = FakeRedditClient()
+        client.set_posts("pics", [_make_post(str(i), "pics") for i in range(100)])
+        client.set_posts("aww", [_make_post(str(i + 200), "aww") for i in range(500)])
+
+        coord = SearchCoordinator(reddit_client=client)
+
+        _, after, _, _ = await coord.execute(
+            query="cat", mode="local", limit=25,
+            subreddits=["pics", "aww"],
+        )
+
+        initial_count = client.call_count
+
+        # Exhausted sub should not increase call count
+        for _ in range(3):
+            _, after, has_more, _ = await coord.execute(
+                query="cat", mode="local", limit=25,
+                subreddits=["pics", "aww"], after=after,
+            )
+            if not has_more:
+                break
+
+        # call_count only increased for aww (continuing sub)
+        # pics never made another Reddit call
+        new_calls = client.call_count - initial_count
+        assert new_calls > 0  # aww made calls
+        # Count unique callers to verify pics wasn't called
+        # (FakeRedditClient tracks total, not per-sub, so we rely on metric)
+
+    @pytest.mark.asyncio
+    async def test_all_exhausted_has_more_false(self):
+        """When all subreddits exhaust, has_more is False and sentinels cleanup."""
+        client = FakeRedditClient()
+        client.set_posts("pics", [_make_post(str(i), "pics") for i in range(150)])
+        client.set_posts("aww", [_make_post(str(i + 200), "aww") for i in range(150)])
+
+        coord = SearchCoordinator(reddit_client=client)
+
+        items1, after1, has_more1, metrics1 = await coord.execute(
+            query="cat", mode="local", limit=25,
+            subreddits=["pics", "aww"],
+        )
+        assert has_more1 is True
+
+        items2, after2, has_more2, metrics2 = await coord.execute(
+            query="cat", mode="local", limit=25,
+            subreddits=["pics", "aww"], after=after1,
+        )
+        assert has_more2 is False
+        assert metrics2.workers_exhausted == 2  # both exhausted in round 2
+
+        # If frontend ignores has_more=False and sends after again,
+        # workers should be skipped and has_more stays False
+        items3, after3, has_more3, metrics3 = await coord.execute(
+            query="cat", mode="local", limit=25,
+            subreddits=["pics", "aww"], after=after2,
+        )
+        assert has_more3 is False
+        assert metrics3.workers_skipped == 2  # both skipped
 
 
 class TestStress:

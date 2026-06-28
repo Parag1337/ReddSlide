@@ -17,6 +17,7 @@ import '../../feed/domain/media_asset.dart';
 import '../../settings/domain/settings_model.dart';
 import '../../settings/providers/settings_provider.dart';
 import '../domain/metrics_collector.dart';
+import '../domain/slide_profiler.dart'; // TEMPORARY — Phase 7.2A
 import '../domain/slideshow_source.dart';
 import '../providers/slideshow_provider.dart';
 import 'widgets/media_viewer.dart';
@@ -46,6 +47,7 @@ class _SlideshowScreenState extends ConsumerState<SlideshowScreen> with WidgetsB
     super.initState();
     _pageController = PageController(initialPage: widget.startIndex);
     WidgetsBinding.instance.addObserver(this);
+    _setProfilerSource(); // TEMPORARY — Phase 7.2A
     _logSource();
     Future.microtask(() {
       final notifier = ref.read(slideshowProvider(widget.source).notifier);
@@ -103,8 +105,20 @@ class _SlideshowScreenState extends ConsumerState<SlideshowScreen> with WidgetsB
     debugPrint('[Slideshow] source=$desc');
   }
 
+  void _setProfilerSource() { // TEMPORARY — Phase 7.2A
+    final tag = switch (widget.source) {
+      SubredditSource() => 'subreddit',
+      MultiSubredditSource() => 'multi',
+      GlobalFeedSource() => 'global',
+      SearchSource() => 'search',
+      GroupSource() => 'group',
+    };
+    SlideProfiler.setSourceType(tag);
+  }
+
   @override
   void dispose() {
+    debugPrint(SlideProfiler.dumpReport()); // TEMPORARY — Phase 7.2A
     WidgetsBinding.instance.removeObserver(this);
     _pageController.dispose();
     _currentIndexSub?.close();
@@ -280,9 +294,11 @@ class _SlideshowPageContentState extends ConsumerState<_SlideshowPageContent> {
     final currentIndex = ref.watch(slideshowProvider(widget.source).select((s) => s.currentIndex));
     final gallerySubIndex = ref.watch(slideshowProvider(widget.source).select((s) => s.gallerySubIndex));
     final isMuted = ref.watch(slideshowProvider(widget.source).select((s) => s.isMuted));
+    ref.watch(slideshowProvider(widget.source).select((s) => s.preparationRevision));
     final notifier = ref.read(slideshowProvider(widget.source).notifier);
 
     _emitOpenedIfNeeded(notifier);
+    SlideProfiler.recordPageViewBuild(); // TEMPORARY — Phase 7.2A
 
     return PageView.builder(
       controller: widget.pageController,
@@ -322,11 +338,16 @@ class _SlideshowPageContentState extends ConsumerState<_SlideshowPageContent> {
               handle: handle,
               isMuted: isMuted,
               onMediaError: widget.onMediaError,
-              onImageDecoded: (url) {
+              onImageDecoded: (url, {required bool wasCached}) {
+                notifier.metrics.recordEvent(
+                  wasCached ? MetricEventType.imageCacheHit : MetricEventType.imageCacheMiss,
+                  data: {'assetId': asset.id, 'index': index, 'url': url},
+                );
                 notifier.metrics.recordEvent(MetricEventType.imageDecoded, data: {
                   'assetId': asset.id,
                   'index': index,
                   'url': url,
+                  'wasCached': wasCached,
                 });
               },
               onVideoFirstFrame: (url) {

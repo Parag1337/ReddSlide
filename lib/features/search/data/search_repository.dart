@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'package:flutter/foundation.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../../../core/network/api_client.dart';
@@ -18,6 +19,58 @@ class SearchRepository {
   final ApiClient _apiClient;
 
   SearchRepository({required this._apiClient});
+
+  Future<Result<ProgressiveSearchResponse>> searchRedditProgressive({
+    required String query,
+    required SearchMode mode,
+    int limit = 50,
+    String? after,
+    List<String>? subreddits,
+  }) async {
+    final params = <String, dynamic>{
+      'q': query,
+      'mode': mode == SearchMode.local ? 'local' : 'global',
+      'limit': limit,
+    };
+    if (after != null) params['after'] = after;
+    if (subreddits != null && subreddits.isNotEmpty) {
+      params['subreddits'] = subreddits.join(',');
+    }
+
+    debugPrint('[SEARCH_REPOSITORY] progressive query=$query mode=$mode');
+
+    final result = await _apiClient.get(
+      ApiConstants.searchRedditProgressive,
+      queryParameters: params,
+      fromJson: (json) =>
+          ProgressiveSearchResponse.fromJson(json as Map<String, dynamic>),
+    );
+    result.when(
+      (data) => debugPrint(
+          '[SEARCH_REPOSITORY] progressive returned=${data.items.length} session=${data.sessionId} done=${data.done}'),
+      (e) => debugPrint('[SEARCH_REPOSITORY] progressive error=$e'),
+    );
+    return result;
+  }
+
+  Future<Result<ProgressiveSearchResponse>> pollSearchResults({
+    required String sessionId,
+  }) async {
+    debugPrint('[SEARCH_REPOSITORY] poll session=$sessionId');
+
+    final result = await _apiClient.get(
+      ApiConstants.searchRedditPoll,
+      queryParameters: {'session': sessionId},
+      fromJson: (json) =>
+          ProgressiveSearchResponse.fromJson(json as Map<String, dynamic>),
+    );
+    result.when(
+      (data) => debugPrint(
+          '[SEARCH_REPOSITORY] poll returned=${data.items.length} done=${data.done}'),
+      (e) => debugPrint('[SEARCH_REPOSITORY] poll error=$e'),
+    );
+    return result;
+  }
 
   Future<Result<FeedResponse>> searchReddit({
     required String query,

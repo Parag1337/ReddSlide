@@ -4,6 +4,7 @@ import 'package:flutter/foundation.dart';
 import 'package:video_player/video_player.dart';
 import '../../../core/constants/app_constants.dart';
 import 'metrics_collector.dart';
+import 'slide_profiler.dart'; // TEMPORARY — Phase 7.2A
 
 enum VideoControllerState { notCreated, preparing, ready, failed }
 
@@ -83,6 +84,7 @@ class VideoPreparationService {
   }
 
   Future<void> _initController(String url, _VideoEntry entry) async {
+    SlideProfiler.recordVideoInitStart(url); // TEMPORARY — Phase 7.2A
     entry.state = VideoControllerState.preparing;
     final completer = entry.completer!;
     metrics?.recordEvent(MetricEventType.videoControllerInitializing, data: {'url': url});
@@ -90,32 +92,53 @@ class VideoPreparationService {
     try {
       final controller = VideoPlayerController.networkUrl(Uri.parse(url));
       entry.controller = controller;
-      await controller.initialize();
+      await controller.initialize().timeout(
+        Duration(milliseconds: AppConstants.videoInitTimeoutMs),
+      );
       entry.state = VideoControllerState.ready;
+      SlideProfiler.recordVideoInitEnd(url, success: true); // TEMPORARY — Phase 7.2A
       metrics?.recordEvent(MetricEventType.videoControllerReady, data: {'url': url, 'retry': false});
       _safeComplete(completer, controller);
       onReadinessChanged?.call();
     } catch (e) {
       if (completer.isCompleted) return;
-      metrics?.recordEvent(MetricEventType.videoRetry, data: {'url': url, 'error': e.toString()});
       entry.controller?.dispose();
-      try {
-        final controller = VideoPlayerController.networkUrl(Uri.parse(url));
-        entry.controller = controller;
-        metrics?.recordEvent(MetricEventType.videoControllerInitializing, data: {'url': url, 'retry': true});
-        await controller.initialize();
-        entry.state = VideoControllerState.ready;
-        metrics?.recordEvent(MetricEventType.videoControllerReady, data: {'url': url, 'retry': true});
-        _safeComplete(completer, controller);
-        onReadinessChanged?.call();
-      } catch (e2) {
-        entry.controller?.dispose();
-        entry.controller = null;
-        entry.state = VideoControllerState.failed;
-        metrics?.recordEvent(MetricEventType.videoControllerFailed, data: {'url': url, 'error': e2.toString()});
-        _safeCompleteError(completer, e2);
-        onReadinessChanged?.call();
+      final isTimeout = e is TimeoutException;
+
+      if (!isTimeout) {
+        metrics?.recordEvent(MetricEventType.videoRetry, data: {'url': url, 'error': e.toString()});
+        try {
+          final controller = VideoPlayerController.networkUrl(Uri.parse(url));
+          entry.controller = controller;
+          metrics?.recordEvent(MetricEventType.videoControllerInitializing, data: {'url': url, 'retry': true});
+          await controller.initialize().timeout(
+            Duration(milliseconds: AppConstants.videoInitTimeoutMs),
+          );
+          entry.state = VideoControllerState.ready;
+          SlideProfiler.recordVideoInitEnd(url, success: true); // TEMPORARY — Phase 7.2A
+          metrics?.recordEvent(MetricEventType.videoControllerReady, data: {'url': url, 'retry': true});
+          _safeComplete(completer, controller);
+          onReadinessChanged?.call();
+          return;
+        } catch (e2) {
+          entry.controller?.dispose();
+          entry.controller = null;
+          entry.state = VideoControllerState.failed;
+          SlideProfiler.recordVideoInitEnd(url, success: false); // TEMPORARY — Phase 7.2A
+          metrics?.recordEvent(MetricEventType.videoControllerFailed, data: {'url': url, 'error': e2.toString()});
+          _safeCompleteError(completer, e2);
+          onReadinessChanged?.call();
+          return;
+        }
       }
+
+      entry.controller?.dispose();
+      entry.controller = null;
+      entry.state = VideoControllerState.failed;
+      SlideProfiler.recordVideoInitEnd(url, success: false); // TEMPORARY — Phase 7.2A
+      metrics?.recordEvent(MetricEventType.videoControllerFailed, data: {'url': url, 'error': e.toString()});
+      _safeCompleteError(completer, e);
+      onReadinessChanged?.call();
     } finally {
       _activeCount--;
       _processNextInQueue();

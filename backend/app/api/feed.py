@@ -63,7 +63,9 @@ async def get_feed(
     after: Optional[str] = Query(default=None),
     subreddits: Optional[str] = Query(default=None),
     sort: str = Query(default="hot"),
-    queue_manager: QueueManager = Depends(get_queue_manager)
+    queue_manager: QueueManager = Depends(get_queue_manager),
+    oauth_manager: OAuthManager = Depends(get_oauth_manager),
+    provider_manager: ProviderManager = Depends(get_provider_manager),
 ):
     """Get media feed from media_assets.
 
@@ -91,7 +93,11 @@ async def get_feed(
     # If no items exist on first page, trigger on-demand fetch from Reddit
     if not items and single_sub and not after:
         print(f"[API] sync_fetch_trigger subreddit={single_sub}")
-        await queue_manager.ensure_subreddit_has_content(single_sub, sort=sort)
+        await queue_manager.ensure_subreddit_has_content(
+            single_sub, sort=sort,
+            oauth_manager=oauth_manager,
+            provider_manager=provider_manager,
+        )
         items, next_cursor, has_more = await queue_manager.get_subreddit_assets(
             subreddit=single_sub,
             limit=limit,

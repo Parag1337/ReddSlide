@@ -1,9 +1,11 @@
+import 'dart:async';
 import 'dart:math' show max;
 import 'package:flutter/foundation.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../../../core/errors/app_error.dart';
 import '../../../core/constants/app_constants.dart';
 import '../../feed/domain/media_asset.dart';
+import '../../feed/data/feed_repository.dart';
 import '../../settings/providers/settings_provider.dart';
 import '../../slideshow/domain/metrics_collector.dart';
 import '../../slideshow/domain/slideshow_source.dart';
@@ -47,6 +49,8 @@ class SearchState {
   final String? mediaType;
   final String? sort;
   final int totalResults;
+  final String? sessionId;
+  final bool isPolling;
 
   const SearchState({
     this.query = '',
@@ -62,6 +66,8 @@ class SearchState {
     this.mediaType,
     this.sort,
     this.totalResults = 0,
+    this.sessionId,
+    this.isPolling = false,
   });
 
   SearchState copyWith({
@@ -78,6 +84,8 @@ class SearchState {
     String? mediaType,
     String? sort,
     int? totalResults,
+    String? sessionId,
+    bool? isPolling,
   }) {
     return SearchState(
       query: query ?? this.query,
@@ -93,6 +101,8 @@ class SearchState {
       mediaType: mediaType ?? this.mediaType,
       sort: sort ?? this.sort,
       totalResults: totalResults ?? this.totalResults,
+      sessionId: sessionId ?? this.sessionId,
+      isPolling: isPolling ?? this.isPolling,
     );
   }
 }
@@ -101,6 +111,9 @@ class SearchNotifier extends StateNotifier<SearchState> {
   final SearchRepository _searchRepository;
   final Ref _ref;
   final MetricsCollector metrics;
+  int _searchGeneration = 0;
+  Timer? _pollTimer;
+  static const Duration _pollInterval = Duration(milliseconds: 1500);
 
   SearchNotifier({
     required this._searchRepository,
@@ -148,9 +161,14 @@ class SearchNotifier extends StateNotifier<SearchState> {
 
   Future<void> search(String query) async {
     if (query.trim().isEmpty) {
+      _stopPolling();
       state = const SearchState();
       return;
     }
+
+    _stopPolling();
+    _searchGeneration++;
+    final int generation = _searchGeneration;
 
     metrics.recordEvent(MetricEventType.searchRequested, data: {
       'query': query,
@@ -167,9 +185,11 @@ class SearchNotifier extends StateNotifier<SearchState> {
       hasMore: true,
       afterCursor: null,
       totalResults: 0,
+      sessionId: null,
+      isPolling: false,
     );
 
-    final result = await _searchRepository.searchReddit(
+    final result = await _searchRepository.searchRedditProgressive(
       query: query,
       mode: state.mode,
       limit: AppConstants.paginationPageSize,
@@ -177,9 +197,12 @@ class SearchNotifier extends StateNotifier<SearchState> {
       subreddits: state.mode == SearchMode.local ? state.selectedSubreddits : null,
     );
 
+    if (generation != _searchGeneration) return;
+
     result.when(
       (data) {
-        _trace('search results', data.items, cursor: data.after, hasMore: data.hasMore);
+        if (generation != _searchGeneration) return;
+        _trace('progressive results', data.items, cursor: data.after, hasMore: data.hasMore);
 
         metrics.recordEvent(MetricEventType.searchResponseReceived, data: {
           'resultCount': data.items.length,
@@ -190,14 +213,21 @@ class SearchNotifier extends StateNotifier<SearchState> {
         state = state.copyWith(
           results: data.items,
           isLoading: false,
-          hasMore: data.hasMore,
+          hasMore: data.hasMore || (data.sessionId != null && !data.done),
           afterCursor: data.after,
           totalResults: data.items.length,
+          sessionId: data.sessionId,
+          isPolling: data.sessionId != null && !data.done,
         );
 
         _addRecentQuery(query);
+
+        if (data.sessionId != null && !data.done) {
+          _startPolling(data.sessionId!);
+        }
       },
       (error) {
+        if (generation != _searchGeneration) return;
         metrics.recordEvent(MetricEventType.searchResponseReceived, data: {
           'error': error.toString(),
         });
@@ -207,10 +237,65 @@ class SearchNotifier extends StateNotifier<SearchState> {
     );
   }
 
+  void _startPolling(String sessionId) {
+    _pollTimer?.cancel();
+    _pollTimer = Timer.periodic(_pollInterval, (_) => _pollOnce(sessionId));
+  }
+
+  void _stopPolling() {
+    _pollTimer?.cancel();
+    _pollTimer = null;
+  }
+
+  Future<void> _pollOnce(String sessionId) async {
+    final generation = _searchGeneration;
+
+    final result = await _searchRepository.pollSearchResults(
+      sessionId: sessionId,
+    );
+
+    if (generation != _searchGeneration) return;
+
+    result.when(
+      (data) {
+        if (generation != _searchGeneration) return;
+
+        if (data.items.isNotEmpty) {
+          final existingIds = state.results.map((e) => e.id).toSet();
+          final newItems = data.items.where((e) => !existingIds.contains(e.id)).toList();
+          final combined = [...state.results, ...newItems];
+          final capped = combined.length > 1000
+              ? combined.sublist(combined.length - 1000)
+              : combined;
+
+          state = state.copyWith(
+            results: capped,
+            totalResults: capped.length,
+          );
+        }
+
+        if (data.done || data.sessionId == null) {
+          _stopPolling();
+          state = state.copyWith(
+            isPolling: false,
+            sessionId: null,
+            hasMore: data.hasMore,
+          );
+        }
+      },
+      (error) {
+        if (generation != _searchGeneration) return;
+        _stopPolling();
+        state = state.copyWith(isPolling: false, sessionId: null, error: error);
+      },
+    );
+  }
+
   Future<void> loadMore() async {
     if (state.isLoadingMore || !state.hasMore || state.afterCursor == null) return;
 
-    state = state.copyWith(isLoadingMore: true);
+    _stopPolling();
+    state = state.copyWith(isLoadingMore: true, isPolling: false, sessionId: null);
 
     final result = await _searchRepository.searchReddit(
       query: state.query,
@@ -244,6 +329,7 @@ class SearchNotifier extends StateNotifier<SearchState> {
   }
 
   void clearResults() {
+    _stopPolling();
     state = SearchState(
       recentQueries: state.recentQueries,
       mode: state.mode,
@@ -275,6 +361,7 @@ class SearchNotifier extends StateNotifier<SearchState> {
 
   @override
   void dispose() {
+    _stopPolling();
     metrics.dispose();
     super.dispose();
   }

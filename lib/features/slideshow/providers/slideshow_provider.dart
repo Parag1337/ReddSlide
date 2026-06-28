@@ -43,7 +43,9 @@ class SlideshowNotifier extends StateNotifier<SlideshowState> {
   Timer? _overlayTimer;
   int _slideshowIntervalSeconds = AppConstants.defaultSlideshowIntervalSeconds;
   Future<void>? _inFlightLoadMore;
+  bool _isNavigating = false;
   final MetricsCollector metrics;
+  int _preparationRevision = 0;
 
   SlideshowNotifier({
     required FeedRepository feedRepository,
@@ -67,7 +69,7 @@ class SlideshowNotifier extends StateNotifier<SlideshowState> {
       )..metrics = metrics
         ..attachContext(
           context,
-          onReadinessChanged: _onVideoReadinessChanged,
+          onReadinessChanged: _onReadinessChanged,
           displayQualityMode: displayQualityMode,
         );
     }
@@ -80,7 +82,8 @@ class SlideshowNotifier extends StateNotifier<SlideshowState> {
     );
   }
 
-  void _onVideoReadinessChanged() {
+  void _onReadinessChanged() {
+    _preparationRevision++;
     _syncState();
   }
 
@@ -197,46 +200,65 @@ class SlideshowNotifier extends StateNotifier<SlideshowState> {
 
   Future<void> next({int eid = -1}) async {
     if (_playlist.isEmpty) return;
-    metrics.recordEvent(MetricEventType.slideshowSwipeNext, data: {'eid': eid});
+    if (_isNavigating) return;
+    _isNavigating = true;
+    try {
+      metrics.recordEvent(MetricEventType.slideshowSwipeNext, data: {'eid': eid});
 
-    final nextIndex = state.currentIndex + 1;
-    if (nextIndex >= _playlist.length) {
-      if (!state.isLoadingMore) {
-        await loadMore();
-      } else if (_inFlightLoadMore != null) {
-        await _inFlightLoadMore;
+      final nextIndex = state.currentIndex + 1;
+      if (nextIndex >= _playlist.length) {
+        if (!state.isLoadingMore) {
+          await loadMore();
+        } else if (_inFlightLoadMore != null) {
+          await _inFlightLoadMore;
+        }
+        if (_playlist.advance()) {
+          _syncState();
+        }
+        _restartAutoAdvance();
+        _notifyPreloader();
+        return;
       }
-      if (_playlist.advance()) {
+
+      if (_playlist.next() != null) {
         _syncState();
+        _restartAutoAdvance();
+        _notifyPreloader();
       }
-      _restartAutoAdvance();
-      _notifyPreloader();
-      return;
-    }
-
-    if (_playlist.next() != null) {
-      _syncState();
-      _restartAutoAdvance();
-      _notifyPreloader();
+    } finally {
+      _isNavigating = false;
     }
   }
 
   Future<void> previous({int eid = -1}) async {
-    metrics.recordEvent(MetricEventType.slideshowSwipePrevious, data: {'eid': eid});
-    if (_playlist.previous() != null) {
-      _syncState();
-      _restartAutoAdvance();
-      _notifyPreloader();
+    if (_playlist.isEmpty) return;
+    if (_isNavigating) return;
+    _isNavigating = true;
+    try {
+      metrics.recordEvent(MetricEventType.slideshowSwipePrevious, data: {'eid': eid});
+      if (_playlist.previous() != null) {
+        _syncState();
+        _restartAutoAdvance();
+        _notifyPreloader();
+      }
+    } finally {
+      _isNavigating = false;
     }
   }
 
   Future<void> jumpTo(int index) async {
     if (index < 0 || index >= _playlist.length) return;
-    metrics.recordEvent(MetricEventType.slideshowSwipeJump, data: {'index': index});
-    _playlist.jumpTo(index);
-    _syncState();
-    _restartAutoAdvance();
-    _notifyPreloader();
+    if (_isNavigating) return;
+    _isNavigating = true;
+    try {
+      metrics.recordEvent(MetricEventType.slideshowSwipeJump, data: {'index': index});
+      _playlist.jumpTo(index);
+      _syncState();
+      _restartAutoAdvance();
+      _notifyPreloader();
+    } finally {
+      _isNavigating = false;
+    }
   }
 
   void togglePlay() {
@@ -280,6 +302,7 @@ class SlideshowNotifier extends StateNotifier<SlideshowState> {
 
   void galleryNext() {
     if (_playlist.isEmpty) return;
+    if (_isNavigating) return;
     final asset = _playlist.current;
     if (asset == null) return;
 
@@ -296,6 +319,7 @@ class SlideshowNotifier extends StateNotifier<SlideshowState> {
 
   void galleryPrevious() {
     if (_playlist.isEmpty) return;
+    if (_isNavigating) return;
     final asset = _playlist.current;
     if (asset == null) return;
 
@@ -348,7 +372,8 @@ class SlideshowNotifier extends StateNotifier<SlideshowState> {
     state = state.copyWith(
       items: _playlist.items,
       currentIndex: _playlist.currentIndex,
-      gallerySubIndex: 0,
+      gallerySubIndex: _playlist.currentIndex != state.currentIndex ? 0 : state.gallerySubIndex,
+      preparationRevision: _preparationRevision,
     );
   }
 

@@ -25,9 +25,16 @@ class AppConstants {
   static const int preloadedUrlSetMaxSize = 500;
   static const int preloadCheckIntervalMs = 100;
 
+  /// Timeout for image preload (milliseconds).
+  /// Prevents a single slow/failed image from blocking a worker indefinitely.
+  static const int imagePreloadTimeoutMs = 60000;
+
   /// Video pre-initialization window (how many videos ahead to prepare)
   static const int videoPreloadWindow = 2;
 
   /// Max concurrent VideoPlayerController initializations
   static const int maxConcurrentVideoPrep = 2;
+
+  /// Timeout for video initialization (milliseconds)
+  static const int videoInitTimeoutMs = 15000;
 }

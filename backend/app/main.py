@@ -41,8 +41,11 @@ async def lifespan(app: FastAPI):
     app.state.oauth_manager = oauth_manager
     app.state.provider_manager = ProviderManager()
 
-    # Initialize and start background service
-    background_service = BackgroundRefreshService()
+    # Initialize and start background service with shared OAuth/Provider instances
+    background_service = BackgroundRefreshService(
+        oauth_manager=oauth_manager,
+        provider_manager=app.state.provider_manager,
+    )
     await background_service.start()
     
     yield
@@ -65,6 +68,8 @@ class SlidingWindowRateLimiter:
 
     Tracks request timestamps per client IP using a sliding window.
     Old entries are pruned lazily on each request.
+    Client IPs with no recent activity are removed periodically
+    to keep memory usage bounded.
     """
 
     def __init__(self, max_requests: int = 60, window_seconds: float = 60.0):
@@ -81,7 +86,21 @@ class SlidingWindowRateLimiter:
         if len(self._clients[client_ip]) >= self.max_requests:
             return False
         self._clients[client_ip].append(now)
+
+        # Periodically prune clients with no recent activity
+        # Triggered when dict exceeds 1000 entries
+        if len(self._clients) > 1000:
+            self._prune_inactive(now)
         return True
+
+    def _prune_inactive(self, now: float):
+        cutoff = now - self.window_seconds * 2
+        stale = [
+            ip for ip, times in self._clients.items()
+            if not times or max(times) < cutoff
+        ]
+        for ip in stale:
+            del self._clients[ip]
 
 
 rate_limiter = SlidingWindowRateLimiter(max_requests=60, window_seconds=60.0)

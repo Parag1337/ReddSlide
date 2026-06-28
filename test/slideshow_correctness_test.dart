@@ -69,6 +69,24 @@ class _MockSearchRepository implements SearchRepository {
   }) async {
     throw UnimplementedError('not used');
   }
+
+  @override
+  Future<Result<ProgressiveSearchResponse>> searchRedditProgressive({
+    required String query,
+    required SearchMode mode,
+    int limit = 50,
+    String? after,
+    List<String>? subreddits,
+  }) async {
+    throw UnimplementedError('not used');
+  }
+
+  @override
+  Future<Result<ProgressiveSearchResponse>> pollSearchResults({
+    required String sessionId,
+  }) async {
+    throw UnimplementedError('not used');
+  }
 }
 
 void main() {

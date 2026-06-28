@@ -11,6 +11,7 @@ class SlideshowState {
   final bool isLoadingMore;
   final bool hasMorePages;
   final int gallerySubIndex;
+  final int preparationRevision;
 
   const SlideshowState({
     this.items = const [],
@@ -23,6 +24,7 @@ class SlideshowState {
     this.isLoadingMore = false,
     this.hasMorePages = true,
     this.gallerySubIndex = 0,
+    this.preparationRevision = 0,
   });
 
   SlideshowState copyWith({
@@ -36,6 +38,7 @@ class SlideshowState {
     bool? isLoadingMore,
     bool? hasMorePages,
     int? gallerySubIndex,
+    int? preparationRevision,
   }) {
     return SlideshowState(
       items: items ?? this.items,
@@ -48,6 +51,7 @@ class SlideshowState {
       isLoadingMore: isLoadingMore ?? this.isLoadingMore,
       hasMorePages: hasMorePages ?? this.hasMorePages,
       gallerySubIndex: gallerySubIndex ?? this.gallerySubIndex,
+      preparationRevision: preparationRevision ?? this.preparationRevision,
     );
   }
 }

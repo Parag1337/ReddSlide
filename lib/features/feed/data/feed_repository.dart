@@ -110,14 +110,43 @@ class FeedResponse {
   }
 }
 
-class QueueResponse {
-  final int queueSize;
+class ProgressiveSearchResponse {
+  final List<MediaAsset> items;
+  final bool hasMore;
+  final String? after;
+  final String? sessionId;
+  final bool done;
 
-  const QueueResponse({required this.queueSize});
+  const ProgressiveSearchResponse({
+    required this.items,
+    required this.hasMore,
+    this.after,
+    this.sessionId,
+    this.done = false,
+  });
+
+  factory ProgressiveSearchResponse.fromJson(Map<String, dynamic> json) {
+    final itemsList = (json['items'] as List<dynamic>)
+        .map((e) => MediaAsset.fromJson(e as Map<String, dynamic>))
+        .toList();
+    return ProgressiveSearchResponse(
+      items: itemsList,
+      hasMore: json['has_more'] as bool? ?? false,
+      after: json['after'] as String?,
+      sessionId: json['session_id'] as String?,
+      done: json['done'] as bool? ?? false,
+    );
+  }
+}
+
+class QueueResponse {
+  final int total;
+
+  const QueueResponse({required this.total});
 
   factory QueueResponse.fromJson(Map<String, dynamic> json) {
     return QueueResponse(
-      queueSize: json['queue_size'] as int? ?? 0,
+      total: json['total'] as int? ?? 0,
     );
   }
 }
