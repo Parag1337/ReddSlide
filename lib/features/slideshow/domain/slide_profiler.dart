@@ -296,6 +296,118 @@ class SlideProfiler {
     }
   }
 
+  // === Scheduler metrics ===
+  static String _currentScheduler = 'unknown';
+  static String _schedulerMode = 'unknown';
+  static int _schedulerNeedCount = 0;
+  static int _schedulerReadyHorizon = 0;
+  static int _schedulerPrepBudget = 0;
+  static int _schedulerGeneration = 0;
+  static int _schedulerPendingTasks = 0;
+  static int _schedulerCompletedTasks = 0;
+  static int _schedulerCancelledTasks = 0;
+  static int _schedulerDemandCalcUs = 0;
+  static int _schedulerPlanUs = 0;
+  static int _schedulerEnqueueUs = 0;
+  static int _schedulerPickTaskUs = 0;
+  static int _schedulerDemandCalcSamples = 0;
+  static int _schedulerPlanSamples = 0;
+  static int _schedulerEnqueueSamples = 0;
+  static int _schedulerPickTaskSamples = 0;
+
+  static void recordSchedulerDemandCalc(int us) {
+    _schedulerDemandCalcUs += us;
+    _schedulerDemandCalcSamples++;
+  }
+
+  static void recordSchedulerPlan(int us) {
+    _schedulerPlanUs += us;
+    _schedulerPlanSamples++;
+  }
+
+  static void recordSchedulerEnqueue(int us) {
+    _schedulerEnqueueUs += us;
+    _schedulerEnqueueSamples++;
+  }
+
+  static void recordSchedulerPickTask(int us) {
+    _schedulerPickTaskUs += us;
+    _schedulerPickTaskSamples++;
+  }
+  static int _schedulerRing0 = 0;
+  static int _schedulerRing1 = 0;
+  static int _schedulerRing2 = 0;
+  static int _schedulerRing3 = 0;
+  static int _schedulerStateActive = 0;
+  static int _schedulerStateSatisfied = 0;
+  static int _schedulerStateSleeping = 0;
+  static int _schedulerStateResuming = 0;
+  static int _schedulerWorkerSamples = 0;
+  static int _schedulerWorkerActiveAccum = 0;
+  static int _schedulerWorkerIdleSamples = 0;
+  static int _schedulerReadinessScoreAccum = 0;
+  static int _schedulerReadinessSamples = 0;
+  static double _schedulerAgreementAccum = 0.0;
+  static int _schedulerAgreementSamples = 0;
+
+  static void recordSchedulerInfo({
+    required String currentScheduler,
+    required String schedulerMode,
+    required int needCount,
+    required int readyHorizon,
+    required int prepBudget,
+    required int generation,
+    required int pendingTasks,
+    required int completedTasks,
+    required int cancelledTasks,
+    required int ring0,
+    required int ring1,
+    required int ring2,
+    required int ring3,
+    required bool isActive,
+    required bool isSatisfied,
+    required bool isSleeping,
+    required bool isResuming,
+  }) {
+    if (!enabled) return;
+    _currentScheduler = currentScheduler;
+    _schedulerMode = schedulerMode;
+    _schedulerNeedCount = needCount;
+    _schedulerReadyHorizon = readyHorizon;
+    _schedulerPrepBudget = prepBudget;
+    _schedulerGeneration = generation;
+    _schedulerPendingTasks = pendingTasks;
+    _schedulerCompletedTasks = completedTasks;
+    _schedulerCancelledTasks += cancelledTasks;
+    _schedulerRing0 = ring0;
+    _schedulerRing1 = ring1;
+    _schedulerRing2 = ring2;
+    _schedulerRing3 = ring3;
+    if (isActive) _schedulerStateActive++;
+    if (isSatisfied) _schedulerStateSatisfied++;
+    if (isSleeping) _schedulerStateSleeping++;
+    if (isResuming) _schedulerStateResuming++;
+  }
+
+  static void recordSchedulerWorker(int activeCount) {
+    if (!enabled) return;
+    _schedulerWorkerSamples++;
+    _schedulerWorkerActiveAccum += activeCount;
+    if (activeCount == 0) _schedulerWorkerIdleSamples++;
+  }
+
+  static void recordSchedulerReadinessScore(int score) {
+    if (!enabled) return;
+    _schedulerReadinessScoreAccum += score;
+    _schedulerReadinessSamples++;
+  }
+
+  static void recordSchedulerAgreement(double agreement) {
+    if (!enabled) return;
+    _schedulerAgreementAccum += agreement;
+    _schedulerAgreementSamples++;
+  }
+
   // === State transition tracking ===
   static int _stateQueuedCount = 0;
   static int _statePreparingCount = 0;
@@ -489,6 +601,63 @@ class SlideProfiler {
         'getPreparedHandleCalls': _getPreparedHandleCalls,
         'preparationRevisionChanges': _preparationRevisionChanges,
       },
+      'scheduler': {
+        'current': _currentScheduler,
+        'mode': _schedulerMode,
+        'needCount': _schedulerNeedCount,
+        'readyHorizon': _schedulerReadyHorizon,
+        'prepBudget': _schedulerPrepBudget,
+        'generation': _schedulerGeneration,
+        'pendingTasks': _schedulerPendingTasks,
+        'completedTasks': _schedulerCompletedTasks,
+        'cancelledTasks': _schedulerCancelledTasks,
+        'timing': {
+          'demandCalcAvgUs': _schedulerDemandCalcSamples > 0
+              ? _fmt(_schedulerDemandCalcUs / _schedulerDemandCalcSamples)
+              : '0',
+          'planAvgUs': _schedulerPlanSamples > 0
+              ? _fmt(_schedulerPlanUs / _schedulerPlanSamples)
+              : '0',
+          'enqueueAvgUs': _schedulerEnqueueSamples > 0
+              ? _fmt(_schedulerEnqueueUs / _schedulerEnqueueSamples)
+              : '0',
+          'pickTaskAvgUs': _schedulerPickTaskSamples > 0
+              ? _fmt(_schedulerPickTaskUs / _schedulerPickTaskSamples)
+              : '0',
+          'demandCalcSamples': _schedulerDemandCalcSamples,
+          'planSamples': _schedulerPlanSamples,
+          'enqueueSamples': _schedulerEnqueueSamples,
+          'pickTaskSamples': _schedulerPickTaskSamples,
+        },
+        'rings': {
+          'immediate': _schedulerRing0,
+          'critical': _schedulerRing1,
+          'near': _schedulerRing2,
+          'background': _schedulerRing3,
+        },
+        'stateCounts': {
+          'active': _schedulerStateActive,
+          'satisfied': _schedulerStateSatisfied,
+          'sleeping': _schedulerStateSleeping,
+          'resuming': _schedulerStateResuming,
+        },
+        'workers': {
+          'samples': _schedulerWorkerSamples,
+          'utilizationPercent': _schedulerWorkerSamples > 0
+              ? _pct(_schedulerWorkerActiveAccum /
+                  (_schedulerWorkerSamples * 3))
+              : 0,
+          'idlePercent': _schedulerWorkerSamples > 0
+              ? _pct(_schedulerWorkerIdleSamples / _schedulerWorkerSamples)
+              : 0,
+        },
+        'readinessScore': _schedulerReadinessSamples > 0
+            ? _fmt(_schedulerReadinessScoreAccum / _schedulerReadinessSamples)
+            : '0',
+        'agreement': _schedulerAgreementSamples > 0
+            ? _fmt(_schedulerAgreementAccum / _schedulerAgreementSamples * 100)
+            : '0',
+      },
       'video': {
         'initSamples': sortedVideoInit.length,
         'initAverageMs': _fmt(_avg(sortedVideoInit)),
@@ -583,6 +752,36 @@ class SlideProfiler {
     buf.writeln('  getPreparedHandle:     ${wd['getPreparedHandleCalls']}');
     buf.writeln('  preparationRevision:   ${wd['preparationRevisionChanges']}');
 
+    // Scheduler
+    final sd = d['scheduler'] as Map;
+    buf.writeln('\n── Scheduler ──');
+    buf.writeln('  Current:      ${sd['current']}');
+    buf.writeln('  Mode:         ${sd['mode']}');
+    buf.writeln('  NeedCount:    ${sd['needCount']}');
+    buf.writeln('  Horizon:      ${sd['readyHorizon']}');
+    buf.writeln('  Budget:       ${sd['prepBudget']}');
+    buf.writeln('  Generation:   ${sd['generation']}');
+    buf.writeln('  Pending:      ${sd['pendingTasks']}');
+    buf.writeln('  Completed:    ${sd['completedTasks']}');
+    buf.writeln('  Cancelled:    ${sd['cancelledTasks']}');
+    buf.writeln('  Readiness:    ${sd['readinessScore']}%');
+    buf.writeln('  Agreement:    ${sd['agreement']}%');
+    final rings = sd['rings'] as Map;
+    buf.writeln('  Rings:        immediate=${rings['immediate']}  '
+        'critical=${rings['critical']}  near=${rings['near']}  '
+        'background=${rings['background']}');
+    final states = sd['stateCounts'] as Map;
+    buf.writeln('  State counts: active=${states['active']}  '
+        'satisfied=${states['satisfied']}  sleeping=${states['sleeping']}  '
+        'resuming=${states['resuming']}');
+    final timings = sd['timing'] as Map;
+    buf.writeln('  Timing (avg): demandCalc=${timings['demandCalcAvgUs']}us  '
+        'plan=${timings['planAvgUs']}us  enqueue=${timings['enqueueAvgUs']}us  '
+        'pickTask=${timings['pickTaskAvgUs']}us');
+    final workers = sd['workers'] as Map;
+    buf.writeln('  Workers:      utilization=${workers['utilizationPercent']}%  '
+        'idle=${workers['idlePercent']}%  samples=${workers['samples']}');
+
     // Video
     final vd = d['video'] as Map;
     buf.writeln('\n── Video ──');
@@ -663,6 +862,38 @@ class SlideProfiler {
     _videoInitDurationsMs.clear();
     _videoSuccessCount = 0;
     _videoFailedCount = 0;
+    _currentScheduler = 'unknown';
+    _schedulerMode = 'unknown';
+    _schedulerNeedCount = 0;
+    _schedulerReadyHorizon = 0;
+    _schedulerPrepBudget = 0;
+    _schedulerGeneration = 0;
+    _schedulerPendingTasks = 0;
+    _schedulerCompletedTasks = 0;
+    _schedulerCancelledTasks = 0;
+    _schedulerDemandCalcUs = 0;
+    _schedulerPlanUs = 0;
+    _schedulerEnqueueUs = 0;
+    _schedulerPickTaskUs = 0;
+    _schedulerDemandCalcSamples = 0;
+    _schedulerPlanSamples = 0;
+    _schedulerEnqueueSamples = 0;
+    _schedulerPickTaskSamples = 0;
+    _schedulerRing0 = 0;
+    _schedulerRing1 = 0;
+    _schedulerRing2 = 0;
+    _schedulerRing3 = 0;
+    _schedulerStateActive = 0;
+    _schedulerStateSatisfied = 0;
+    _schedulerStateSleeping = 0;
+    _schedulerStateResuming = 0;
+    _schedulerWorkerSamples = 0;
+    _schedulerWorkerActiveAccum = 0;
+    _schedulerWorkerIdleSamples = 0;
+    _schedulerReadinessScoreAccum = 0;
+    _schedulerReadinessSamples = 0;
+    _schedulerAgreementAccum = 0.0;
+    _schedulerAgreementSamples = 0;
     _stateQueuedCount = 0;
     _statePreparingCount = 0;
     _stateReadyCount = 0;

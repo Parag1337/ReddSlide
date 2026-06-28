@@ -1,22 +1,31 @@
+import 'dart:developer';
 import 'package:flutter/material.dart';
 import 'package:video_player/video_player.dart';
 import '../../feed/domain/media_asset.dart';
 import '../../../core/display_quality/display_quality_mode.dart';
 import '../../../core/display_quality/image_decode_policy.dart';
 import 'adaptive_preloader.dart';
+import 'adaptive_preloader_scheduler.dart';
 import 'metrics_collector.dart';
 import 'playlist_manager.dart';
 import 'preparation_policy.dart';
+import 'preparation_scheduler.dart';
 import 'prepared_media_handle.dart';
-import 'slide_profiler.dart'; // TEMPORARY — Phase 7.2A
+import 'readiness_state.dart';
+import 'scheduler_mode.dart';
+import 'shadow_scheduler.dart';
+import 'slide_profiler.dart';
 import 'video_preparation_service.dart';
+import 'viewport_scheduler_adapter.dart';
 
 class MediaPreparationEngine {
   final PlaylistManager _playlist;
   final LoadMoreCallback _onLoadMore;
   final PreparationPolicy _policy;
   final VideoPreparationService _videoService = VideoPreparationService();
-  AdaptivePreloader? _preloader;
+  PreparationScheduler? _activeScheduler;
+  AdaptivePreloaderScheduler? _adaptiveScheduler;
+  ViewportSchedulerAdapter? _viewportScheduler;
   DecodeSize? _defaultDecodeSize;
   MetricsCollector? metrics;
 
@@ -27,6 +36,9 @@ class MediaPreparationEngine {
   final Set<String> _failedUrls = {};
   static const int _maxConfirmedReadyUrls = 1000;
   VoidCallback? _onReadinessChanged;
+
+  final ShadowScheduler _shadowScheduler = ShadowScheduler();
+  final ShadowMetricsAggregator shadowAggregator = ShadowMetricsAggregator();
 
   void _onUrlStarted(String url) {
     _preparingUrls.add(url);
@@ -70,19 +82,36 @@ class MediaPreparationEngine {
     );
     _defaultDecodeSize = policy.getDecodeSize();
     _onReadinessChanged = onReadinessChanged;
-    _preloader = AdaptivePreloader(
+
+    _wireSchedulerCallbacks(_adaptiveScheduler = AdaptivePreloaderScheduler(
       playlist: _playlist,
       onLoadMore: _onLoadMore,
       context: context,
-      metrics: metrics,
       displayQualityMode: displayQualityMode,
-    )
-      ..onUrlReady = _onUrlReady
-      ..onUrlStarted = _onUrlStarted
-      ..onUrlFailed = _onUrlFailed;
+    ));
+
+    _wireSchedulerCallbacks(_viewportScheduler = ViewportSchedulerAdapter(
+      playlist: _playlist,
+      onLoadMore: _onLoadMore,
+      context: context,
+      measureWindow: measureWindow,
+    ));
+
+    if (isViewportSchedulerEnabled) {
+      _activeScheduler = _viewportScheduler;
+    } else {
+      _activeScheduler = _adaptiveScheduler;
+    }
+
     if (onReadinessChanged != null) {
       _videoService.onReadinessChanged = onReadinessChanged;
     }
+  }
+
+  void _wireSchedulerCallbacks(PreparationScheduler scheduler) {
+    scheduler.onUrlStarted = _onUrlStarted;
+    scheduler.onUrlReady = _onUrlReady;
+    scheduler.onUrlFailed = _onUrlFailed;
   }
 
   void onPlaylistChanged() {
@@ -91,11 +120,84 @@ class MediaPreparationEngine {
     }
   }
 
-  void onIndexChanged(int currentIndex) {
-    _preloader?.onIndexChanged(currentIndex);
+  void onPlaylistReplaced() {
+    _activeScheduler?.onPlaylistReplaced();
+    _lastReconciledIndex = -1;
+  }
+
+  void onIndexChanged(int currentIndex, {int galleryIndex = 0}) {
+    _checkFallback();
+
+    try {
+      _activeScheduler?.onIndexChanged(
+        currentIndex,
+        galleryIndex: galleryIndex,
+      );
+    } catch (e) {
+      log('[MediaPreparationEngine] Scheduler error: $e');
+      _fallbackToAdaptive();
+      _activeScheduler?.onIndexChanged(currentIndex);
+    }
+
+    SlideProfiler.recordSchedulerInfo(
+      currentScheduler: _activeScheduler == _viewportScheduler
+          ? 'viewport'
+          : 'adaptive',
+      schedulerMode: isViewportSchedulerEnabled ? 'viewport' : 'adaptive',
+      needCount: 0,
+      readyHorizon: 0,
+      prepBudget: 0,
+      generation: 0,
+      pendingTasks: 0,
+      completedTasks: 0,
+      cancelledTasks: 0,
+      ring0: 0,
+      ring1: 0,
+      ring2: 0,
+      ring3: 0,
+      isActive: _activeScheduler == _viewportScheduler,
+      isSatisfied: false,
+      isSleeping: false,
+      isResuming: false,
+    );
+
+    _runShadowCycle(currentIndex);
+
     if (currentIndex == _lastReconciledIndex) return;
     _lastReconciledIndex = currentIndex;
     _reconcilePreparationWindow(currentIndex);
+  }
+
+  void _checkFallback() {
+    if (_activeScheduler == _viewportScheduler &&
+        _viewportScheduler != null &&
+        _viewportScheduler!.hasFailed) {
+      _fallbackToAdaptive();
+    }
+  }
+
+  void _fallbackToAdaptive() {
+    log('[MediaPreparationEngine] Falling back to AdaptivePreloader');
+    _activeScheduler = _adaptiveScheduler;
+  }
+
+  void _runShadowCycle(int currentIndex) {
+    if (_adaptiveScheduler == null) return;
+    final states = measureWindow(currentIndex, _shadowScheduler.config.horizon);
+    if (states.isEmpty) return;
+    final result = _shadowScheduler.runCycle(
+      states: states,
+      items: _playlist.items,
+      currentIndex: currentIndex,
+      adaptivePlannedUrls: _adaptiveScheduler!.plannedUrls,
+    );
+    shadowAggregator.record(result);
+    if (result.adaptiveUrls.isNotEmpty || result.viewportUrls.isNotEmpty) {
+      final union = result.adaptiveUrls.union(result.viewportUrls);
+      final intersection = result.adaptiveUrls.intersection(result.viewportUrls);
+      final agreement = union.isEmpty ? 1.0 : intersection.length / union.length;
+      SlideProfiler.recordSchedulerAgreement(agreement);
+    }
   }
 
   void _reconcilePreparationWindow(int currentIndex) {
@@ -211,6 +313,50 @@ class MediaPreparationEngine {
     return _confirmedReadyUrls.contains(asset.mediaUrl);
   }
 
+  List<ReadinessState> measureWindow(int currentIndex, int horizon) {
+    final items = _playlist.items;
+    if (items.isEmpty || currentIndex >= items.length) return [];
+
+    final end = (currentIndex + horizon + 1).clamp(0, items.length);
+    return [for (int i = currentIndex; i < end; i++) _readinessOf(items[i])];
+  }
+
+  ReadinessState _readinessOf(MediaAsset asset) {
+    if (asset.isVideo && asset.videoUrl != null) {
+      if (_videoService.isReady(asset.videoUrl!)) return ReadinessState.ready;
+      if (_videoService.isPreparing(asset.videoUrl!)) return ReadinessState.likelyReady;
+      if (_videoService.hasFailed(asset.videoUrl!)) return ReadinessState.unavailable;
+    }
+
+    final urls = <String>[
+      if (asset.isGallery && asset.galleryUrls != null) ...asset.galleryUrls!
+      else if (asset.isVideo && asset.thumbnailUrl != null) asset.thumbnailUrl!
+      else asset.mediaUrl,
+    ];
+
+    bool hasReady = false;
+    bool hasLikely = false;
+
+    for (final url in urls) {
+      if (_confirmedReadyUrls.contains(url)) {
+        hasReady = true;
+      } else if (_preparingUrls.contains(url)) {
+        hasLikely = true;
+      } else if (_failedUrls.contains(url)) {
+        // unavailable — handled by the else branch below
+      } else if (_preparedItemIds.contains(asset.id)) {
+        hasLikely = true;
+      }
+      // else: unavailable by default
+    }
+
+    if (hasReady && urls.every((u) => _confirmedReadyUrls.contains(u))) {
+      return ReadinessState.ready;
+    }
+    if (hasReady || hasLikely) return ReadinessState.likelyReady;
+    return ReadinessState.unavailable;
+  }
+
   void dispose() {
     if (_preparedItemIds.isNotEmpty) {
       metrics?.recordEvent(MetricEventType.preparationCancelled, data: {
@@ -218,8 +364,11 @@ class MediaPreparationEngine {
         'reason': 'engineDisposed',
       });
     }
-    _preloader?.dispose();
-    _preloader = null;
+    _adaptiveScheduler?.dispose();
+    _adaptiveScheduler = null;
+    _viewportScheduler?.dispose();
+    _viewportScheduler = null;
+    _activeScheduler = null;
     _videoService.dispose();
     _preparedItemIds.clear();
     _confirmedReadyUrls.clear();

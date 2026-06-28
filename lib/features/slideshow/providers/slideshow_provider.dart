@@ -378,7 +378,10 @@ class SlideshowNotifier extends StateNotifier<SlideshowState> {
   }
 
   void _notifyPreloader() {
-    _preparationEngine?.onIndexChanged(_playlist.currentIndex);
+    _preparationEngine?.onIndexChanged(
+      _playlist.currentIndex,
+      galleryIndex: state.gallerySubIndex,
+    );
   }
 
   void _startAutoAdvance() {

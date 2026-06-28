@@ -97,6 +97,13 @@ class AdaptivePreloader {
 
   bool get isIdle => _inFlightPreloads == 0 && _preloadQueue.isEmpty;
 
+  Set<String> get plannedUrls {
+    final urls = <String>{};
+    urls.addAll(_queuedUrls);
+    urls.addAll(_activeUrls);
+    return urls;
+  }
+
   void onIndexChanged(int currentIndex) {
     if (currentIndex == _lastPreloadIndex) return;
     _lastPreloadIndex = currentIndex;

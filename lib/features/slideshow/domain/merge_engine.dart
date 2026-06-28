@@ -76,6 +76,10 @@ class MergeEngine {
   static const int _lowWatermark = 8;
   static const int _mergeBatchSize = 20;
 
+  final Map<String, String?> _domainCache = {};
+  final Map<int, double> _freshnessCache = {};
+  int _freshnessHour = -1;
+
   MergeEngine({
     required List<MediaSource> sources,
   }) : _sources = sources;
@@ -138,8 +142,21 @@ class MergeEngine {
     log('[MERGE_GENERATE] selected=$selected target=$batchSize buffers=${_buffers.length}');
   }
 
-  MediaAsset? _selectNext() {
+  double _freshnessOf(int? createdUtc) {
     final now = DateTime.now().millisecondsSinceEpoch ~/ 1000;
+    final hour = now ~/ 3600;
+    if (hour != _freshnessHour) {
+      _freshnessCache.clear();
+      _freshnessHour = hour;
+    }
+    if (createdUtc == null) return 0.5;
+    return _freshnessCache.putIfAbsent(createdUtc, () {
+      final ageSeconds = max(1, now - createdUtc);
+      return max(0.0, 1.0 - (ageSeconds / 604800.0));
+    });
+  }
+
+  MediaAsset? _selectNext() {
     final candidates = <_Candidate>[];
 
     for (int bi = 0; bi < _buffers.length; bi++) {
@@ -151,14 +168,7 @@ class MergeEngine {
       final item = buffer.nextUnconsumed!;
 
       double score = 0.45 * _random.nextDouble();
-
-      if (item.createdUtc != null) {
-        final ageSeconds = max(1, now - item.createdUtc!);
-        final freshness = max(0.0, 1.0 - (ageSeconds / 604800.0));
-        score += 0.35 * freshness;
-      } else {
-        score += 0.35 * 0.5;
-      }
+      score += 0.35 * _freshnessOf(item.createdUtc);
 
       double diversity = 0.0;
       if (_lastBufferIndex == bi) {
@@ -167,7 +177,7 @@ class MergeEngine {
       if (item.author == _lastAuthor) {
         diversity -= 0.05;
       }
-      final domain = _extractDomain(item.mediaUrl);
+      final domain = _cachedDomain(item.mediaUrl);
       if (domain != null && domain == _lastDomain) {
         diversity -= 0.02;
       }
@@ -190,7 +200,7 @@ class MergeEngine {
             _lastBufferIndex = bi;
           }
           _lastAuthor = result.author;
-          _lastDomain = _extractDomain(result.mediaUrl);
+          _lastDomain = _cachedDomain(result.mediaUrl);
           _buffers[bi].consumeNext();
           break;
         }
@@ -207,7 +217,7 @@ class MergeEngine {
       }
 
       _lastAuthor = best.asset.author;
-      _lastDomain = _extractDomain(best.asset.mediaUrl);
+      _lastDomain = _cachedDomain(best.asset.mediaUrl);
 
       _buffers[best.bufferIndex].consumeNext();
       result = best.asset;
@@ -217,13 +227,20 @@ class MergeEngine {
     return result;
   }
 
-  String? _extractDomain(String url) {
-    try {
-      final uri = Uri.parse(url);
-      return uri.host;
-    } catch (_) {
-      return null;
-    }
+  String? _cachedDomain(String url) {
+    return _domainCache.putIfAbsent(url, () {
+      try {
+        return Uri.parse(url).host;
+      } catch (_) {
+        return null;
+      }
+    });
+  }
+
+  void clearCache() {
+    _domainCache.clear();
+    _freshnessCache.clear();
+    _freshnessHour = -1;
   }
 
   void dispose() {
@@ -232,6 +249,7 @@ class MergeEngine {
     }
     _buffers.clear();
     _merged.clear();
+    clearCache();
   }
 }
 
