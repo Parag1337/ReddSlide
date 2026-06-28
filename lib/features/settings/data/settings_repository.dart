@@ -1,6 +1,7 @@
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import '../domain/settings_model.dart';
+import '../../../core/display_quality/display_quality_mode.dart';
 import '../../../core/network/result.dart';
 import '../../../core/errors/app_error.dart';
 import '../../../core/constants/api_constants.dart';
@@ -19,6 +20,7 @@ class SettingsRepository {
 
   Future<SettingsModel> loadFull() async {
     final prefs = await SharedPreferences.getInstance();
+    final qualityRaw = prefs.getString('${_key}_display_quality');
     return SettingsModel(
       backendUrl: prefs.getString('${_key}_url') ?? '',
       nsfwEnabled: prefs.getBool('${_key}_nsfw') ?? false,
@@ -26,6 +28,9 @@ class SettingsRepository {
       slideshowIntervalSeconds: prefs.getInt('${_key}_interval') ?? 5,
       defaultSortMode: prefs.getString('${_key}_sort') ?? 'hot',
       subreddits: prefs.getStringList('${_key}_subreddits') ?? [],
+      displayQualityMode: qualityRaw != null
+          ? DisplayQualityMode.fromJson(qualityRaw)
+          : DisplayQualityMode.smart,
     );
   }
 
@@ -37,6 +42,8 @@ class SettingsRepository {
     await prefs.setInt('${_key}_interval', settings.slideshowIntervalSeconds);
     await prefs.setString('${_key}_sort', settings.defaultSortMode);
     await prefs.setStringList('${_key}_subreddits', settings.subreddits);
+    await prefs.setString(
+        '${_key}_display_quality', settings.displayQualityMode.toJson());
   }
 
   Future<Result<bool>> validateBackendUrl(String url, ApiClient client) async {

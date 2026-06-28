@@ -6,24 +6,38 @@ import '../../../slideshow/domain/prepared_media_handle.dart';
 class ImageViewer extends StatefulWidget {
   final PreparedMediaHandle handle;
   final void Function(MediaErrorType errorType)? onError;
+  final void Function(String url)? onFirstFrameDecoded;
 
   const ImageViewer({
     super.key,
     required this.handle,
     this.onError,
+    this.onFirstFrameDecoded,
   });
 
   @override
   State<ImageViewer> createState() => _ImageViewerState();
 }
 
-class _ImageViewerState extends State<ImageViewer> {
+class _ImageViewerState extends State<ImageViewer> with SingleTickerProviderStateMixin {
   final TransformationController _transformController = TransformationController();
+  late final AnimationController _fadeController;
+  late final Animation<double> _fadeAnimation;
   bool _zoomed = false;
+  bool _hasDecodedFrame = false;
+  bool _reportedFailure = false;
 
   @override
   void initState() {
     super.initState();
+    _fadeController = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 200),
+    );
+    _fadeAnimation = CurvedAnimation(
+      parent: _fadeController,
+      curve: Curves.easeIn,
+    );
   }
 
   @override
@@ -31,44 +45,129 @@ class _ImageViewerState extends State<ImageViewer> {
     super.didUpdateWidget(oldWidget);
     if (oldWidget.handle.displayUrl != widget.handle.displayUrl) {
       _zoomed = false;
+      _hasDecodedFrame = false;
+      _reportedFailure = false;
+      _fadeController.value = 0.0;
       _transformController.value = Matrix4.identity();
     }
   }
 
   @override
   void dispose() {
+    _fadeController.dispose();
     _transformController.dispose();
     super.dispose();
   }
 
   @override
   Widget build(BuildContext context) {
+    final state = widget.handle.state;
+
+    if (state == MediaState.failed) {
+      return RepaintBoundary(
+        child: Center(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Icon(Icons.broken_image, color: Colors.white38, size: 48),
+              SizedBox(height: 12),
+              Text('Failed to load', style: TextStyle(color: Colors.white38)),
+            ],
+          ),
+        ),
+      );
+    }
+
+    if (state != MediaState.ready) {
+      return RepaintBoundary(
+        child: Center(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              SizedBox(
+                width: 24,
+                height: 24,
+                child: CircularProgressIndicator(
+                  strokeWidth: 2,
+                  color: Colors.white38,
+                ),
+              ),
+              SizedBox(height: 12),
+              Text(_stateLabel(state), style: TextStyle(color: Colors.white38)),
+            ],
+          ),
+        ),
+      );
+    }
+
+    final decodeWidth = widget.handle.decodeSize?.width;
+
     return RepaintBoundary(
-      child: GestureDetector(
-        onDoubleTap: _handleDoubleTap,
-        child: InteractiveViewer(
-          transformationController: _transformController,
-          minScale: 1.0,
-          maxScale: 4.0,
-          boundaryMargin: const EdgeInsets.all(20),
-          child: Image(
-            image: CachedNetworkImageProvider(widget.handle.displayUrl),
-            fit: BoxFit.contain,
-            gaplessPlayback: true,
-            errorBuilder: (context, error, stackTrace) {
-              final errorType = _classifyError(error);
-              WidgetsBinding.instance.addPostFrameCallback((_) {
-                widget.onError?.call(errorType);
-              });
-              return const SizedBox.shrink();
-            },
-            frameBuilder: (context, child, frame, wasSynchronouslyLoaded) {
-              return child;
-            },
+      child: FadeTransition(
+        opacity: _fadeAnimation,
+        child: GestureDetector(
+          onDoubleTap: _handleDoubleTap,
+          child: InteractiveViewer(
+            transformationController: _transformController,
+            minScale: 1.0,
+            maxScale: 4.0,
+            boundaryMargin: const EdgeInsets.all(20),
+            child: Image(
+              image: ResizeImage.resizeIfNeeded(
+                decodeWidth,
+                null,
+                CachedNetworkImageProvider(widget.handle.displayUrl),
+              ),
+              fit: BoxFit.contain,
+              gaplessPlayback: true,
+              loadingBuilder: (context, child, loadingProgress) {
+                if (loadingProgress == null) return child;
+                return child;
+              },
+              errorBuilder: (context, error, stackTrace) {
+                if (!_reportedFailure) {
+                  _reportedFailure = true;
+                  widget.onError?.call(_classifyError(error));
+                }
+                return Center(
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Icon(Icons.broken_image, color: Colors.white38, size: 48),
+                      SizedBox(height: 12),
+                      Text('Failed to load', style: TextStyle(color: Colors.white38)),
+                    ],
+                  ),
+                );
+              },
+              frameBuilder: (context, child, frame, wasSynchronouslyLoaded) {
+                if (frame != null && !_hasDecodedFrame) {
+                  _hasDecodedFrame = true;
+                  _fadeController.forward();
+                  widget.onFirstFrameDecoded?.call(widget.handle.displayUrl);
+                }
+                return child;
+              },
+            ),
           ),
         ),
       ),
     );
+  }
+
+  String _stateLabel(MediaState state) {
+    switch (state) {
+      case MediaState.notRequested:
+      case MediaState.evicted:
+        return 'Waiting...';
+      case MediaState.queued:
+        return 'Queued...';
+      case MediaState.preparing:
+        return 'Preparing...';
+      case MediaState.ready:
+      case MediaState.failed:
+        return '';
+    }
   }
 
   void _handleDoubleTap() {

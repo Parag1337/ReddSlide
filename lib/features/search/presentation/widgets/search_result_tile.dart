@@ -28,6 +28,7 @@ class SearchResultTile extends StatelessWidget {
           height: 60,
           child: CachedNetworkImage(
             imageUrl: asset.thumbnailUrl ?? asset.mediaUrl,
+            memCacheWidth: (60 * MediaQuery.of(context).devicePixelRatio).ceil(),
             fit: BoxFit.cover,
             placeholder: (_, _) => Container(color: theme.colorScheme.surfaceContainerHighest),
             errorWidget: (_, _, _) => Container(

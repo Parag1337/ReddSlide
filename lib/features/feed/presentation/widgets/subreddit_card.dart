@@ -50,6 +50,7 @@ class SubredditCard extends StatelessWidget {
                   if (coverUrl != null)
                     CachedNetworkImage(
                       imageUrl: coverUrl!,
+                      memCacheWidth: (MediaQuery.of(context).size.width * MediaQuery.of(context).devicePixelRatio).ceil(),
                       fit: BoxFit.cover,
                       placeholder: (_, _) => _buildPlaceholder(theme),
                       errorWidget: (_, _, _) => _buildPlaceholder(theme),

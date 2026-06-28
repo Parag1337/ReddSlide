@@ -1,7 +1,8 @@
-from fastapi import APIRouter
+from fastapi import APIRouter, Depends
 from ..models.schemas import HealthResponse
 from ..services.queue_manager import QueueManager
 from ..managers.provider import ProviderManager
+from .dependencies import get_provider_manager
 from ..core.database import get_db
 
 router = APIRouter()
@@ -31,10 +32,11 @@ async def health():
 
 
 @router.get("/debug/providers")
-async def debug_providers():
+async def debug_providers(
+    provider_manager: ProviderManager = Depends(get_provider_manager),
+):
     """Provider health status and metrics."""
-    pm = ProviderManager()
-    return await pm.get_provider_status()
+    return await provider_manager.get_provider_status()
 
 
 @router.get("/debug/queue")

@@ -6,7 +6,10 @@ import 'package:flutter/material.dart';
 import 'package:cached_network_image/cached_network_image.dart';
 
 import '../../../core/constants/app_constants.dart';
+import '../../../core/display_quality/display_quality_mode.dart';
+import '../../../core/display_quality/image_decode_policy.dart';
 import '../../feed/domain/media_asset.dart';
+import 'metrics_collector.dart';
 import 'playlist_manager.dart';
 
 enum _PreloadPriority { urgent, high, medium, background }
@@ -60,24 +63,21 @@ class AdaptivePreloader {
   int _lastPreloadIndex = -1;
   static const int _maxConcurrentPreloads = AppConstants.maxConcurrentPreloads;
 
+  MetricsCollector? metrics;
+  void Function(String url)? onUrlReady;
+  void Function(String url)? onUrlStarted;
+  final DisplayQualityMode _displayQualityMode;
+
   AdaptivePreloader({
     required PlaylistManager playlist,
     required LoadMoreCallback onLoadMore,
     required BuildContext context,
+    this.metrics,
+    DisplayQualityMode displayQualityMode = DisplayQualityMode.smart,
   })  : _playlist = playlist,
         _onLoadMore = onLoadMore,
-        _context = context;
-
-  bool _isInImageCache(String url) {
-    try {
-      final imageCache = PaintingBinding.instance.imageCache;
-      final key = CachedNetworkImageProvider(url).cacheKey;
-      if (key == null) return false;
-      return imageCache.containsKey(key);
-    } catch (_) {
-      return false;
-    }
-  }
+        _context = context,
+        _displayQualityMode = displayQualityMode;
 
   void dispose() {
     _preloadedUrls.clear();
@@ -164,13 +164,12 @@ class AdaptivePreloader {
   }
 
   void _enqueueUrl(String url, _PreloadPriority priority) {
-    if (_preloadedUrls.contains(url)) return;
-    if (_activeUrls.contains(url)) return;
-    if (_queuedUrls.contains(url)) return;
-    if (_isInImageCache(url)) {
-      _preloadedUrls.add(url);
+    if (_preloadedUrls.contains(url)) {
+      onUrlReady?.call(url);
       return;
     }
+    if (_activeUrls.contains(url)) return;
+    if (_queuedUrls.contains(url)) return;
     _queuedUrls.add(url);
     final task = _PreloadTask(url: url, priority: priority);
     int insertAt = _preloadQueue.length;
@@ -197,15 +196,28 @@ class AdaptivePreloader {
 
   Future<void> _executePreload(String url) async {
     log('[PRELOAD_START] url=$url active=$_inFlightPreloads');
+    onUrlStarted?.call(url);
     try {
-      if (_isInImageCache(url)) {
-        _preloadedUrls.add(url);
-        return;
-      }
-      await precacheImage(CachedNetworkImageProvider(url), _context);
+      metrics?.recordEvent(MetricEventType.imagePreparationStarted, data: {'url': url});
+      final policy = ImageDecodePolicy.fromContext(
+        context: _context,
+        mode: _displayQualityMode,
+      );
+      final decodeSize = policy.getDecodeSize();
+      await precacheImage(
+        ResizeImage.resizeIfNeeded(
+          decodeSize.width,
+          decodeSize.height,
+          CachedNetworkImageProvider(url),
+        ),
+        _context,
+      );
       _preloadedUrls.add(url);
+      onUrlReady?.call(url);
+      metrics?.recordEvent(MetricEventType.imagePreparationCompleted, data: {'url': url});
       log('[PRELOAD_DONE] url=$url');
     } catch (e) {
+      metrics?.recordEvent(MetricEventType.imagePreparationFailed, data: {'url': url, 'error': e.toString()});
       log('[PRELOAD_FAILED] url=$url error=$e');
     } finally {
       _activeUrls.remove(url);
@@ -217,7 +229,6 @@ class AdaptivePreloader {
   List<String> _allAssetUrls(MediaAsset asset, {bool includeVideo = false}) {
     final urls = <String>[
       asset.mediaUrl,
-      if (asset.thumbnailUrl != null) asset.thumbnailUrl!,
       if (asset.isGallery && asset.galleryUrls != null) ...asset.galleryUrls!,
       if (includeVideo && asset.videoUrl != null) asset.videoUrl!,
     ];
@@ -226,18 +237,11 @@ class AdaptivePreloader {
 
   List<String> _imageUrls(MediaAsset asset) {
     if (asset.isGallery && asset.galleryUrls != null) {
-      return [
-        ...asset.galleryUrls!,
-        if (asset.thumbnailUrl != null) asset.thumbnailUrl!,
-      ];
+      return [...asset.galleryUrls!];
     }
     if (asset.isVideo && asset.thumbnailUrl != null) {
       return [asset.thumbnailUrl!];
     }
-    final urls = <String>[asset.mediaUrl];
-    if (asset.thumbnailUrl != null) {
-      urls.add(asset.thumbnailUrl!);
-    }
-    return urls;
+    return [asset.mediaUrl];
   }
 }

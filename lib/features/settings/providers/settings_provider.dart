@@ -2,6 +2,7 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../domain/settings_model.dart';
 import '../data/settings_repository.dart';
+import '../../../core/display_quality/display_quality_mode.dart';
 import '../../../core/network/api_client.dart';
 import '../../../core/network/result.dart';
 import '../../../core/constants/api_constants.dart';
@@ -9,6 +10,11 @@ import '../../../core/errors/app_error.dart';
 
 final settingsProvider =
     AsyncNotifierProvider<SettingsNotifier, SettingsModel>(SettingsNotifier.new);
+
+final displayQualityModeProvider = Provider<DisplayQualityMode>((ref) {
+  final settings = ref.watch(settingsProvider);
+  return settings.valueOrNull?.displayQualityMode ?? DisplayQualityMode.smart;
+});
 
 class SettingsNotifier extends AsyncNotifier<SettingsModel> {
   @override
@@ -52,6 +58,14 @@ class SettingsNotifier extends AsyncNotifier<SettingsModel> {
   Future<void> setDefaultSortMode(String mode) async {
     final current = state.value ?? const SettingsModel();
     final updated = current.copyWith(defaultSortMode: mode);
+    state = AsyncData(updated);
+    final repo = ref.read(settingsRepositoryProvider);
+    await repo.saveFull(updated);
+  }
+
+  Future<void> setDisplayQualityMode(DisplayQualityMode mode) async {
+    final current = state.value ?? const SettingsModel();
+    final updated = current.copyWith(displayQualityMode: mode);
     state = AsyncData(updated);
     final repo = ref.read(settingsRepositoryProvider);
     await repo.saveFull(updated);

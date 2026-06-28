@@ -39,7 +39,7 @@ class SearchResultCard extends StatelessWidget {
                 child: Stack(
                   fit: StackFit.expand,
                   children: [
-                    _buildImage(theme),
+                    _buildImage(context, theme),
                     if (asset.isVideo)
                       Positioned(
                         bottom: 8,
@@ -119,10 +119,14 @@ class SearchResultCard extends StatelessWidget {
     );
   }
 
-  Widget _buildImage(ThemeData theme) {
-    final imageUrl = asset.mediaUrl;
+  Widget _buildImage(BuildContext context, ThemeData theme) {
+    final pixelRatio = MediaQuery.of(context).devicePixelRatio;
+    final columns = MediaQuery.of(context).size.width > 600 ? 3 : 2;
+    final thumbWidth = (MediaQuery.of(context).size.width / columns * pixelRatio).ceil();
+    final imageUrl = asset.thumbnailUrl ?? asset.mediaUrl;
     return CachedNetworkImage(
       imageUrl: imageUrl,
+      memCacheWidth: thumbWidth,
       fit: BoxFit.cover,
       placeholder: (_, _) => _shimmerPlaceholder(theme),
       errorWidget: (_, _, _) => _errorPlaceholder(theme),

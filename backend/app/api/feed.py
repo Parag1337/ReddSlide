@@ -3,6 +3,9 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from typing import Optional
 from ..models.schemas import FeedResponse, QueueResponse, SearchResponse, MediaAssetResponse
 from ..services.queue_manager import QueueManager
+from ..managers.oauth import OAuthManager
+from ..managers.provider import ProviderManager
+from .dependencies import get_oauth_manager, get_provider_manager
 from ..core.database import get_db
 
 router = APIRouter()
@@ -197,7 +200,9 @@ async def start_slideshow(id: str):
 @router.post("/subreddits/sync")
 async def sync_subreddits(
     body: dict,
-    queue_manager: QueueManager = Depends(get_queue_manager)
+    queue_manager: QueueManager = Depends(get_queue_manager),
+    oauth_manager: OAuthManager = Depends(get_oauth_manager),
+    provider_manager: ProviderManager = Depends(get_provider_manager),
 ):
     """Sync user's subreddit list to backend config.
 
@@ -226,7 +231,9 @@ async def sync_subreddits(
 
     # Trigger on-demand fetch for newly added subreddits
     for name in added:
-        asyncio.create_task(queue_manager.ensure_subreddit_has_content(name))
+        asyncio.create_task(
+            queue_manager.ensure_subreddit_has_content(name, oauth_manager=oauth_manager, provider_manager=provider_manager)
+        )
 
     return {
         "synced": len(incoming),
@@ -239,10 +246,12 @@ async def sync_subreddits(
 @router.post("/subreddits/fetch")
 async def fetch_subreddit(
     subreddit: str = Query(..., min_length=1),
-    queue_manager: QueueManager = Depends(get_queue_manager)
+    queue_manager: QueueManager = Depends(get_queue_manager),
+    oauth_manager: OAuthManager = Depends(get_oauth_manager),
+    provider_manager: ProviderManager = Depends(get_provider_manager),
 ):
     """Immediately fetch content from a subreddit and store it."""
     clean = subreddit.strip().lower()
     await queue_manager.add_or_update_subreddit_config(clean)
-    added, _ = await queue_manager.fetch_and_store(clean)
+    added, _ = await queue_manager.fetch_and_store(clean, oauth_manager=oauth_manager, provider_manager=provider_manager)
     return {"subreddit": clean, "fetched": added}

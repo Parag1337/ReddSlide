@@ -336,6 +336,7 @@ class _SearchScreenState extends ConsumerState<SearchScreen> {
                         : null,
                     mediaType: searchState.mediaType,
                     sort: searchState.sort,
+                    initialResults: searchState.results,
                   ),
                   startIndex: 0,
                 ));
@@ -392,6 +393,7 @@ class _SearchScreenState extends ConsumerState<SearchScreen> {
                               : null,
                           mediaType: searchState.mediaType,
                           sort: searchState.sort,
+                          initialResults: searchState.results,
                         ),
                         startIndex: index,
                       ));

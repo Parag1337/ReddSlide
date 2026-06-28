@@ -5,6 +5,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../../../core/constants/app_constants.dart';
+import '../../../core/display_quality/display_quality_mode.dart';
 import '../../../core/media/media_source.dart';
 import '../../feed/data/feed_repository.dart';
 import '../../feed/domain/media_asset.dart';
@@ -14,13 +15,11 @@ import '../data/search_media_source.dart';
 import '../data/subreddit_media_source.dart';
 import '../domain/media_preparation_engine.dart';
 import '../domain/merge_engine.dart';
+import '../domain/metrics_collector.dart';
 import '../domain/playlist_manager.dart';
 import '../domain/prepared_media_handle.dart';
 import '../domain/slideshow_source.dart';
 import '../domain/slideshow_state.dart';
-
-int _nextEventId = 0;
-int _nextEvent() => ++_nextEventId;
 
 final slideshowProvider = StateNotifierProvider.family<SlideshowNotifier, SlideshowState, SlideshowSource>(
   (ref, source) {
@@ -44,30 +43,40 @@ class SlideshowNotifier extends StateNotifier<SlideshowState> {
   Timer? _overlayTimer;
   int _slideshowIntervalSeconds = AppConstants.defaultSlideshowIntervalSeconds;
   Future<void>? _inFlightLoadMore;
+  final MetricsCollector metrics;
 
   SlideshowNotifier({
     required FeedRepository feedRepository,
     required SearchRepository searchRepository,
     required SlideshowSource source,
     required List<String> allSubreddits,
-  }  ) : super(SlideshowState()) {
+  })  : metrics = MetricsCollector(),
+        super(SlideshowState()) {
     _playlist = PlaylistManager();
     _mergeEngine = _buildMergeEngine(source, feedRepository, searchRepository, allSubreddits);
   }
 
-  void attachPreparationEngine(BuildContext context) {
+  void attachPreparationEngine(
+    BuildContext context, {
+    DisplayQualityMode displayQualityMode = DisplayQualityMode.smart,
+  }) {
     if (_mergeEngine != null) {
       _preparationEngine = MediaPreparationEngine(
         playlist: _playlist,
         onLoadMore: loadMore,
-      )..attachContext(context, onReadinessChanged: _onVideoReadinessChanged);
+      )..metrics = metrics
+        ..attachContext(
+          context,
+          onReadinessChanged: _onVideoReadinessChanged,
+          displayQualityMode: displayQualityMode,
+        );
     }
   }
 
   PreparedMediaHandle getPreparedHandle(MediaAsset asset, {int galleryIndex = 0}) {
     return _preparationEngine?.prepare(asset, galleryIndex: galleryIndex) ?? PreparedMediaHandle(
       asset: asset,
-      ready: false,
+      state: MediaState.notRequested,
     );
   }
 
@@ -113,12 +122,13 @@ class SlideshowNotifier extends StateNotifier<SlideshowState> {
             subreddit: sub,
           ),
         ).toList(),
-      SearchSource(:final query, :final mode, :final subreddits) => [
+      SearchSource(:final query, :final mode, :final subreddits, :final initialResults) => [
           SearchMediaSource(
             repository: searchRepository,
             query: query,
             mode: mode,
             subreddits: subreddits,
+            initialResults: initialResults,
           ),
         ],
       GroupSource(:final subreddits) => subreddits.map((sub) =>
@@ -150,6 +160,7 @@ class SlideshowNotifier extends StateNotifier<SlideshowState> {
       );
 
       if (items.isNotEmpty) {
+        _notifyPreloader();
         _startAutoAdvance();
       }
     } catch (e) {
@@ -161,6 +172,7 @@ class SlideshowNotifier extends StateNotifier<SlideshowState> {
   void setStartIndex(int index) {
     _playlist.jumpTo(index);
     state = state.copyWith(currentIndex: index);
+    _notifyPreloader();
   }
 
   void setInterval(int seconds) {
@@ -185,7 +197,7 @@ class SlideshowNotifier extends StateNotifier<SlideshowState> {
 
   Future<void> next({int eid = -1}) async {
     if (_playlist.isEmpty) return;
-    if (eid == -1) eid = _nextEvent();
+    metrics.recordEvent(MetricEventType.slideshowSwipeNext, data: {'eid': eid});
 
     final nextIndex = state.currentIndex + 1;
     if (nextIndex >= _playlist.length) {
@@ -210,7 +222,7 @@ class SlideshowNotifier extends StateNotifier<SlideshowState> {
   }
 
   Future<void> previous({int eid = -1}) async {
-    if (eid == -1) eid = _nextEvent();
+    metrics.recordEvent(MetricEventType.slideshowSwipePrevious, data: {'eid': eid});
     if (_playlist.previous() != null) {
       _syncState();
       _restartAutoAdvance();
@@ -220,6 +232,7 @@ class SlideshowNotifier extends StateNotifier<SlideshowState> {
 
   Future<void> jumpTo(int index) async {
     if (index < 0 || index >= _playlist.length) return;
+    metrics.recordEvent(MetricEventType.slideshowSwipeJump, data: {'index': index});
     _playlist.jumpTo(index);
     _syncState();
     _restartAutoAdvance();
@@ -298,6 +311,7 @@ class SlideshowNotifier extends StateNotifier<SlideshowState> {
 
   Future<void> loadMore() async {
     if (state.isLoadingMore || _mergeEngine == null) return;
+    metrics.recordEvent(MetricEventType.paginationTriggered);
     state = state.copyWith(isLoadingMore: true);
     _inFlightLoadMore = _doLoadMore();
     await _inFlightLoadMore;
@@ -313,6 +327,13 @@ class SlideshowNotifier extends StateNotifier<SlideshowState> {
     final newItems = engine.drainMerged();
     final hasMore = engine.hasMoreSources;
 
+    metrics.recordEvent(MetricEventType.paginationCompleted, data: {
+      'appended': newItems.length,
+      'hasMore': hasMore,
+    });
+    if (newItems.isEmpty && !hasMore) {
+      metrics.recordEvent(MetricEventType.playlistStarvation);
+    }
     log('[LOAD_MORE] before=$beforeCount appended=${newItems.length} hasMore=$hasMore');
 
     _playlist.append(newItems);
@@ -375,8 +396,14 @@ class SlideshowNotifier extends StateNotifier<SlideshowState> {
     _cancelAutoAdvance();
     _cancelOverlayTimer();
     _preparationEngine?.dispose();
+    if (_preparationEngine != null) {
+      metrics.recordEvent(MetricEventType.preparationCancelled, data: {
+        'reason': 'slideshowDisposed',
+      });
+    }
     _mergeEngine?.dispose();
     _playlist.dispose();
+    metrics.dispose();
     super.dispose();
   }
 }

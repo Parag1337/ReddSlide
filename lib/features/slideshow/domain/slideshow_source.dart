@@ -1,3 +1,5 @@
+import '../../feed/domain/media_asset.dart';
+
 sealed class SlideshowSource {
   const SlideshowSource();
 }
@@ -50,12 +52,14 @@ class SearchSource extends SlideshowSource {
   final List<String>? subreddits;
   final String? mediaType;
   final String? sort;
+  final List<MediaAsset>? initialResults;
   const SearchSource({
     required this.query,
     this.mode = SearchMode.global,
     this.subreddits,
     this.mediaType,
     this.sort,
+    this.initialResults,
   });
 
   @override
@@ -66,10 +70,11 @@ class SearchSource extends SlideshowSource {
           mode == other.mode &&
           const ListEquality().equals(subreddits ?? [], other.subreddits ?? []) &&
           mediaType == other.mediaType &&
-          sort == other.sort;
+          sort == other.sort &&
+          identical(initialResults, other.initialResults);
 
   @override
-  int get hashCode => Object.hash(query, mode, Object.hashAll(subreddits ?? []), mediaType, sort);
+  int get hashCode => Object.hash(query, mode, Object.hashAll(subreddits ?? []), mediaType, sort, initialResults.hashCode);
 }
 
 class GroupSource extends SlideshowSource {

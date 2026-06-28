@@ -11,6 +11,52 @@ from ..models.schemas import MediaAsset
 SEARCH_MAX_PAGES = 20
 SEARCH_TIME_BUDGET_SECONDS = 5.0
 
+REJECTION_DELETED = "deleted_or_removed_post"
+REJECTION_MISSING_SUBREDDIT = "missing_subreddit"
+REJECTION_MISSING_MEDIA_URL = "missing_media_url"
+REJECTION_THUMBNAIL_URL = "thumbnail_url"
+REJECTION_SMALL_RESOLUTION = "below_minimum_resolution"
+REJECTION_EMPTY_GALLERY = "gallery_has_no_valid_items"
+REJECTION_MISSING_GALLERY_METADATA = "gallery_missing_media_metadata"
+REJECTION_MISSING_VIDEO_DATA = "video_post_missing_reddit_video_data"
+REJECTION_CROSSPOST_NO_MEDIA = "crosspost_has_no_extractable_media"
+REJECTION_UNSUPPORTED_MEDIA = "unsupported_media_type"
+
+
+@dataclass
+class ParseResult:
+    asset: Optional[MediaAsset] = None
+    rejection_reason: Optional[str] = None
+
+    @property
+    def accepted(self) -> bool:
+        return self.asset is not None
+
+
+@dataclass
+class ParserStats:
+    total: int = 0
+    accepted: int = 0
+    rejected: int = 0
+    images: int = 0
+    videos: int = 0
+    galleries: int = 0
+    crossposts: int = 0
+    missing_url: int = 0
+    deleted: int = 0
+    thumbnail_url: int = 0
+    small_resolution: int = 0
+    broken_gallery: int = 0
+    missing_video_data: int = 0
+    unsupported: int = 0
+    total_parse_time: float = 0.0
+
+    @property
+    def avg_parse_time(self) -> float:
+        if self.total == 0:
+            return 0.0
+        return self.total_parse_time / self.total
+
 
 @dataclass
 class SearchAuditResult:
@@ -86,12 +132,28 @@ class RedditClient:
                 },
                 params=params
             )
-            
+
             if response.status_code == 401:
                 await self.oauth.refresh_token()
-                await self.provider_manager.record_provider_failure("reddit_oauth")
-                return await self._fetch_redlib(subreddit, limit, after, sort)
-            
+                token = await self.oauth.get_valid_token()
+                async with httpx.AsyncClient() as retry_client:
+                    retry_response = await retry_client.get(
+                        url,
+                        headers={
+                            "Authorization": f"bearer {token}",
+                            "User-Agent": "RedSlide/1.0 by u/redslide_dev"
+                        },
+                        params=params
+                    )
+                    if retry_response.status_code == 200:
+                        await self.oauth.record_success()
+                        await self.provider_manager.record_provider_success("reddit_oauth")
+                        data = retry_response.json()
+                        return self._parse_reddit_response(data, subreddit)
+                    else:
+                        await self.provider_manager.record_provider_failure("reddit_oauth")
+                        return await self._fetch_redlib(subreddit, limit, after, sort)
+
             if response.status_code != 200:
                 await self.provider_manager.record_provider_failure("reddit_oauth")
                 return await self._fetch_redlib(subreddit, limit, after, sort)
@@ -121,38 +183,10 @@ class RedditClient:
         
         for post in data.get("data", {}).get("children", []):
             post_data = post.get("data", {})
-            
-            # Extract media URL and gallery items
-            media_url, video_url, thumbnail_url, width, height, duration, gallery_items = self._extract_media_details(post_data)
-            if not media_url:
-                continue
-            
-            asset = MediaAsset(
-                id=f"{subreddit}_{post_data.get('id')}",
-                reddit_id=post_data.get("id", ""),
-                permalink=post_data.get("permalink", ""),
-                media_url=media_url,
-                title=post_data.get("title", ""),
-                author=post_data.get("author", ""),
-                score=post_data.get("score", 0),
-                subreddit=subreddit,
-                video_url=video_url,
-                thumbnail_url=thumbnail_url,
-                created_utc=post_data.get("created_utc", 0),
-                is_video=bool(post_data.get("is_video")),
-                is_gallery=bool(post_data.get("is_gallery")),
-                nsfw=post_data.get("over_18", False),
-                width=width,
-                height=height,
-                duration=duration,
-                created_at=int(time.time()),
-                last_seen=int(time.time())
-            )
-            
-            if self.validate_media(asset):
-                # Store gallery items info in asset for later database insertion
-                asset._gallery_items = gallery_items  # type: ignore
-                assets.append(asset)
+
+            result = self._parse_post_pipeline(post_data)
+            if result.accepted:
+                assets.append(result.asset)
         
         return assets, after
     
@@ -167,47 +201,26 @@ class RedditClient:
         gallery_items = []
         
         if post_data.get("is_gallery"):
-            # Gallery: extract all images in order
-            gallery_data = post_data.get("media_metadata", {})
-            # Sort by gallery order if available
-            items_list = []
-            for gallery_id, item in gallery_data.items():
-                if item.get("e") == "Image":
-                    u = item.get("s", {}).get("u", "")
-                    if u:
-                        u = html.unescape(u)
-                        item_url = u
-                        item_width = item["s"].get("x")
-                        item_height = item["s"].get("y")
-                        # Try to get position from gallery_id (format: "abc123" where position might be in order)
-                        items_list.append({
-                            "url": item_url,
-                            "width": item_width,
-                            "height": item_height,
-                            "order": len(items_list)  # Use order of iteration
-                        })
-            
-            # Use first image as main media_url
-            if items_list:
-                media_url = items_list[0]["url"]
-                width = items_list[0].get("width") or width
-                height = items_list[0].get("height") or height
-                gallery_items = items_list
+            gallery_items = self._extract_gallery_items(post_data)
+            if gallery_items:
+                media_url = gallery_items[0]["url"]
+                width = gallery_items[0].get("width") or width
+                height = gallery_items[0].get("height") or height
         
         elif post_data.get("is_video"):
-            # Video: extract playable video URL
             media = post_data.get("media", {})
             reddit_video = media.get("reddit_video", {})
             if reddit_video:
-                # Use fallback_url as the playable video URL (MP4 format)
                 video_url = reddit_video.get("fallback_url")
                 if video_url:
                     video_url = html.unescape(video_url)
+                    # Strip query params before checking extension
+                    clean_url = video_url.split("?")[0]
+                    if clean_url.endswith(".mp4"):
+                        media_url = video_url
                 duration = reddit_video.get("duration")
                 width = reddit_video.get("width") or width
                 height = reddit_video.get("height") or height
-                # For compatibility, set media_url to the fallback_url for playback
-                media_url = video_url
         
         elif post_data.get("url", "").endswith((".jpg", ".jpeg", ".png", ".gif", ".webp")):
             media_url = post_data.get("url")
@@ -215,15 +228,16 @@ class RedditClient:
                 media_url = html.unescape(media_url)
         
         else:
-            preview = post_data.get("preview", {})
-            images = preview.get("images", [])
-            if images:
-                source = images[0].get("source", {})
-                media_url = source.get("url", "")
-                if media_url:
-                    media_url = html.unescape(media_url)
-                width = source.get("width") or width
-                height = source.get("height") or height
+            preview = post_data.get("preview")
+            if preview and isinstance(preview, dict):
+                images = preview.get("images", [])
+                if images:
+                    source = images[0].get("source", {})
+                    media_url = source.get("url", "")
+                    if media_url:
+                        media_url = html.unescape(media_url)
+                    width = source.get("width") or width
+                    height = source.get("height") or height
         
         # Extract thumbnail from preview, falling back to Reddit's thumbnail field
         if post_data.get("preview"):
@@ -262,177 +276,79 @@ class RedditClient:
         ]
 
         return media_url, video_url, thumbnail_url, width, height, duration, gallery_items
+
+    def _extract_gallery_items(self, post_data: dict) -> list[dict]:
+        """Extract gallery items from post data, preserving Reddit's display order."""
+        media_metadata = post_data.get("media_metadata", {})
+        if not media_metadata:
+            return []
+
+        # Build media_id -> metadata lookup
+        metadata_map: dict[str, dict] = {}
+        for gid, item in media_metadata.items():
+            if item.get("e") == "Image":
+                u = item.get("s", {}).get("u", "")
+                if u:
+                    u = html.unescape(u)
+                    metadata_map[gid] = {
+                        "url": u,
+                        "width": item["s"].get("x"),
+                        "height": item["s"].get("y"),
+                    }
+
+        if not metadata_map:
+            return []
+
+        # Try gallery_data.items for official ordering
+        gallery_data = post_data.get("gallery_data", {})
+        order_items = gallery_data.get("items", []) if isinstance(gallery_data, dict) else []
+
+        items_list: list[dict] = []
+        if order_items:
+            seen = set()
+            for entry in order_items:
+                media_id = entry.get("media_id")
+                if media_id and media_id in metadata_map and media_id not in seen:
+                    item = metadata_map[media_id]
+                    items_list.append({
+                        "url": item["url"],
+                        "width": item["width"],
+                        "height": item["height"],
+                        "order": len(items_list),
+                    })
+                    seen.add(media_id)
+            # Append any remaining items not in the order list
+            for gid, item in metadata_map.items():
+                if gid not in seen:
+                    items_list.append({
+                        "url": item["url"],
+                        "width": item["width"],
+                        "height": item["height"],
+                        "order": len(items_list),
+                    })
+        else:
+            # Fallback: use dict iteration order
+            for gid, item in metadata_map.items():
+                items_list.append({
+                    "url": item["url"],
+                    "width": item["width"],
+                    "height": item["height"],
+                    "order": len(items_list),
+                })
+
+        return items_list
     
-    async def search_reddit(
-        self,
-        query: str,
-        limit: int = 25,
-        after: Optional[str] = None,
-        subreddits: Optional[list[str]] = None,
-        mode: str = "global"
-    ) -> tuple[list[dict], Optional[str]]:
-        """Accumulation-based Reddit search.
-
-        Scans multiple Reddit pages until enough media-only results are found,
-        a page limit is hit, or a time budget is exhausted.
-
-        For local mode with subreddits, searches each subreddit individually
-        (Reddit's multi-subreddit restricted search frequently returns 0 results
-        even when individual subreddits have many matches), then merges and
-        deduplicates results.
-
-        Returns raw post data dicts (not parsed MediaAsset objects).
-        """
-        provider = await self.provider_manager.get_healthy_provider()
-        print(f"[SEARCH_PROVIDER] healthy_provider={provider}")
-        if provider != "reddit_oauth":
-            return [], None
-
-        target_results = max(limit * 4, 100)
-        print(f"[SEARCH_LOOP] entering query={query} mode={mode} subreddits={subreddits} target={target_results}")
-
-        if mode == "local" and subreddits:
-            return await self._search_local_multi(query, subreddits, target_results, after=after)
-
-        results: list[dict] = []
-        current_after = after
-        pages_scanned = 0
-        start_time = time.monotonic()
-
-        audit = SearchAuditResult(query=query, mode=mode)
-
-        while True:
-            if len(results) >= target_results:
-                break
-            if pages_scanned >= SEARCH_MAX_PAGES:
-                break
-            if time.monotonic() - start_time > SEARCH_TIME_BUDGET_SECONDS:
-                break
-
-            page_items, next_after = await self._search_oauth(
-                query=query,
-                limit=25,
-                after=current_after,
-                subreddits=subreddits,
-                mode=mode
-            )
-
-            audit.raw_posts += len(page_items)
-
-            if not page_items:
-                break
-
-            text_items = []
-            for item in page_items:
-                media_url = self._extract_preview_url(item)
-                if not media_url:
-                    text_items.append(item)
-
-            audit.text_posts_removed += len(text_items)
-
-            media_items = [item for item in page_items if self._is_media_post(item)]
-
-            audit.non_media_removed += len(page_items) - len(text_items) - len(media_items)
-            print(f"[SEARCH_MEDIA] page_items={len(page_items)} text_removed={len(text_items)} media_kept={len(media_items)}")
-
-            for item in media_items:
-                if item.get("is_gallery"):
-                    audit.galleries += 1
-                elif item.get("is_video"):
-                    audit.videos += 1
-                else:
-                    audit.images += 1
-
-            results.extend(media_items)
-            audit.kept = len(results)
-
-            current_after = next_after
-            pages_scanned += 1
-            audit.pages_scanned = pages_scanned
-
-            print(f"[Search] page={pages_scanned} fetched={len(page_items)} media={len(media_items)} total={len(results)} after={current_after}")
-
-            if not next_after:
-                break
-
-        print(f"[Search] DONE query='{query}' pages={pages_scanned} returned={len(results)} elapsed={time.monotonic() - start_time:.2f}s")
-        print(f"[Search] Audit: raw={audit.raw_posts} text_removed={audit.text_posts_removed} non_media_removed={audit.non_media_removed} sub_filtered={audit.subreddit_filtered} kept={audit.kept} images={audit.images} galleries={audit.galleries} videos={audit.videos}")
-        print(f"[SEARCH_FINAL] returned={len(results)} after={current_after}")
-
-        return results, current_after
-
-    async def _search_local_multi(
-        self,
-        query: str,
-        subreddits: list[str],
-        target_results: int,
-        after: Optional[str] = None,
-    ) -> tuple[list[dict], Optional[str]]:
-        """Search each selected subreddit individually, then merge and deduplicate.
-
-        Reddit's multi-subreddit search (r/sub1+sub2/search?restrict_sr=on)
-        frequently returns zero results even when individual subreddits have
-        many matching posts. This method works around that by searching each
-        subreddit separately.
-
-        The `after` parameter is accepted for interface consistency. On repeat
-        calls the per-subreddit cursors would ideally be tracked; for now,
-        duplicate prevention happens in `_refillSearchBuffers()` on the
-        Flutter side.
-        """
-        all_results: list[dict] = []
-        last_cursor: Optional[str] = None
-        any_had_more = False
-        overall_start = time.monotonic()
-
-        for subreddit in subreddits:
-            sub_start = time.monotonic()
-
-            sub_results, sub_after, sub_audit = await self._accumulate_search(
-                query=query,
-                subreddits=[subreddit],
-                mode="local",
-                target_results=target_results,
-            )
-
-            print(f"[LOCAL_SEARCH] subreddit={subreddit} raw={sub_audit.raw_posts} kept={len(sub_results)} "
-                  f"images={sub_audit.images} galleries={sub_audit.galleries} videos={sub_audit.videos} "
-                  f"elapsed={time.monotonic() - sub_start:.2f}s")
-
-            if sub_results:
-                all_results.extend(sub_results)
-                if len(sub_results) >= target_results:
-                    any_had_more = True
-                if sub_after:
-                    last_cursor = sub_after
-                elif any_had_more:
-                    last_cursor = "more"
-
-        seen_ids = set()
-        deduped: list[dict] = []
-        for item in all_results:
-            pid = item.get("id")
-            if pid and pid not in seen_ids:
-                deduped.append(item)
-                seen_ids.add(pid)
-
-        cursor = last_cursor if any_had_more else None
-        print(f"[LOCAL_SEARCH_MERGE] before={len(all_results)} duplicates_removed={len(all_results) - len(deduped)} after={len(deduped)}")
-        print(f"[Search] DONE query='{query}' pages=merged returned={len(deduped)} elapsed={time.monotonic() - overall_start:.2f}s")
-        print(f"[SEARCH_FINAL] returned={len(deduped)} after={cursor}")
-
-        return deduped, cursor
-
     async def _accumulate_search(
         self,
         query: str,
         subreddits: Optional[list[str]],
         mode: str,
         target_results: int,
+        after: Optional[str] = None,
     ) -> tuple[list[dict], Optional[str], SearchAuditResult]:
         """Accumulate search results across pages for a given query/subreddit/mode combination."""
         results: list[dict] = []
-        current_after = None
+        current_after = after
         pages_scanned = 0
         start_time = time.monotonic()
 
@@ -494,6 +410,10 @@ class RedditClient:
             return "gallery"
         if post_data.get("is_video") and post_data.get("media", {}).get("reddit_video"):
             return "video"
+        if post_data.get("crosspost_parent") and (
+            post_data.get("crosspost_parent_data") or post_data.get("crosspost_parent_media")
+        ):
+            return "crosspost"
         url = post_data.get("url", "")
         if any(url.lower().endswith(ext) for ext in [".jpg", ".jpeg", ".png", ".gif", ".webp"]):
             return url
@@ -548,6 +468,29 @@ class RedditClient:
 
         if response.status_code == 401:
             await self.oauth.refresh_token()
+            token = await self.oauth.get_valid_token()
+            try:
+                async with httpx.AsyncClient(timeout=httpx.Timeout(15.0)) as retry_client:
+                    retry_response = await retry_client.get(
+                        url,
+                        headers={
+                            "Authorization": f"bearer {token}",
+                            "User-Agent": "RedSlide/1.0 by u/redslide_dev",
+                        },
+                        params=params,
+                    )
+                    if retry_response.status_code == 200:
+                        await self.oauth.record_success()
+                        await self.provider_manager.record_provider_success("reddit_oauth")
+                        data = retry_response.json()
+                        after_cursor = data.get("data", {}).get("after")
+                        raw_items = []
+                        for child in data.get("data", {}).get("children", []):
+                            raw_items.append(child.get("data", {}))
+                        print(f"[SEARCH_RAW] count={len(raw_items)} after_cursor={after_cursor}")
+                        return raw_items, after_cursor
+            except (httpx.TimeoutException, httpx.ConnectError) as e:
+                print(f"[SEARCH_TIMEOUT_RETRY] url={url} error={e}")
             await self.provider_manager.record_provider_failure("reddit_oauth")
             return [], None
 
@@ -566,6 +509,59 @@ class RedditClient:
         print(f"[SEARCH_RAW] count={len(raw_items)} after_cursor={after_cursor}")
         return raw_items, after_cursor
 
+    def _unwrap_crosspost(self, post_data: dict) -> dict:
+        """Detect and unwrap crossposted Reddit posts.
+
+        If a post is a crosspost (has crosspost_parent) and lacks its own
+        media, try to extract media from the crosspost's parent data that
+        Reddit may include inline.
+        """
+        if not post_data.get("crosspost_parent"):
+            return post_data
+
+        # Check if this crosspost has its own media
+        has_own_media = (
+            post_data.get("is_gallery") or
+            post_data.get("is_video") or
+            self._has_direct_media_url(post_data)
+        )
+        if has_own_media:
+            return post_data
+
+        # Try to get parent post data provided inline by Reddit
+        parent_data = post_data.get("crosspost_parent_data")
+        if parent_data and isinstance(parent_data, dict):
+            merged = dict(post_data)
+            for key in ("media", "media_metadata", "preview", "url",
+                        "is_gallery", "is_video", "gallery_data",
+                        "thumbnail", "width", "height", "title",
+                        "author", "score", "permalink", "over_18",
+                        "created_utc"):
+                if key not in merged or not merged.get(key):
+                    if key in parent_data:
+                        merged[key] = parent_data[key]
+            return merged
+
+        crosspost_media = post_data.get("crosspost_parent_media")
+        if crosspost_media and isinstance(crosspost_media, dict):
+            merged = dict(post_data)
+            merged["media"] = crosspost_media
+            merged["is_video"] = True
+            return merged
+
+        return post_data
+
+    def _has_direct_media_url(self, post_data: dict) -> bool:
+        """Check if the post has a direct media URL without full parsing."""
+        url = post_data.get("url", "")
+        if any(url.lower().endswith(ext) for ext in (".jpg", ".jpeg", ".png", ".gif", ".webp")):
+            return True
+        preview = post_data.get("preview")
+        if preview and isinstance(preview, dict):
+            if preview.get("images"):
+                return True
+        return False
+
     def _is_media_post(self, post_data: dict) -> bool:
         """Returns True only if the Reddit post contains usable media."""
         data = post_data.get("data", post_data)
@@ -573,6 +569,10 @@ class RedditClient:
         if data.get("is_gallery") and data.get("media_metadata"):
             return True
         if data.get("is_video") and data.get("media", {}).get("reddit_video"):
+            return True
+        if data.get("crosspost_parent") and (
+            data.get("crosspost_parent_data") or data.get("crosspost_parent_media")
+        ):
             return True
         url = data.get("url", "")
         if any(url.lower().endswith(ext) for ext in [".jpg", ".jpeg", ".png", ".gif", ".webp"]):
@@ -582,28 +582,71 @@ class RedditClient:
             return True
         return False
 
-    def _parse_post(self, post_data: dict) -> Optional[MediaAsset]:
-        """Parse a single Reddit post data dict into a MediaAsset."""
-        media_url, video_url, thumbnail_url, width, height, duration, gallery_items = self._extract_media_details(post_data)
-        if not media_url:
-            return None
+    def _parse_post_pipeline(self, post_data: dict) -> ParseResult:
+        """Single authoritative parser for all Reddit post data -> MediaAsset.
 
+        Used by Search, Home feed, and all future media sources. Validates
+        every post and returns a ParseResult with either the asset or a
+        rejection reason.
+        """
+        start = time.monotonic()
+
+        # 1. Check for deleted/removed posts
+        title = post_data.get("title", "").lower()
+        author = post_data.get("author", "").lower()
+        if title in ("[deleted]", "[removed]") or author in ("[deleted]",):
+            return ParseResult(rejection_reason=REJECTION_DELETED)
+
+        # 2. Check subreddit exists
         subreddit = post_data.get("subreddit", "").lower()
+        if not subreddit:
+            return ParseResult(rejection_reason=REJECTION_MISSING_SUBREDDIT)
+
+        # 3. Unwrap crossposts that lack their own media
+        resolved = self._unwrap_crosspost(post_data)
+
+        # 4. Extract media details
+        media_url, video_url, thumbnail_url, width, height, duration, gallery_items = self._extract_media_details(resolved)
+
+        # 5. Check media URL exists
+        if not media_url:
+            return ParseResult(rejection_reason=REJECTION_MISSING_MEDIA_URL)
+
+        # 6. Reject thumbnail URLs
+        if "thumbnail" in media_url:
+            return ParseResult(rejection_reason=REJECTION_THUMBNAIL_URL)
+
+        # 7. Gallery must have items
+        is_gallery = bool(resolved.get("is_gallery"))
+        is_video = bool(resolved.get("is_video"))
+        if is_gallery and not gallery_items:
+            return ParseResult(rejection_reason=REJECTION_EMPTY_GALLERY)
+
+        # 8. Resolution validation
+        known_width = width or 0
+        known_height = height or 0
+        if known_width > 0 and known_width < self.QUALITY_MIN_WIDTH:
+            return ParseResult(rejection_reason=REJECTION_SMALL_RESOLUTION)
+        if known_height > 0 and known_height < self.QUALITY_MIN_HEIGHT:
+            return ParseResult(rejection_reason=REJECTION_SMALL_RESOLUTION)
+
+        # 9. Build MediaAsset
+        reddit_id = resolved.get("id", "")
         asset = MediaAsset(
-            id=f"{subreddit}_{post_data.get('id')}",
-            reddit_id=post_data.get("id", ""),
-            permalink=post_data.get("permalink", ""),
+            id=f"{subreddit}_{reddit_id}",
+            reddit_id=reddit_id,
+            permalink=resolved.get("permalink", ""),
             media_url=media_url,
-            title=post_data.get("title", ""),
-            author=post_data.get("author", ""),
-            score=post_data.get("score", 0),
+            title=resolved.get("title", ""),
+            author=resolved.get("author", ""),
+            score=resolved.get("score", 0),
             subreddit=subreddit,
             video_url=video_url,
             thumbnail_url=thumbnail_url,
-            created_utc=post_data.get("created_utc", 0),
-            is_video=bool(post_data.get("is_video")),
-            is_gallery=bool(post_data.get("is_gallery")),
-            nsfw=post_data.get("over_18", False),
+            created_utc=resolved.get("created_utc", 0),
+            is_video=is_video,
+            is_gallery=is_gallery,
+            nsfw=resolved.get("over_18", False),
             width=width,
             height=height,
             duration=duration,
@@ -611,55 +654,28 @@ class RedditClient:
             last_seen=int(time.time()),
         )
         asset._gallery_items = gallery_items  # type: ignore
-        return asset
 
-    def _validate_search_asset(self, asset: MediaAsset) -> bool:
-        """Final quality gate for search results."""
-        if not asset.reddit_id:
-            return False
-        if not asset.media_url:
-            return False
-        if not asset.subreddit:
-            return False
+        # 10. Calculate quality score (sets asset.quality_score)
+        asset.quality_score = self._calculate_quality_score(asset)
 
-        title = asset.title.lower()
-        author = asset.author.lower()
-        if title in ("[deleted]", "[removed]"):
-            return False
-        if author in ("[deleted]", "automoderator"):
-            return False
+        return ParseResult(asset=asset)
 
-        media_url = asset.media_url
-        if "thumbnail" in media_url:
-            return False
+    def _parse_post(self, post_data: dict) -> Optional[MediaAsset]:
+        """Legacy wrapper — parses Reddit post data into MediaAsset.
 
-        if asset.is_gallery:
-            gallery_items = getattr(asset, "_gallery_items", None)
-            if not gallery_items:
-                return False
-
-        width = asset.width or 0
-        height = asset.height or 0
-        if width > 0 and height > 0:
-            if width < 400 or height < 300:
-                return False
-
-        return True
+        Delegates to the unified _parse_post_pipeline. Returns None if
+        the post is rejected.
+        """
+        return self._parse_post_pipeline(post_data).asset
 
     def validate_media(self, asset: MediaAsset) -> bool:
-        """Validate media quality before queue insertion."""
-        # Reject known thumbnail paths (not preview.redd.it CDN URLs)
-        if "thumbnail" in asset.media_url:
-            return False
-        
-        # Reject small images
-        if asset.width and asset.width < self.QUALITY_MIN_WIDTH:
-            return False
-        if asset.height and asset.height < self.QUALITY_MIN_HEIGHT:
-            return False
-        
-        # Calculate quality score
-        asset.quality_score = self._calculate_quality_score(asset)
+        """Validate media quality before queue insertion.
+
+        Quality score is now computed during _parse_post_pipeline.
+        This method only recalculates if needed (e.g. for queue insertion).
+        """
+        if asset.quality_score == 0:
+            asset.quality_score = self._calculate_quality_score(asset)
         return True
     
     def _calculate_quality_score(self, asset: MediaAsset) -> int:

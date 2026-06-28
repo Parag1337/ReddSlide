@@ -7,21 +7,15 @@ from ..models.schemas import MediaAsset
 
 load_dotenv()
 
-QUEUE_MAX = 1000
-QUEUE_MIN = 500
 QUEUE_REFILL = 300
-QUEUE_EMERGENCY = 100
 
 
 class QueueManager:
     """Persistent queue for slideshow playback."""
-    
-    def __init__(self):
-        self._initialized = False
-    
+
     async def initialize(self):
         """Load queue state on startup."""
-        self._initialized = True
+        pass
     
     async def count_queue_items(self) -> int:
         """DEPRECATED: No longer used by slideshow. Will be removed in future."""
@@ -86,7 +80,9 @@ class QueueManager:
                 
                 await db.commit()
                 return True
-            except Exception:
+            except Exception as e:
+                import traceback
+                print(f"[QUEUE_ERROR] add_to_queue failed for {asset.reddit_id}: {e}\n{traceback.format_exc()}")
                 return False
     
     @staticmethod
@@ -206,39 +202,7 @@ class QueueManager:
             )
             return items, next_cursor, has_more
 
-    async def remove_from_queue(self, reddit_post_id: str) -> bool:
-        """Remove item from queue."""
-        async with get_db() as db:
-            await db.execute("DELETE FROM media_queue WHERE reddit_post_id = ?", (reddit_post_id,))
-            await db.commit()
-            return True
-    
-    async def clear_queue(self) -> None:
-        """Clear all queue items."""
-        async with get_db() as db:
-            await db.execute("DELETE FROM media_queue")
-            await db.commit()
-    
-    async def manage_queue(self) -> None:
-        """DEPRECATED: No longer used by slideshow. Will be removed in future."""
-        pass
-    
-    async def _refill_queue(self, count: int) -> None:
-        """DEPRECATED: No longer used by slideshow. Will be removed in future."""
-        pass
-    
-    async def _trim_queue(self, max_size: int) -> None:
-        """DEPRECATED: No longer used by slideshow. Will be removed in future."""
-        async with get_db() as db:
-            await db.execute(
-                """DELETE FROM media_queue WHERE id IN (
-                    SELECT id FROM media_queue 
-                    ORDER BY position DESC 
-                    LIMIT (SELECT COUNT(*) - ? FROM media_queue)
-                )""",
-                (max_size,)
-            )
-            await db.commit()
+
     
     async def search(
         self,
@@ -251,45 +215,49 @@ class QueueManager:
     ) -> tuple[list[dict], int]:
         """Search media using FTS5 with optional filters."""
         async with get_db() as db:
-            base_where = "ma.reddit_id IN (SELECT reddit_post_id FROM media_search WHERE media_search MATCH ?)"
-            params: list = [query]
+            try:
+                base_where = "ma.reddit_id IN (SELECT reddit_post_id FROM media_search WHERE media_search MATCH ?)"
+                params: list = [query]
 
-            if subreddits:
-                placeholders = ",".join("?" * len(subreddits))
-                base_where += f" AND ma.subreddit IN ({placeholders})"
-                params.extend(subreddits)
+                if subreddits:
+                    placeholders = ",".join("?" * len(subreddits))
+                    base_where += f" AND ma.subreddit IN ({placeholders})"
+                    params.extend(subreddits)
 
-            if media_type == "images":
-                base_where += " AND ma.is_video = 0 AND ma.is_gallery = 0"
-            elif media_type == "galleries":
-                base_where += " AND ma.is_gallery = 1"
-            elif media_type == "videos":
-                base_where += " AND ma.is_video = 1"
+                if media_type == "images":
+                    base_where += " AND ma.is_video = 0 AND ma.is_gallery = 0"
+                elif media_type == "galleries":
+                    base_where += " AND ma.is_gallery = 1"
+                elif media_type == "videos":
+                    base_where += " AND ma.is_video = 1"
 
-            order_clause = "ORDER BY ma.score DESC"
-            if sort == "newest":
-                order_clause = "ORDER BY ma.created_utc DESC"
-            elif sort == "relevance":
-                order_clause = "ORDER BY ma.quality_score DESC, ma.score DESC"
+                order_clause = "ORDER BY ma.score DESC"
+                if sort == "newest":
+                    order_clause = "ORDER BY ma.created_utc DESC"
+                elif sort == "relevance":
+                    order_clause = "ORDER BY ma.quality_score DESC, ma.score DESC"
 
-            cursor = await db.execute(
-                f"""SELECT ma.* FROM media_assets ma
-                   WHERE {base_where}
-                   {order_clause}
-                   LIMIT ? OFFSET ?""",
-                [*params, limit, offset]
-            )
-            rows = await cursor.fetchall()
+                cursor = await db.execute(
+                    f"""SELECT ma.* FROM media_assets ma
+                       WHERE {base_where}
+                       {order_clause}
+                       LIMIT ? OFFSET ?""",
+                    [*params, limit, offset]
+                )
+                rows = await cursor.fetchall()
 
-            count_cursor = await db.execute(
-                f"""SELECT COUNT(*) as count FROM media_assets ma
-                   WHERE {base_where}""",
-                params
-            )
-            count_row = await count_cursor.fetchone()
-            total = count_row["count"] if count_row else 0
+                count_cursor = await db.execute(
+                    f"""SELECT COUNT(*) as count FROM media_assets ma
+                       WHERE {base_where}""",
+                    params
+                )
+                count_row = await count_cursor.fetchone()
+                total = count_row["count"] if count_row else 0
 
-            return [dict(row) for row in rows], total
+                return [dict(row) for row in rows], total
+            except Exception as e:
+                print(f"[FTS5_ERROR] Malformed query: {query} error={e}")
+                return [], 0
     
     async def get_gallery_urls(self, reddit_ids: list[str]) -> dict[str, list[str]]:
         """Get gallery URLs for a list of reddit IDs. Returns dict mapping reddit_id -> list of URLs."""
@@ -388,24 +356,28 @@ class QueueManager:
             )
             await db.commit()
 
-    async def fetch_and_store(self, subreddit: str, limit: int = 25, sort: str = "hot", after: Optional[str] = None) -> tuple[int, Optional[str]]:
+    async def fetch_and_store(self, subreddit: str, limit: int = 25, sort: str = "hot", after: Optional[str] = None, oauth_manager=None, provider_manager=None) -> tuple[int, Optional[str]]:
         """Fetch content from a subreddit on-demand and store in queue.
-        Returns (added_count, new_cursor_from_reddit)."""
+        Returns (added_count, new_cursor_from_reddit).
+
+        If oauth_manager and provider_manager are provided (shared singletons),
+        they are reused instead of creating per-request instances."""
         before_count = await self.count_subreddit_items(subreddit)
         print(f"[QUEUE] fetch_and_store start subreddit={subreddit} limit={limit} sort={sort} after={after}")
-        from .reddit_client import RedditClient
-        from ..managers.oauth import OAuthManager
-        from ..managers.provider import ProviderManager
 
-        oauth = OAuthManager(
-            client_id=os.getenv("REDDIT_CLIENT_ID", ""),
-            client_secret=os.getenv("REDDIT_CLIENT_SECRET", ""),
-            user_agent=os.getenv("REDDIT_USER_AGENT", "RedSlide/1.0")
-        )
-        await oauth.initialize()
+        if oauth_manager is None or provider_manager is None:
+            from .reddit_client import RedditClient
+            from ..managers.oauth import OAuthManager
+            from ..managers.provider import ProviderManager
+            oauth_manager = OAuthManager(
+                client_id=os.getenv("REDDIT_CLIENT_ID", ""),
+                client_secret=os.getenv("REDDIT_CLIENT_SECRET", ""),
+                user_agent=os.getenv("REDDIT_USER_AGENT", "RedSlide/1.0")
+            )
+            await oauth_manager.initialize()
+            provider_manager = ProviderManager()
 
-        provider = ProviderManager()
-        client = RedditClient(oauth_manager=oauth, provider_manager=provider)
+        client = RedditClient(oauth_manager=oauth_manager, provider_manager=provider_manager)
 
         assets, new_cursor = await client.fetch_subreddit_media(subreddit, limit=limit, after=after, sort=sort)
         added = 0
@@ -424,7 +396,7 @@ class QueueManager:
 
         return added, new_cursor
 
-    async def ensure_subreddit_has_content(self, subreddit: str, sort: str = "hot") -> bool:
+    async def ensure_subreddit_has_content(self, subreddit: str, sort: str = "hot", oauth_manager=None, provider_manager=None) -> bool:
         """Refill subreddit queue with cursor-based pagination.
         Reads stored cursor, fetches next page from Reddit, stores new cursor.
         If Reddit returns no items (end of pagination), resets cursor so next
@@ -435,7 +407,7 @@ class QueueManager:
             f"before={stored_after}"
         )
         try:
-            added, new_cursor = await self.fetch_and_store(subreddit, limit=50, sort=sort, after=stored_after)
+            added, new_cursor = await self.fetch_and_store(subreddit, limit=50, sort=sort, after=stored_after, oauth_manager=oauth_manager, provider_manager=provider_manager)
 
             # Cursor recovery: if Reddit returned no items, cursor is stale or
             # we reached end of pagination.  Reset to None so the next fetch
@@ -456,8 +428,31 @@ class QueueManager:
             return await self.count_subreddit_items(subreddit) > 0
 
     async def cleanup_old_assets(self, days: int = 30) -> None:
-        """Clean up assets older than specified days."""
+        """Clean up assets older than specified days.
+
+        Removes orphaned gallery_items and media_queue entries first,
+        then prunes media_assets older than cutoff. All operations are
+        transactional.
+        """
         cutoff = int(time.time()) - (days * 24 * 60 * 60)
         async with get_db() as db:
-            await db.execute("DELETE FROM media_assets WHERE created_at < ?", (cutoff,))
+            # Remove orphaned gallery_items for old assets
+            await db.execute(
+                """DELETE FROM gallery_items WHERE reddit_id IN (
+                    SELECT reddit_id FROM media_assets WHERE created_at < ?
+                )""",
+                (cutoff,)
+            )
+            # Remove orphaned media_queue entries for old assets
+            await db.execute(
+                """DELETE FROM media_queue WHERE reddit_post_id IN (
+                    SELECT id FROM media_assets WHERE created_at < ?
+                )""",
+                (cutoff,)
+            )
+            # Remove old assets
+            await db.execute(
+                "DELETE FROM media_assets WHERE created_at < ?",
+                (cutoff,)
+            )
             await db.commit()

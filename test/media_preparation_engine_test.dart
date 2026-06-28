@@ -57,7 +57,6 @@ void main() {
         playlist: playlist,
         onLoadMore: () async {},
       );
-      engine.initialize();
       engine.dispose();
     });
 
@@ -364,9 +363,9 @@ void main() {
   });
 
   group('PreparationPolicy', () {
-    test('default values are 6 ahead and 3 behind', () {
+    test('default values are 10 ahead and 3 behind', () {
       final policy = const PreparationPolicy();
-      expect(policy.decodedAhead, 6);
+      expect(policy.decodedAhead, 10);
       expect(policy.decodedBehind, 3);
     });
 
@@ -380,7 +379,7 @@ void main() {
   group('PreparedMediaHandle', () {
     test('displayUrl returns mediaUrl for plain image', () {
       final asset = _makeAsset(id: 'img1');
-      final handle = PreparedMediaHandle(asset: asset, ready: false);
+      final handle = PreparedMediaHandle(asset: asset, state: MediaState.notRequested);
       expect(handle.displayUrl, asset.mediaUrl);
     });
 
@@ -402,7 +401,7 @@ void main() {
 
     test('isVideo returns true for video assets', () {
       final asset = _makeAsset(id: 'vid1', isVideo: true);
-      final handle = PreparedMediaHandle(asset: asset, ready: false);
+      final handle = PreparedMediaHandle(asset: asset, state: MediaState.notRequested);
       expect(handle.isVideo, true);
     });
 
@@ -424,7 +423,7 @@ void main() {
         galleryUrls: null,
         createdUtc: 0,
       );
-      final handle = PreparedMediaHandle(asset: noThumbAsset, ready: false);
+      final handle = PreparedMediaHandle(asset: noThumbAsset, state: MediaState.notRequested);
       expect(handle.displayThumbnailUrl, 'https://i.redd.it/no_thumb.jpg');
     });
   });

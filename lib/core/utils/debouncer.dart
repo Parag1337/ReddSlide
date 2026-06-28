@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'package:flutter/foundation.dart';
 
 class Debouncer {
   final Duration delay;
@@ -20,5 +21,3 @@ class Debouncer {
     _timer = null;
   }
 }
-
-typedef VoidCallback = void Function();

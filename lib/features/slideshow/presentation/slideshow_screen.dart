@@ -8,6 +8,7 @@ import 'package:dio/dio.dart';
 import 'package:url_launcher/url_launcher.dart';
 import 'package:share_plus/share_plus.dart';
 import '../../../core/constants/theme_constants.dart';
+import '../../../core/display_quality/display_quality_mode.dart';
 import '../../../core/extensions/context_extensions.dart';
 import '../../../core/media/media_error.dart';
 import '../../../shared/utils/url_sanitizer.dart';
@@ -15,6 +16,7 @@ import '../../../shared/widgets/empty_state_widget.dart';
 import '../../feed/domain/media_asset.dart';
 import '../../settings/domain/settings_model.dart';
 import '../../settings/providers/settings_provider.dart';
+import '../domain/metrics_collector.dart';
 import '../domain/slideshow_source.dart';
 import '../providers/slideshow_provider.dart';
 import 'widgets/media_viewer.dart';
@@ -47,15 +49,18 @@ class _SlideshowScreenState extends ConsumerState<SlideshowScreen> with WidgetsB
     _logSource();
     Future.microtask(() {
       final notifier = ref.read(slideshowProvider(widget.source).notifier);
+      final settings = ref.read(settingsProvider).valueOrNull;
 
-      notifier.attachPreparationEngine(context);
+      notifier.attachPreparationEngine(
+        context,
+        displayQualityMode: settings?.displayQualityMode ?? DisplayQualityMode.smart,
+      );
 
       notifier.initialize();
 
       if (widget.startIndex > 0) {
         notifier.setStartIndex(widget.startIndex);
       }
-      final settings = ref.read(settingsProvider).valueOrNull;
       if (settings != null) {
         notifier.setInterval(settings.slideshowIntervalSeconds);
       }
@@ -203,14 +208,10 @@ class _SlideshowScreenState extends ConsumerState<SlideshowScreen> with WidgetsB
       isGallery: isGallery,
       isLastInGallery: isLastInGallery,
     );
-
-    if (mounted) {
-      ref.read(slideshowProvider(widget.source).notifier).galleryNext();
-    }
   }
 }
 
-class _SlideshowPageContent extends ConsumerWidget {
+class _SlideshowPageContent extends ConsumerStatefulWidget {
   final SlideshowSource source;
   final PageController pageController;
   final ValueChanged<int> onPageChanged;
@@ -228,11 +229,44 @@ class _SlideshowPageContent extends ConsumerWidget {
   });
 
   @override
-  Widget build(BuildContext context, WidgetRef ref) {
-    if (isLoading) {
+  ConsumerState<_SlideshowPageContent> createState() => _SlideshowPageContentState();
+}
+
+class _SlideshowPageContentState extends ConsumerState<_SlideshowPageContent> {
+  String? _lastVisibleAssetId;
+  bool _emittedOpened = false;
+  bool _emittedFirstRequested = false;
+
+  void _emitOpenedIfNeeded(SlideshowNotifier notifier) {
+    if (!_emittedOpened) {
+      _emittedOpened = true;
+      final desc = switch (widget.source) {
+        SubredditSource(:final subreddit) => 'subreddit=$subreddit',
+        MultiSubredditSource(:final subreddits) => 'subreddits=${subreddits.length}',
+        GlobalFeedSource() => 'global',
+        SearchSource(:final query) => 'query=$query',
+        GroupSource(:final groupName) => 'group=$groupName',
+      };
+      notifier.metrics.recordEvent(MetricEventType.slideshowOpened, data: {'source': desc});
+    }
+  }
+
+  void _emitFirstRequestedIfNeeded(SlideshowNotifier notifier, String assetId, int index) {
+    if (!_emittedFirstRequested) {
+      _emittedFirstRequested = true;
+      notifier.metrics.recordEvent(MetricEventType.firstImageRequested, data: {
+        'assetId': assetId,
+        'index': index,
+      });
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    if (widget.isLoading) {
       return const Center(child: CircularProgressIndicator(color: Colors.white));
     }
-    if (itemsEmpty) {
+    if (widget.itemsEmpty) {
       return const Center(
         child: EmptyStateWidget(
           icon: Icons.image_not_supported,
@@ -242,17 +276,19 @@ class _SlideshowPageContent extends ConsumerWidget {
       );
     }
 
-    final items = ref.watch(slideshowProvider(source).select((s) => s.items));
-    final currentIndex = ref.watch(slideshowProvider(source).select((s) => s.currentIndex));
-    final gallerySubIndex = ref.watch(slideshowProvider(source).select((s) => s.gallerySubIndex));
-    final isMuted = ref.watch(slideshowProvider(source).select((s) => s.isMuted));
-    final notifier = ref.read(slideshowProvider(source).notifier);
+    final items = ref.watch(slideshowProvider(widget.source).select((s) => s.items));
+    final currentIndex = ref.watch(slideshowProvider(widget.source).select((s) => s.currentIndex));
+    final gallerySubIndex = ref.watch(slideshowProvider(widget.source).select((s) => s.gallerySubIndex));
+    final isMuted = ref.watch(slideshowProvider(widget.source).select((s) => s.isMuted));
+    final notifier = ref.read(slideshowProvider(widget.source).notifier);
+
+    _emitOpenedIfNeeded(notifier);
 
     return PageView.builder(
-      controller: pageController,
+      controller: widget.pageController,
       itemCount: items.length,
       scrollDirection: Axis.horizontal,
-      onPageChanged: onPageChanged,
+      onPageChanged: widget.onPageChanged,
       itemBuilder: (context, index) {
         if (index >= items.length) return const SizedBox();
         final asset = items[index];
@@ -260,22 +296,46 @@ class _SlideshowPageContent extends ConsumerWidget {
           asset,
           galleryIndex: index == currentIndex ? gallerySubIndex : 0,
         );
+        if (index == currentIndex && asset.id != _lastVisibleAssetId) {
+          _lastVisibleAssetId = asset.id;
+          _emitFirstRequestedIfNeeded(notifier, asset.id, index);
+          notifier.metrics.recordEvent(
+            asset.isVideo
+                ? MetricEventType.slideshowVideoVisible
+                : MetricEventType.slideshowImageVisible,
+            data: {'assetId': asset.id, 'index': index},
+          );
+        }
         return RepaintBoundary(
           child: GestureDetector(
             onTapUp: (details) {
               final width = MediaQuery.of(context).size.width;
               if (details.localPosition.dx < width * 0.3) {
-                ref.read(slideshowProvider(source).notifier).galleryPrevious();
+                ref.read(slideshowProvider(widget.source).notifier).galleryPrevious();
               } else if (details.localPosition.dx > width * 0.7) {
-                ref.read(slideshowProvider(source).notifier).galleryNext();
+                ref.read(slideshowProvider(widget.source).notifier).galleryNext();
               } else {
-                ref.read(slideshowProvider(source).notifier).toggleOverlay();
+                ref.read(slideshowProvider(widget.source).notifier).toggleOverlay();
               }
             },
             child: MediaViewer(
               handle: handle,
               isMuted: isMuted,
-              onMediaError: onMediaError,
+              onMediaError: widget.onMediaError,
+              onImageDecoded: (url) {
+                notifier.metrics.recordEvent(MetricEventType.imageDecoded, data: {
+                  'assetId': asset.id,
+                  'index': index,
+                  'url': url,
+                });
+              },
+              onVideoFirstFrame: (url) {
+                notifier.metrics.recordEvent(MetricEventType.videoFirstFrameRendered, data: {
+                  'assetId': asset.id,
+                  'index': index,
+                  'url': url,
+                });
+              },
             ),
           ),
         );

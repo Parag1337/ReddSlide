@@ -3,7 +3,7 @@ class PreparationPolicy {
   final int decodedBehind;
 
   const PreparationPolicy({
-    this.decodedAhead = 6,
+    this.decodedAhead = 10,
     this.decodedBehind = 3,
   });
 }

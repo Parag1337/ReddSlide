@@ -35,7 +35,7 @@ class MediaCard extends StatelessWidget {
             child: Stack(
               fit: StackFit.expand,
               children: [
-                _buildImage(theme),
+                _buildImage(context, theme),
                 if (asset.isVideo)
                   Positioned(
                     bottom: 8,
@@ -76,17 +76,14 @@ class MediaCard extends StatelessWidget {
     );
   }
 
-  Widget _buildImage(ThemeData theme) {
-    if (asset.thumbnailUrl != null) {
-      return CachedNetworkImage(
-        imageUrl: asset.thumbnailUrl!,
-        fit: BoxFit.cover,
-        placeholder: (_, _) => _shimmerPlaceholder(theme),
-        errorWidget: (_, _, _) => _errorPlaceholder(theme),
-      );
-    }
+  Widget _buildImage(BuildContext context, ThemeData theme) {
+    final pixelRatio = MediaQuery.of(context).devicePixelRatio;
+    final columns = MediaQuery.of(context).size.width > 600 ? 3 : 2;
+    final thumbWidth = (MediaQuery.of(context).size.width / columns * pixelRatio).ceil();
+    final url = asset.thumbnailUrl ?? asset.mediaUrl;
     return CachedNetworkImage(
-      imageUrl: asset.mediaUrl,
+      imageUrl: url,
+      memCacheWidth: thumbWidth,
       fit: BoxFit.cover,
       placeholder: (_, _) => _shimmerPlaceholder(theme),
       errorWidget: (_, _, _) => _errorPlaceholder(theme),

@@ -8,11 +8,11 @@ from ..models.schemas import OAuthToken
 
 class OAuthManager:
     """Internal OAuth manager - no public endpoints."""
-    
+
     REFRESH_BUFFER_SECONDS = 300  # Refresh 5 minutes before expiry
     MAX_RETRIES = 3
     BACKOFF_BASE = 1
-    
+
     def __init__(self, client_id: str, client_secret: str, user_agent: str, redirect_uri: str = "http://localhost:8080"):
         self.client_id = client_id
         self.client_secret = client_secret
@@ -21,7 +21,7 @@ class OAuthManager:
         self._token: Optional[str] = None
         self._refresh_token_value: Optional[str] = None
         self._token_id: Optional[int] = None
-        self._refresh_task: Optional[asyncio.Task] = None
+        self._refresh_lock = asyncio.Lock()
     
     async def initialize(self):
         """Initialize OAuth tokens table and load existing token."""
@@ -39,15 +39,20 @@ class OAuthManager:
                 await self._acquire_initial_token()
     
     async def get_valid_token(self) -> str:
-        """Get valid token, refresh if needed."""
-        if self._token is None:
-            await self._ensure_token()
-        
-        token_data = await self._get_stored_token()
-        if token_data and token_data.expires_at <= int(time.time()) + self.REFRESH_BUFFER_SECONDS:
-            await self.refresh_token()
-        
-        return self._token or ""
+        """Get valid token, refresh if needed.
+
+        Thread-safe: only one refresh occurs at a time via _refresh_lock.
+        Concurrent callers reuse the refreshed token.
+        """
+        async with self._refresh_lock:
+            if self._token is None:
+                await self._ensure_token()
+
+            token_data = await self._get_stored_token()
+            if token_data and token_data.expires_at <= int(time.time()) + self.REFRESH_BUFFER_SECONDS:
+                await self.refresh_token()
+
+            return self._token or ""
     
     async def _ensure_token(self):
         """Ensure a token exists."""

@@ -8,12 +8,16 @@ class MediaViewer extends StatelessWidget {
   final PreparedMediaHandle handle;
   final bool isMuted;
   final void Function(MediaErrorType errorType)? onMediaError;
+  final void Function(String url)? onImageDecoded;
+  final void Function(String url)? onVideoFirstFrame;
 
   const MediaViewer({
     super.key,
     required this.handle,
     required this.isMuted,
     this.onMediaError,
+    this.onImageDecoded,
+    this.onVideoFirstFrame,
   });
 
   @override
@@ -23,8 +27,13 @@ class MediaViewer extends StatelessWidget {
             handle: handle,
             muted: isMuted,
             onError: onMediaError,
+            onFirstFrameRendered: onVideoFirstFrame,
           )
-        : ImageViewer(handle: handle, onError: onMediaError);
+        : ImageViewer(
+            handle: handle,
+            onError: onMediaError,
+            onFirstFrameDecoded: onImageDecoded,
+          );
 
     return widget;
   }

@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import '../../../core/display_quality/display_quality_mode.dart';
 import '../../../core/network/api_client.dart';
 import '../providers/settings_provider.dart';
 import '../domain/settings_model.dart';
@@ -132,6 +133,65 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
             subtitle: Text('${settings.slideshowIntervalSeconds} seconds'),
             trailing: const Icon(Icons.chevron_right),
             onTap: () => _showIntervalDialog(settings, theme),
+          ),
+          const Divider(height: 1),
+          Padding(
+            padding: const EdgeInsets.fromLTRB(16, 12, 16, 12),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text('Display Quality', style: theme.textTheme.titleSmall),
+                const SizedBox(height: 8),
+                ...DisplayQualityMode.values.where((m) => m != DisplayQualityMode.auto).map((mode) {
+                  final selected = settings.displayQualityMode == mode;
+                  return Padding(
+                    padding: const EdgeInsets.only(bottom: 8),
+                    child: InkWell(
+                      borderRadius: BorderRadius.circular(8),
+                      onTap: () => ref.read(settingsProvider.notifier).setDisplayQualityMode(mode),
+                      child: Row(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Padding(
+                            padding: const EdgeInsets.only(top: 2, right: 12),
+                            child: Icon(
+                              selected ? Icons.radio_button_checked : Icons.radio_button_unchecked,
+                              size: 20,
+                              color: selected
+                                  ? theme.colorScheme.primary
+                                  : theme.colorScheme.onSurfaceVariant,
+                            ),
+                          ),
+                          Expanded(
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                Text(
+                                  mode.displayLabel,
+                                  style: theme.textTheme.bodyMedium?.copyWith(
+                                    fontWeight: selected ? FontWeight.w600 : FontWeight.normal,
+                                    color: selected
+                                        ? theme.colorScheme.primary
+                                        : theme.colorScheme.onSurface,
+                                  ),
+                                ),
+                                const SizedBox(height: 2),
+                                Text(
+                                  mode.displayDescription,
+                                  style: theme.textTheme.bodySmall?.copyWith(
+                                    color: theme.colorScheme.onSurfaceVariant,
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  );
+                }),
+              ],
+            ),
           ),
         ],
       ),

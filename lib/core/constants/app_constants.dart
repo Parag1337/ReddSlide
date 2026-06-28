@@ -27,4 +27,7 @@ class AppConstants {
 
   /// Video pre-initialization window (how many videos ahead to prepare)
   static const int videoPreloadWindow = 2;
+
+  /// Max concurrent VideoPlayerController initializations
+  static const int maxConcurrentVideoPrep = 2;
 }

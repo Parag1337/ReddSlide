@@ -1,3 +1,5 @@
+import '../../../core/display_quality/display_quality_mode.dart';
+
 class SettingsModel {
   final String backendUrl;
   final bool nsfwEnabled;
@@ -5,6 +7,7 @@ class SettingsModel {
   final int slideshowIntervalSeconds;
   final String defaultSortMode;
   final List<String> subreddits;
+  final DisplayQualityMode displayQualityMode;
 
   const SettingsModel({
     this.backendUrl = '',
@@ -13,6 +16,7 @@ class SettingsModel {
     this.slideshowIntervalSeconds = 5,
     this.defaultSortMode = 'hot',
     this.subreddits = const [],
+    this.displayQualityMode = DisplayQualityMode.smart,
   });
 
   SettingsModel copyWith({
@@ -22,6 +26,7 @@ class SettingsModel {
     int? slideshowIntervalSeconds,
     String? defaultSortMode,
     List<String>? subreddits,
+    DisplayQualityMode? displayQualityMode,
   }) {
     return SettingsModel(
       backendUrl: backendUrl ?? this.backendUrl,
@@ -31,6 +36,7 @@ class SettingsModel {
           slideshowIntervalSeconds ?? this.slideshowIntervalSeconds,
       defaultSortMode: defaultSortMode ?? this.defaultSortMode,
       subreddits: subreddits ?? this.subreddits,
+      displayQualityMode: displayQualityMode ?? this.displayQualityMode,
     );
   }
 
@@ -41,6 +47,7 @@ class SettingsModel {
         'slideshowIntervalSeconds': slideshowIntervalSeconds,
         'defaultSortMode': defaultSortMode,
         'subreddits': subreddits,
+        'displayQualityMode': displayQualityMode.toJson(),
       };
 
   factory SettingsModel.fromJson(Map<String, dynamic> json) => SettingsModel(
@@ -54,5 +61,8 @@ class SettingsModel {
                 ?.map((e) => e as String)
                 .toList() ??
             [],
+        displayQualityMode: json['displayQualityMode'] != null
+            ? DisplayQualityMode.fromJson(json['displayQualityMode'] as String)
+            : DisplayQualityMode.smart,
       );
 }

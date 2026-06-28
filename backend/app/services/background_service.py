@@ -67,7 +67,7 @@ class BackgroundRefreshService:
             self.scheduler.start()
 
     async def stop(self):
-        """Stop background service."""
+        """Stop background service and release resources."""
         if not self._is_running:
             return
 
@@ -128,9 +128,11 @@ class BackgroundRefreshService:
                 if added > 0:
                     print(f"Refill: {subreddit} ({count} before) — added {added} assets")
             except Exception as e:
-                print(f"Error fetching from {subreddit}: {e}")
+                import traceback
+                print(f"[REFRESH_ERROR] subreddit={subreddit}: {e}\n{traceback.format_exc()}")
         except Exception as e:
-            print(f"Refresh job error: {e}")
+            import traceback
+            print(f"[REFRESH_JOB_ERROR] {e}\n{traceback.format_exc()}")
 
     async def _cleanup_job(self):
         """Clean up old assets."""
@@ -143,4 +145,5 @@ class BackgroundRefreshService:
                 )
                 await db.commit()
         except Exception as e:
-            print(f"Cleanup job error: {e}")
+            import traceback
+            print(f"[CLEANUP_JOB_ERROR] {e}\n{traceback.format_exc()}")

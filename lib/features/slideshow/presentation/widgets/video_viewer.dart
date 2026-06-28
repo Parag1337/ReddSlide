@@ -8,12 +8,14 @@ class VideoViewer extends StatefulWidget {
   final PreparedMediaHandle handle;
   final bool muted;
   final void Function(MediaErrorType errorType)? onError;
+  final void Function(String url)? onFirstFrameRendered;
 
   const VideoViewer({
     super.key,
     required this.handle,
     required this.muted,
     this.onError,
+    this.onFirstFrameRendered,
   });
 
   @override
@@ -24,6 +26,7 @@ class _VideoViewerState extends State<VideoViewer> {
   VideoPlayerController? _attachedController;
   bool _firstFrameRendered = false;
   bool _errorReported = false;
+  bool _frameEventEmitted = false;
 
   @override
   void initState() {
@@ -38,6 +41,7 @@ class _VideoViewerState extends State<VideoViewer> {
     if (oldWidget.handle.asset.id != widget.handle.asset.id) {
       _detachFromController();
       _firstFrameRendered = false;
+      _frameEventEmitted = false;
       _errorReported = false;
       _attachToController();
       _reportErrorIfNeeded();
@@ -50,10 +54,14 @@ class _VideoViewerState extends State<VideoViewer> {
     final c = widget.handle.controller;
     if (c == null || !c.value.isInitialized) return;
     _attachedController = c;
-    _attachedController!.addListener(_onVideoUpdate);
-    _attachedController!.setVolume(widget.muted ? 0 : 1);
-    _attachedController!.seekTo(Duration.zero);
-    _attachedController!.play();
+    try {
+      _attachedController!.addListener(_onVideoUpdate);
+      _attachedController!.setVolume(widget.muted ? 0 : 1);
+      _attachedController!.seekTo(Duration.zero);
+      _attachedController!.play();
+    } catch (_) {
+      _attachedController = null;
+    }
   }
 
   void _detachFromController() {
@@ -70,6 +78,10 @@ class _VideoViewerState extends State<VideoViewer> {
     final position = _attachedController!.value.position;
     if (!_firstFrameRendered && position > Duration.zero) {
       if (mounted) setState(() => _firstFrameRendered = true);
+      if (!_frameEventEmitted) {
+        _frameEventEmitted = true;
+        widget.onFirstFrameRendered?.call(widget.handle.asset.videoUrl ?? '');
+      }
     }
   }
 

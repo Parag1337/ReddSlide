@@ -136,9 +136,10 @@ backend/
 │   │   ├── oauth.py                 # OAuthManager — token lifecycle
 │   │   └── provider.py              # ProviderManager — circuit breaker failover
 │   ├── services/
-│   │   ├── __init__.py              # Re-exports RedditClient, QueueManager
+│   │   ├── __init__.py              # Re-exports RedditClient, QueueManager, SearchCoordinator
 │   │   ├── queue_manager.py         # QueueManager — queue CRUD, search, subreddit config, cursors
 │   │   ├── reddit_client.py         # RedditClient — fetch/parse media from Reddit API
+│   │   ├── search_coordinator.py    # SearchCoordinator — parallel search with bounded concurrency
 │   │   └── background_service.py    # BackgroundRefreshService — APScheduler jobs
 │   └── api/
 │       ├── __init__.py              # Imports feed, debug, search routers
@@ -150,8 +151,7 @@ backend/
 ├── .env                             # Environment variables (not committed)
 ├── .env.example
 ├── requirements.txt
-├── Dockerfile
-└── validate.py / benchmark.py / etc.  # Test/validation scripts
+└── Dockerfile
 ```
 
 ---
@@ -265,27 +265,40 @@ The feed endpoint uses cursor-based pagination on `media_assets` table. Multi-su
 #### GET /api/search/reddit
 
 ```
-1. Create RedditClient with fresh OAuthManager + ProviderManager
+1. Create RedditClient + SearchCoordinator(concurrency=5)
 2. OAuthManager.initialize() — loads/acquires token
-3. Call RedditClient.search_reddit(query, limit, after, subreddits, mode)
+3. Call SearchCoordinator.execute(query, mode, limit, subreddits, after)
    │
-   ├── Global mode: Calls _accumulate_search() — scans Reddit up to 20 pages
-   │   or until target_results (limit × 4, min 100) media items are found,
-   │   within SEARCH_TIME_BUDGET_SECONDS (5s). Uses single Reddit OAuth
-   │   search request per page, passes restrict_sr=on if subreddits given.
+   ├── Parse opaque `after` → per-subreddit cursors (JSON decode)
+   │   ({subreddit: cursor, ...}) or empty dict on first call
    │
-   └── Local mode: Calls _search_local_multi(query, subreddits, target_results)
-       — searches EACH selected subreddit individually via _accumulate_search()
-       (accepts after parameter but cursor is always returned as None in local
-       mode, preventing incremental pagination), then merges and deduplicates
-       by post id. Bypasses Reddit's multi-subreddit search bug
-       (r/sub1+sub2/search returns 0 results for many queries).
-       Passes include_over_18=on for NSFW content.
-
-4. _parse_post() converts raw dicts → MediaAsset objects
-5. validate_media() + _validate_search_asset() filter low-quality items
-6. _asset_to_response() enriches with gallery URLs
-7. Return FeedResponse (NO storage in search_results table)
+   ├── Local mode + subreddits:
+   │     └── _run_workers()
+   │           ├── asyncio.Semaphore(5) — at most 5 in flight
+   │           ├── For each subreddit, launch worker coroutine:
+   │           │     └── _accumulate_search(subreddit=[name], after=cursor)
+   │           │           └── _search_oauth() → multi-page loop (up to 20 pages
+   │           │               or target_results items or 5s time budget)
+   │           └── asyncio.gather(return_exceptions=True)
+   │               — failed workers return empty, others proceed
+   │
+   └── Global mode (no subreddits):
+         └── Single _accumulate_search(mode="global", after=cursor)
+   │
+   ├── Aggregate & deduplicate:
+   │     ├── Flatten all worker result lists
+   │     ├── Deduplicate by post "id" (first wins)
+   │     └── Sort by created_utc DESC
+   │
+   ├── Parse to responses:
+   │     ├── _parse_post() → MediaAsset
+   │     ├── validate_media() + _validate_search_asset() → filter
+   │     └── → MediaAssetResponse (stop at `limit` items)
+   │
+   └── Return FeedResponse:
+         ├── items: MediaAssetResponse[] (up to `limit`)
+         ├── after: JSON-encoded per-subreddit cursors (opaque to frontend)
+         └── has_more: true if any worker has more pages AND limit was reached
 ```
 
 **Error handling**: The entire `search_reddit()` call is wrapped in try/except. On any exception, returns `FeedResponse(items=[], after=None, has_more=False)`.
@@ -399,9 +412,11 @@ The central service for queue and subreddit management.
 
 ### RedditClient (`app/services/reddit_client.py`)
 
-Fetches and validates media from Reddit. Contains two independent pipelines:
+Fetches and validates media from Reddit. Contains two pipelines:
 one for **feed fetching** (`fetch_subreddit_media` → `_fetch_oauth`) and one
-for **live search** (`search_reddit` → `_accumulate_search` / `_search_local_multi`).
+for **live search** (`_accumulate_search` → `_search_oauth`). The sequential
+`search_reddit` / `_search_local_multi` methods are superseded by
+`SearchCoordinator` (see below) but retained for backward compatibility.
 
 #### Feed Fetching
 
@@ -416,24 +431,11 @@ from a single subreddit for the queue/background refresh pipeline, using
 
 `_fetch_redlib` is a **stub** — returns `[], None`.
 
-#### Live Reddit Search (v4.1)
-
-Three-tier architecture that replaced the original single-page search:
+#### Live Search Accumulation (used by SearchCoordinator)
 
 ```
-search_reddit()
-  │
-  ├── Local mode + subreddits present:
-  │     └── _search_local_multi(query, subreddits, target_results, after)
-  │           ├── for each subreddit:
-  │           │     └── _accumulate_search(query, [subreddit], mode="local")
-  │           │           └── _search_oauth() → page loop up to 20 pages
-  │           ├── merge all results
-  │           └── deduplicate by post "id"
-  │
-  └── Global mode (or no subreddits):
-        └── _accumulate_search(query, subreddits, mode="global")
-              └── _search_oauth() → page loop up to 20 pages
+_accumulate_search(query, subreddits, mode, target_results, after)
+  └── _search_oauth() → page loop up to 20 pages
 ```
 
 **Constants:**
@@ -447,20 +449,99 @@ search_reddit()
 
 | Method | Purpose |
 |--------|---------|
-| `search_reddit(query, limit, after, subreddits, mode)` | Entry point. Delegates to `_search_local_multi` (local) or `_accumulate_search` (global). Returns `(list[dict], cursor)` |
-| `_search_local_multi(query, subreddits, target_results, after)` | Iterates subreddits individually, calls `_accumulate_search` per subreddit, merges, deduplicates by `id`. Accepts `after` parameter but cursor is always returned as `None`, preventing incremental pagination. Budget: `SEARCH_TIME_BUDGET_SECONDS × 1.5`. Returns `(merged_list, None)` |
-| `_accumulate_search(query, subreddits, mode, target_results)` | Accumulation loop: fetches pages of 25 via `_search_oauth` until target reached, pages exhausted, or time budget exceeded. Returns `(results, last_cursor, SearchAuditResult)` |
+| `_accumulate_search(query, subreddits, mode, target_results, after=None)` | Accumulation loop for ONE subreddit. Fetches pages of 25 via `_search_oauth` until target reached, pages exhausted, or time budget exceeded. Accepts optional `after` cursor for pagination resumption. Returns `(results, last_cursor, SearchAuditResult)` |
 | `_search_oauth(query, limit, after, subreddits, mode)` | Single Reddit OAuth search HTTP request. Builds URL (`r/sub/search` for local, `search` for global). Adds `restrict_sr=on` + `include_over_18=on` for local mode. Returns raw post dicts |
-
-**Why per-subreddit search for local mode?** Reddit's OAuth API returns 0
-children for multi-subreddit restricted searches
-(`r/sub1+sub2/search?restrict_sr=on&q=...`) even when individual subreddits
-contain many matching posts. `_search_local_multi` works around this by
-searching each subreddit separately and deduplicating the merged results.
 
 **`SearchAuditResult`** — Dataclass used during accumulation to track:
 `raw_posts`, `text_posts_removed`, `non_media_removed`,
 `subreddit_filtered`, `kept`, `images`, `galleries`, `videos`.
+
+### SearchCoordinator (`app/services/search_coordinator.py`)
+
+Replaces the sequential `_search_local_multi` with parallel bounded-concurrency
+workers. Introduced in Phase 6.1 to eliminate the subreddit-search bottleneck.
+
+**Architecture:**
+
+```
+SearchCoordinator.execute(query, mode, limit, subreddits, after)
+  │
+  ├── Local mode + subreddits present:
+  │     └── _run_workers(query, subreddits, target, after_cursors, metrics)
+  │           ├── asyncio.Semaphore(concurrency=5)  ← bounded parallelism
+  │           ├── Per-subreddit worker coroutines:
+  │           │     └── RedditClient._accumulate_search(subreddit, after=cursor)
+  │           │           └── _search_oauth() → multi-page accumulation
+  │           ├── asyncio.gather(return_exceptions=True)
+  │           └── Failed workers → empty result (does not block others)
+  │
+  └── Global mode (no subreddits):
+        └── _run_global_worker()
+              └── RedditClient._accumulate_search(mode="global")
+
+  ├── _aggregate_and_dedup(worker_results)
+  │     ├── Merge all worker items
+  │     ├── Deduplicate by post "id" (first occurrence wins)
+  │     └── Sort by created_utc DESC
+  │
+  ├── _parse_to_response(deduped, limit)
+  │     ├── _parse_post() → MediaAsset
+  │     ├── validate_media() + _validate_search_asset() → filter
+  │     └── → MediaAssetResponse (stop at limit)
+  │
+  └── Returns (items, after, has_more, metrics)
+        ├── after = JSON-encoded per-subreddit cursors
+        └── has_more = any worker had_more AND we hit the limit
+```
+
+**Key design decisions:**
+- **Bounded concurrency**: Default 5 parallel workers via `asyncio.Semaphore`. Workers waiting on the semaphore queue up naturally. No unlimited parallelism.
+- **Per-subreddit pagination**: Each worker tracks its own Reddit `after` cursor. Cursors are serialized to a JSON-encoded string in the opaque `after` field returned to the frontend. On `loadMore`, the JSON is decoded and each worker resumes from its own cursor.
+- **Centralized deduplication**: Workers return raw items without deduplicating. The aggregator deduplicates by Reddit `id` field across all workers, with first occurrence winning (preserving highest-quality metadata from earlier-arriving results).
+- **Worker isolation**: Failed workers (network error, rate limit) return empty results and do not block or abort sibling workers.
+- **Metrics**: `SearchMetrics` dataclass captures start/end time, per-worker latency, Reddit request count, aggregation latency, and dedup counts. Logged at request completion.
+- **No frontend changes**: The response shape (`FeedResponse` with `items`, `after`, `has_more`) is unchanged. `after` was always opaque to the frontend — now it's JSON-encoded per-subreddit cursors instead of a single Reddit cursor.
+
+**Key classes:**
+
+| Class / Function | Purpose |
+|---|---|
+| `SearchCoordinator` | Orchestrator — manages worker creation, concurrency semaphore, aggregation, dedup, pagination, metrics |
+| `SubredditWorkerResult` | Per-worker result dataclass: subreddit, items, after_cursor, had_more, elapsed, pages_scanned |
+| `SearchMetrics` | Dataclass: start/end time, workers launched/completed/failed, raw/dedup counts, aggregation elapsed, per-subreddit latency, total Reddit requests |
+| `DEFAULT_CONCURRENCY` | 5 (configurable at construction) |
+| `_after_to_cursors()` / `_cursors_to_after()` | Encode/decode per-subreddit pagination cursors to/from opaque JSON string |
+
+**How the `after` cursor encoding works:**
+
+```
+Frontend sends:  after = "{\"pics\":\"t3_abc\",\"itookapicture\":\"t3_def\"}"
+                                 │
+                    _after_to_cursors() → {"pics": "t3_abc", "itookapicture": "t3_def"}
+                                 │
+                    Each worker resumes from its own cursor
+                                 │
+                    _cursors_to_after() → "{\"pics\":\"t3_ghi\",\"itookapicture\":\"t3_jkl\"}"
+                                 │
+Frontend receives: after = "{\"pics\":\"t3_ghi\",\"itookapicture\":\"t3_jkl\"}"
+                                 │
+               Sends it back verbatim on next loadMore
+```
+
+**Why parallel workers?** With 5 subreddits and 5s budget each, the old
+sequential code took 25s total (5s × 5). With 5 parallel workers, total time
+drops to ~5s (all run concurrently). The semaphore prevents overwhelming the
+Reddit API (no more than 5 concurrent requests).
+
+**`SubredditWorkerResult`** — Dataclass used during accumulation:
+`subreddit`, `items` (raw dicts), `after_cursor`, `had_more`,
+`elapsed`, `pages_scanned`.
+
+**`SearchMetrics`** — Dataclass:
+`start_time`, `end_time`, `total_elapsed`, `workers_launched`,
+`workers_completed`, `workers_failed`, `total_raw_items`,
+`total_after_dedup`, `aggregation_elapsed`, `per_subreddit` (dict),
+`total_reddit_requests`.
 
 #### Media URL Extraction Logic
 
@@ -904,7 +985,7 @@ if added == 0 and new_cursor is None:
 `search.py` — Entire search wrapped in try/except:
 ```python
 try:
-    items, new_after = await client.search_reddit(...)
+    items, new_after, has_more, metrics = await coordinator.execute(...)
 except Exception as e:
     print(f"[SEARCH_ERROR] query={q} error={e}")
     return FeedResponse(items=[], after=None, has_more=False)
@@ -921,10 +1002,75 @@ except Exception as e:
 5. **No CASCADE DELETE** — `media_queue` and `gallery_items` rows for deleted `media_assets` must be cleaned up manually
 6. **Cleanup only prunes `media_queue`** — `media_assets` and `gallery_items` are not auto-cleaned beyond 30 days
 7. **OAuth token has no public setup endpoint** — must be configured via `.env` before first startup
-8. **Local search budget is 1.5× global budget** — `_search_local_multi` uses `SEARCH_TIME_BUDGET_SECONDS × 1.5` to accommodate N subreddits, which may still time out if many subreddits are selected
-9. **`_search_local_multi` ignores incoming `after` cursor** — each call starts fresh; cursor is always returned as `None`, preventing incremental pagination for local search
-10. **OAuth initialized multiple times** — startup lifespan, BackgroundRefreshService, and every API call all create separate `OAuthManager` instances calling `initialize()`
-11. **Global instances not shared with routers** — the `oauth_manager` and `background_service` globals in `app/main.py` are never passed to API endpoints; each request creates fresh instances
-12. **`praw` dependency unused** — `praw>=7.8.0` is in `requirements.txt` but no code imports it
-13. **`media_queue`-based feed is deprecated** — `get_queue_items()`, `manage_queue()`, `_refill_queue()` are stubs marked for future removal. The slideshow exclusively uses `get_subreddit_assets()` cursor-based pagination
-14. **Multi-subreddit merging is Flutter-only** — the backend returns 400 for multi-subreddit requests, putting all merge complexity on the client
+8. **OAuth initialized multiple times** — startup lifespan, BackgroundRefreshService, and every API call all create separate `OAuthManager` instances calling `initialize()`
+9. **Global instances not shared with routers** — the `oauth_manager` and `background_service` globals in `app/main.py` are never passed to API endpoints; each request creates fresh instances
+10. **`praw` dependency unused** — `praw>=7.8.0` is in `requirements.txt` but no code imports it
+11. **`media_queue`-based feed is deprecated** — `get_queue_items()`, `manage_queue()`, `_refill_queue()` are stubs marked for future removal. The slideshow exclusively uses `get_subreddit_assets()` cursor-based pagination
+12. **Multi-subreddit merging is Flutter-only** — the backend returns 400 for multi-subreddit requests, putting all merge complexity on the client
+13. **Search worker failures are silent** — a subreddit worker that errors out (network, rate limit) returns empty results. This is logged but not surfaced to the frontend.
+14. **No global rate limiting for parallel workers** — with 5 concurrent workers each making up to 20 Reddit requests, a single search could generate 100+ Reddit API calls in a few seconds.
+15. **`after` cursor encoding changes format** — the `after` field changed from a single Reddit cursor (`t3_xxxxx`) to a JSON-encoded dict. This is backward-compatible because the frontend treats `after` as opaque, but any client that parsed the old format would break.
+16. **No connection pooling** — each `_search_oauth` call creates a new `httpx.AsyncClient()`, losing HTTP connection reuse benefits.
+
+## Phase 6.0 — Backend Stability & Correctness
+
+### Objective
+
+Make the backend **production-safe** before making it faster. Zero API changes, zero feature additions. Internal correctness improvements only.
+
+### Issues Fixed
+
+| # | Issue | Severity | File Changes | Root Cause & Fix |
+|---|-------|----------|-------------|-----------------|
+| 1 | **VideoPreparationService completer leak** | **Critical** — callers awaiting `prepare()` never resolve | `lib/features/slideshow/domain/video_preparation_service.dart` | `_initController()` created a new `Completer`, overwriting the one from `prepare()`. The original completer (whose future was returned to the caller) was orphaned and never completed. Fix: `entry.completer ??= Completer()` — reuses the existing completer. |
+| 2 | **OAuth token refresh race condition** | **High** — concurrent requests can trigger 5+ simultaneous refreshes | `backend/app/managers/oauth.py` | `get_valid_token()` had no synchronization. Multiple concurrent callers checking an expiring token would all call `refresh_token()` simultaneously, overwriting each other's results. Fix: wrap refresh logic in `asyncio.Lock()` so only one refresh occurs at a time; concurrent callers reuse the refreshed token. |
+| 3 | **Database transaction safety** | **Medium** — `cleanup_old_assets()` left orphaned `gallery_items` and `media_queue` rows | `backend/app/services/queue_manager.py` | `cleanup_old_assets()` only deleted from `media_assets`. `gallery_items` and `media_queue` rows became orphaned. Fix: cascade deletes for gallery_items and media_queue before pruning assets, all within a single transaction. |
+| 4 | **Video controller synchronization** | **Low** — combined with Issue 1 fix | same as Issue 1 | The completer leak (Issue 1) was the only synchronization defect. All other controller lifecycle operations are consistent. |
+| 5 | **Dead code removal** | **Low** — no runtime impact | `backend/app/services/queue_manager.py`, `backend/app/services/reddit_client.py`, `backend/app/managers/oauth.py` | Removed: `_search_local_multi()` and `search_reddit()` (superseded by SearchCoordinator), `manage_queue()`, `_refill_queue()`, `_trim_queue()`, `remove_from_queue()`, `clear_queue()` (unused stubs), `QUEUE_MAX`, `QUEUE_MIN`, `QUEUE_EMERGENCY` (unused constants), `_initialized` field (set but never read), `_refresh_task` field (declared but never used). |
+| 6 | **Error handling improvements** | **Medium** — silent failures in `add_to_queue` and background jobs | `backend/app/services/queue_manager.py`, `backend/app/services/background_service.py` | `add_to_queue` had a bare `except Exception: return False` that swallowed all errors silently. Background job error logging used minimal messages without context. Fix: added `traceback.format_exc()` logging with asset/subreddit context. |
+| 7 | **Resource cleanup** | **Low** — httpx clients already self-cleaning via `async with` | No changes needed | All `httpx.AsyncClient` instances were already managed via `async with` context managers, ensuring proper cleanup. |
+| 8 | **Thread safety — ProviderManager** | **Medium** — `_failure_count` and `_cooldown_until` mutated by concurrent requests | `backend/app/managers/provider.py` | `get_healthy_provider()`, `record_provider_success()`, and `record_provider_failure()` all mutated shared state without synchronization. Fix: wrap all mutable operations in `asyncio.Lock()`. |
+
+### Validation
+
+| Check | Status |
+|-------|--------|
+| Backend test suite (38 tests) | ✅ All pass |
+| Python compile check (all modified files) | ✅ Clean |
+| Flutter analyzer (video_preparation_service.dart) | ✅ No issues found |
+| Dart analyzer | ✅ No issues found |
+| API contract changes | ✅ None |
+
+### Regression Report
+
+| Area | Status |
+|------|--------|
+| API unchanged | ✅ |
+| Search behavior unchanged | ✅ |
+| Pagination unchanged | ✅ |
+| Response formats unchanged | ✅ |
+| Slideshow unaffected | ✅ |
+| Frontend compatibility | ✅ Fully maintained |
+| Existing test pass rate | ✅ 38/38 |
+
+### Remaining Technical Debt
+
+The following are intentionally deferred for later optimization phases (not Phase 6.0):
+
+- **Connection pooling** (Phase 6.1) — Share a single `httpx.AsyncClient` across the app
+- **Query-level caching** (Phase 6.2) — In-memory TTL cache for Reddit API responses
+- **Parallel background refill** (Phase 6.3) — Replace single-subreddit-per-tick with concurrent refill
+- **Streaming search** (Phase 6.4) — SSE-based incremental result delivery
+- **Cancellation / rate limiting** (Phase 6.5) — `asyncio.CancelledError` propagation + Reddit rate-limit awareness
+- **`fetch_and_store` atomicity** — Currently commits each asset individually in a loop; full atomicity would require a larger refactor
+- **`_fetch_redlib` stub** — Fallback provider is unimplemented (returns empty); only impacts when OAuth is down
+
+### Audit Reference
+
+See `phase_6_0_audit.md` for the pre-stabilization architectural audit: 10 bottlenecks ranked by impact, complete architecture diagrams, concurrency analysis, pagination review, search pipeline timing breakdown, target architecture proposal, and risk/compatibility assessment for future optimization phases.
+
+**Key audit findings (pre-stabilization):**
+- #1 bottleneck: within-worker sequential page accumulation (adds 5-15s per search)
+- #2 bottleneck: no streaming (perceived latency = max worker time, not min)
+- Highest ROI: connection pooling + response cache — low risk, 10-30s elimination
+- Biggest UX win: streaming — first paint at 2-3s instead of 10-15s, but requires frontend SSE support

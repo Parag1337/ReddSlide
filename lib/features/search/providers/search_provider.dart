@@ -5,6 +5,7 @@ import '../../../core/errors/app_error.dart';
 import '../../../core/constants/app_constants.dart';
 import '../../feed/domain/media_asset.dart';
 import '../../settings/providers/settings_provider.dart';
+import '../../slideshow/domain/metrics_collector.dart';
 import '../../slideshow/domain/slideshow_source.dart';
 import '../data/search_repository.dart';
 
@@ -99,11 +100,13 @@ class SearchState {
 class SearchNotifier extends StateNotifier<SearchState> {
   final SearchRepository _searchRepository;
   final Ref _ref;
+  final MetricsCollector metrics;
 
   SearchNotifier({
     required this._searchRepository,
     required Ref ref,
   })  : _ref = ref,
+        metrics = MetricsCollector(),
         super(SearchState(
           selectedSubreddits: ref.read(settingsProvider).valueOrNull?.subreddits ?? [],
         ));
@@ -149,6 +152,12 @@ class SearchNotifier extends StateNotifier<SearchState> {
       return;
     }
 
+    metrics.recordEvent(MetricEventType.searchRequested, data: {
+      'query': query,
+      'mode': state.mode.name,
+      'subreddits': state.selectedSubreddits.length,
+    });
+
     syncSelectedSubreddits();
 
     state = state.copyWith(
@@ -172,6 +181,12 @@ class SearchNotifier extends StateNotifier<SearchState> {
       (data) {
         _trace('search results', data.items, cursor: data.after, hasMore: data.hasMore);
 
+        metrics.recordEvent(MetricEventType.searchResponseReceived, data: {
+          'resultCount': data.items.length,
+          'hasMore': data.hasMore,
+          'cursor': data.after,
+        });
+
         state = state.copyWith(
           results: data.items,
           isLoading: false,
@@ -183,6 +198,10 @@ class SearchNotifier extends StateNotifier<SearchState> {
         _addRecentQuery(query);
       },
       (error) {
+        metrics.recordEvent(MetricEventType.searchResponseReceived, data: {
+          'error': error.toString(),
+        });
+
         state = state.copyWith(isLoading: false, error: error);
       },
     );
@@ -252,6 +271,12 @@ class SearchNotifier extends StateNotifier<SearchState> {
 
   void resetFilters() {
     state = state.copyWith(mediaType: null, sort: null);
+  }
+
+  @override
+  void dispose() {
+    metrics.dispose();
+    super.dispose();
   }
 }
 
