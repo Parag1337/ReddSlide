@@ -72,10 +72,10 @@ class QueueManager:
                             )
                         )
                 
-                position = await self._get_next_position(db)
                 await db.execute(
-                    "INSERT INTO media_queue (reddit_post_id, position, added_at) VALUES (?, ?, ?)",
-                    (asset.reddit_id, position, int(time.time()))
+                    """INSERT INTO media_queue (reddit_post_id, position, added_at)
+                       SELECT ?, COALESCE(MAX(position), 0) + 1, ? FROM media_queue""",
+                    (asset.reddit_id, int(time.time()))
                 )
                 
                 await db.commit()
@@ -93,12 +93,6 @@ class QueueManager:
             .replace("external-i.redd.it", "i.redd.it")
         )
 
-    async def _get_next_position(self, db) -> int:
-        """Get next position for queue item."""
-        cursor = await db.execute("SELECT MAX(position) as max_pos FROM media_queue")
-        row = await cursor.fetchone()
-        return (row["max_pos"] or 0) + 1
-    
     async def get_queue_items(self, limit: int = 20, offset: int = 0, subreddits: Optional[list[str]] = None) -> tuple[list[dict], bool]:
         """DEPRECATED: No longer used by slideshow. Will be removed in future."""
         async with get_db() as db:
@@ -446,7 +440,7 @@ class QueueManager:
             # Remove orphaned media_queue entries for old assets
             await db.execute(
                 """DELETE FROM media_queue WHERE reddit_post_id IN (
-                    SELECT id FROM media_assets WHERE created_at < ?
+                    SELECT reddit_id FROM media_assets WHERE created_at < ?
                 )""",
                 (cutoff,)
             )

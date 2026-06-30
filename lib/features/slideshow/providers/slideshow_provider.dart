@@ -5,6 +5,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../../../core/constants/app_constants.dart';
+import '../../../core/debug/trace.dart';
 import '../../../core/display_quality/display_quality_mode.dart';
 import '../../../core/media/media_source.dart';
 import '../../feed/data/feed_repository.dart';
@@ -84,6 +85,7 @@ class SlideshowNotifier extends StateNotifier<SlideshowState> {
 
   void _onReadinessChanged() {
     _preparationRevision++;
+    Trace.t('Notifier._onReadinessChanged', ['revision', _preparationRevision]);
     _syncState();
   }
 
@@ -182,26 +184,11 @@ class SlideshowNotifier extends StateNotifier<SlideshowState> {
     _slideshowIntervalSeconds = seconds;
   }
 
-  void debugDump() {
-    debugPrint('[DEBUG_DUMP] items.length=${state.items.length} isLoading=${state.isLoading}');
-    debugPrint('[DEBUG_DUMP] hasMorePages=${state.hasMorePages} currentIndex=${state.currentIndex}');
-    debugPrint('[DEBUG_DUMP] _playlist.items=${_playlist.items.length} currentIndex=${_playlist.currentIndex}');
-    final engine = _mergeEngine;
-    if (engine != null) {
-      debugPrint('[DEBUG_DUMP] MergeEngine buffers=${engine.buffers.length} '
-          'merged=${engine.merged.length} hasMoreSources=${engine.hasMoreSources}');
-      for (int i = 0; i < engine.buffers.length; i++) {
-        final b = engine.buffers[i];
-        debugPrint('[DEBUG_DUMP]   buffer[$i] items=${b.items.length} '
-            'remaining=${b.remainingCount} hasMore=${b.hasMore} isLoading=${b.isLoading}');
-      }
-    }
-  }
-
   Future<void> next({int eid = -1}) async {
     if (_playlist.isEmpty) return;
     if (_isNavigating) return;
     _isNavigating = true;
+    Trace.t('Notifier.next', ['from', state.currentIndex, 'to', state.currentIndex + 1]);
     try {
       metrics.recordEvent(MetricEventType.slideshowSwipeNext, data: {'eid': eid});
 
@@ -234,6 +221,7 @@ class SlideshowNotifier extends StateNotifier<SlideshowState> {
     if (_playlist.isEmpty) return;
     if (_isNavigating) return;
     _isNavigating = true;
+    Trace.t('Notifier.previous', ['from', state.currentIndex, 'to', state.currentIndex - 1]);
     try {
       metrics.recordEvent(MetricEventType.slideshowSwipePrevious, data: {'eid': eid});
       if (_playlist.previous() != null) {
@@ -250,6 +238,7 @@ class SlideshowNotifier extends StateNotifier<SlideshowState> {
     if (index < 0 || index >= _playlist.length) return;
     if (_isNavigating) return;
     _isNavigating = true;
+    Trace.t('Notifier.jumpTo', ['from', state.currentIndex, 'to', index]);
     try {
       metrics.recordEvent(MetricEventType.slideshowSwipeJump, data: {'index': index});
       _playlist.jumpTo(index);
@@ -305,11 +294,13 @@ class SlideshowNotifier extends StateNotifier<SlideshowState> {
     if (_isNavigating) return;
     final asset = _playlist.current;
     if (asset == null) return;
+    Trace.t('Notifier.galleryNext', ['index', state.currentIndex, 'gallerySub', state.gallerySubIndex]);
 
     if (asset.isGallery && asset.galleryUrls != null && asset.galleryUrls!.isNotEmpty) {
       final maxIndex = asset.galleryUrls!.length - 1;
       if (state.gallerySubIndex < maxIndex) {
         state = state.copyWith(gallerySubIndex: state.gallerySubIndex + 1);
+        Trace.t('Notifier.galleryNext.advance', ['subIndex', state.gallerySubIndex]);
         _restartAutoAdvance();
         return;
       }
@@ -337,9 +328,12 @@ class SlideshowNotifier extends StateNotifier<SlideshowState> {
     if (state.isLoadingMore || _mergeEngine == null) return;
     metrics.recordEvent(MetricEventType.paginationTriggered);
     state = state.copyWith(isLoadingMore: true);
-    _inFlightLoadMore = _doLoadMore();
-    await _inFlightLoadMore;
-    _inFlightLoadMore = null;
+    try {
+      _inFlightLoadMore = _doLoadMore();
+      await _inFlightLoadMore;
+    } finally {
+      _inFlightLoadMore = null;
+    }
   }
 
   Future<void> _doLoadMore() async {
@@ -347,25 +341,30 @@ class SlideshowNotifier extends StateNotifier<SlideshowState> {
     if (engine == null) return;
     final beforeCount = _playlist.length;
 
-    await engine.autoRefill();
-    final newItems = engine.drainMerged();
-    final hasMore = engine.hasMoreSources;
+    try {
+      await engine.autoRefill();
+      final newItems = engine.drainMerged();
+      final hasMore = engine.hasMoreSources;
 
-    metrics.recordEvent(MetricEventType.paginationCompleted, data: {
-      'appended': newItems.length,
-      'hasMore': hasMore,
-    });
-    if (newItems.isEmpty && !hasMore) {
-      metrics.recordEvent(MetricEventType.playlistStarvation);
+      metrics.recordEvent(MetricEventType.paginationCompleted, data: {
+        'appended': newItems.length,
+        'hasMore': hasMore,
+      });
+      if (newItems.isEmpty && !hasMore) {
+        metrics.recordEvent(MetricEventType.playlistStarvation);
+      }
+      log('[LOAD_MORE] before=$beforeCount appended=${newItems.length} hasMore=$hasMore');
+
+      _playlist.append(newItems);
+      state = state.copyWith(
+        items: _playlist.items,
+        isLoadingMore: false,
+        hasMorePages: newItems.isNotEmpty || hasMore,
+      );
+    } catch (e) {
+      log('[LOAD_MORE] error=$e');
+      state = state.copyWith(isLoadingMore: false);
     }
-    log('[LOAD_MORE] before=$beforeCount appended=${newItems.length} hasMore=$hasMore');
-
-    _playlist.append(newItems);
-    state = state.copyWith(
-      items: _playlist.items,
-      isLoadingMore: false,
-      hasMorePages: newItems.isNotEmpty || hasMore,
-    );
   }
 
   void _syncState() {
@@ -375,9 +374,11 @@ class SlideshowNotifier extends StateNotifier<SlideshowState> {
       gallerySubIndex: _playlist.currentIndex != state.currentIndex ? 0 : state.gallerySubIndex,
       preparationRevision: _preparationRevision,
     );
+    Trace.t('Notifier._syncState', ['index', _playlist.currentIndex, 'items', _playlist.length, 'revision', _preparationRevision]);
   }
 
   void _notifyPreloader() {
+    Trace.t('Notifier._notifyPreloader', ['index', _playlist.currentIndex]);
     _preparationEngine?.onIndexChanged(
       _playlist.currentIndex,
       galleryIndex: state.gallerySubIndex,
@@ -387,9 +388,13 @@ class SlideshowNotifier extends StateNotifier<SlideshowState> {
   void _startAutoAdvance() {
     _cancelAutoAdvance();
     if (!state.isPlaying) return;
+    Trace.t('Notifier._startAutoAdvance', ['interval', _slideshowIntervalSeconds]);
     _autoAdvanceTimer = Timer(
       Duration(seconds: _slideshowIntervalSeconds),
-      () => galleryNext(),
+      () {
+        Trace.t('Notifier.autoAdvanceTimer.fire', ['index', state.currentIndex]);
+        galleryNext();
+      },
     );
   }
 
@@ -421,6 +426,7 @@ class SlideshowNotifier extends StateNotifier<SlideshowState> {
 
   @override
   void dispose() {
+    Trace.t('Notifier.dispose', ['revision', _preparationRevision]);
     _cancelAutoAdvance();
     _cancelOverlayTimer();
     _preparationEngine?.dispose();

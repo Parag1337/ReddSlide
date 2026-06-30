@@ -140,12 +140,14 @@ backend/
 │   │   ├── queue_manager.py         # QueueManager — queue CRUD, search, subreddit config, cursors
 │   │   ├── reddit_client.py         # RedditClient — fetch/parse media from Reddit API
 │   │   ├── search_coordinator.py    # SearchCoordinator — parallel search with bounded concurrency
+│   │   ├── search_session.py        # SearchSessionManager — progressive search session lifecycle
 │   │   └── background_service.py    # BackgroundRefreshService — APScheduler jobs
 │   └── api/
 │       ├── __init__.py              # Imports feed, debug, search routers
-│       ├── feed.py                  # /api/feed, /api/media*, /api/subreddits*, /api/search*
-│       ├── search.py                # /api/search/reddit (direct Reddit search)
-│       └── debug.py                 # /api/health, /api/debug/*
+│       ├── feed.py                  # /api/feed, /api/media*, /api/subreddits*, /api/search*, /api/search/debug
+│       ├── search.py                # /api/search/reddit, /api/search/reddit/progressive, /api/search/reddit/poll
+│       ├── debug.py                 # /api/health, /api/debug/*
+│       └── dependencies.py          # FastAPI Depends: get_oauth_manager, get_provider_manager
 ├── data/
 │   └── redslide.db                  # SQLite database (auto-created)
 ├── .env                             # Environment variables (not committed)
@@ -194,6 +196,8 @@ The server starts via `backend/main.py`, which runs `uvicorn` on `app.main:app`.
    └── BackgroundRefreshService.stop() → scheduler.shutdown()
 ```
 
+**Rate limiting middleware**: `app/main.py` registers a `SlidingWindowRateLimiter` (60 requests per 60s window per client IP) as an HTTP middleware. Clients exceeding the limit receive HTTP 429. Inactive clients are pruned periodically when the tracking dict exceeds 1000 entries.
+
 **Critical startup behavior**: The backend does NOT seed any default subreddits. It does NOT fetch any Reddit content on startup. It waits for the Flutter client to call `POST /api/subreddits/sync` with the user's subscribed subreddits. This is the **client-driven subreddit management** model.
 
 ---
@@ -209,6 +213,8 @@ The server starts via `backend/main.py`, which runs `uvicorn` on `app.main:app`.
 | GET | `/api/search` | FTS5 full-text search | `q` (required), `limit`, `page`, `subreddits`, `media_type`, `sort` |
 | GET | `/api/search/debug` | LIKE-based search fallback | `q` (required) |
 | GET | `/api/search/reddit` | Live Reddit search (no cache) | `q`, `mode` (global/local), `limit`, `after`, `subreddits` |
+| GET | `/api/search/reddit/progressive` | Progressive Reddit search (returns first batch immediately, background continues) | `q`, `mode` (global/local), `limit`, `after`, `subreddits` |
+| GET | `/api/search/reddit/poll` | Poll progressive search session for next batch | `session` (session_id from progressive) |
 | GET | `/api/media/{id}` | Get single media asset | — |
 | POST | `/api/media/start/{id}` | Start slideshow placeholder | — |
 | POST | `/api/subreddits/sync` | Sync subreddit list | Body: `{"subreddits": [...]}` |
@@ -337,7 +343,8 @@ The feed endpoint uses cursor-based pagination on `media_assets` table. Multi-su
   "height": "integer|null",
   "duration": "integer|null",
   "created_utc": "integer|null",
-  "gallery_urls": "string[]|null"
+  "gallery_urls": "string[]|null",
+  "video_headers": "object|null"
 }
 
 // FeedResponse
@@ -355,6 +362,15 @@ The feed endpoint uses cursor-based pagination on `media_assets` table. Multi-su
   "total_results": "integer",
   "has_more": "boolean",
   "after": "string|null"
+}
+
+// ProgressiveSearchResponse
+{
+  "items": "MediaAssetResponse[]",
+  "has_more": "boolean",
+  "after": "string|null",
+  "session_id": "string|null",
+  "done": "boolean"
 }
 
 // HealthResponse
@@ -604,7 +620,7 @@ Runs on APScheduler with two periodic jobs. Creates its own `OAuthManager`,
 
 Manages Reddit OAuth token lifecycle.
 
-**Note on instance sharing:** The `OAuthManager` instance created during startup in `app/main.py` is not shared with API routers or the background service. Each endpoint that needs OAuth (e.g., `/api/search/reddit` in `search.py`, `QueueManager.fetch_and_store()` in `feed.py`, `BackgroundRefreshService` in `background_service.py`) creates its own fresh instances, loading the token from the database again.
+**Instance sharing:** The `OAuthManager` created during startup is stored in `app.state.oauth_manager` and injected into API routes via `dependencies.py` (`get_oauth_manager()` reads from `request.app.state`). The `BackgroundRefreshService` receives its own `OAuthManager` instance at construction (created during startup). API routers that need OAuth endpoints (e.g., `/api/search/reddit` in `search.py`, `/api/subreddits/sync`/`fetch` in `feed.py`) share the startup-managed instance via dependency injection.
 
 **Token acquisition flow:**
 1. On `initialize()`: Load token from `oauth_tokens` table
@@ -822,6 +838,7 @@ All models in `app/models/schemas.py`:
 | `FeedResponse` | Wrapper for feed/search results (`items`, `after`, `has_more`) |
 | `QueueResponse` | Queue status (`items`, `total`, `pending`) |
 | `SearchResponse` | Search results with `page`, `limit`, `total_results` |
+| `ProgressiveSearchResponse` | Progressive search response with `session_id`, `done` flag |
 | `SubredditConfig` | Subreddit configuration model |
 | `OAuthToken` | Token storage model |
 | `HealthResponse` | Health check response |
@@ -919,6 +936,24 @@ DATABASE_PATH=./data/redslide.db
 
 ---
 
+## Tests
+
+Located in `backend/tests/`:
+
+| File | Purpose |
+|------|---------|
+| `conftest.py` | Pytest fixtures and shared test setup |
+| `test_background_service.py` | Background refresh job behavior |
+| `test_benchmark_search.py` | Search coordinator performance benchmarks |
+| `test_cleanup.py` | Cleanup job and asset pruning |
+| `test_media_filter.py` | Media validation and filtering |
+| `test_oauth_injection.py` | OAuth token lifecycle and injection |
+| `test_search_coordinator.py` | Search coordinator execution and pagination |
+
+Run with: `cd backend && python -m pytest tests/ -v`
+
+---
+
 ## Deployment
 
 ### Docker
@@ -1006,21 +1041,19 @@ except Exception as e:
 ## Known Limitations
 
 1. **Redlib fallback is a stub** — `_fetch_redlib()` returns `[], None`
-2. **No rate limiting** — API is unprotected against abuse
-3. **SQLite single-instance** — not suitable for horizontal scaling (use PostgreSQL for production)
-4. **FTS5 token-level matching** — "city" won't match "cityscape" (use `/api/search/debug` for substring LIKE fallback)
-5. **No CASCADE DELETE** — `media_queue` and `gallery_items` rows for deleted `media_assets` must be cleaned up manually
-6. **Cleanup only prunes `media_queue`** — `media_assets` and `gallery_items` are not auto-cleaned beyond 30 days
-7. **OAuth token has no public setup endpoint** — must be configured via `.env` before first startup
-8. **OAuth initialized multiple times** — startup lifespan, BackgroundRefreshService, and every API call all create separate `OAuthManager` instances calling `initialize()`
-9. **Global instances not shared with routers** — the `oauth_manager` and `background_service` globals in `app/main.py` are never passed to API endpoints; each request creates fresh instances
-10. **`praw` dependency unused** — `praw>=7.8.0` is in `requirements.txt` but no code imports it
-11. **`media_queue`-based feed is deprecated** — `get_queue_items()`, `manage_queue()`, `_refill_queue()` are stubs marked for future removal. The slideshow exclusively uses `get_subreddit_assets()` cursor-based pagination
-12. **Multi-subreddit merging is Flutter-only** — the backend returns 400 for multi-subreddit requests, putting all merge complexity on the client
-13. **Search worker failures are silent** — a subreddit worker that errors out (network, rate limit) returns empty results. This is logged but not surfaced to the frontend.
-14. **Rate limiting is at page granularity, not subreddit granularity** — with the per-page semaphore (default 5), a single search across 20 subreddits generates up to 80 Reddit API calls. Peak concurrency (5 concurrent) is the same as before, but requests complete faster. Reddit's 60 req/min sustained limit may be exceeded during bursts; implement a token-bucket rate limiter if needed.
-15. **`after` cursor encoding changes format** — the `after` field changed from a single Reddit cursor (`t3_xxxxx`) to a JSON-encoded dict. This is backward-compatible because the frontend treats `after` as opaque, but any client that parsed the old format would break.
-16. **No connection pooling** — each `_search_oauth` call creates a new `httpx.AsyncClient()`, losing HTTP connection reuse benefits. Planned for Phase 6.1.2.
+2. **SQLite single-instance** — not suitable for horizontal scaling (use PostgreSQL for production)
+3. **FTS5 token-level matching** — "city" won't match "cityscape" (use `/api/search/debug` for substring LIKE fallback)
+4. **No CASCADE DELETE** — `media_queue` and `gallery_items` rows for deleted `media_assets` must be cleaned up manually
+5. **Cleanup only prunes `media_queue`** — `media_assets` and `gallery_items` are not auto-cleaned beyond 30 days
+6. **OAuth token has no public setup endpoint** — must be configured via `.env` before first startup
+7. **`praw` dependency unused** — `praw>=7.8.0` is in `requirements.txt` but no code imports it
+8. **`media_queue`-based feed is deprecated** — `get_queue_items()`, `manage_queue()`, `_refill_queue()` are stubs marked for future removal. The slideshow exclusively uses `get_subreddit_assets()` cursor-based pagination
+9. **Multi-subreddit merging is Flutter-only** — the backend returns 400 for multi-subreddit requests, putting all merge complexity on the client
+10. **Search worker failures are silent** — a subreddit worker that errors out (network, rate limit) returns empty results. This is logged but not surfaced to the frontend.
+11. **Rate limiting is at page granularity, not subreddit granularity** — with the per-page semaphore (default 5), a single search across 20 subreddits generates up to 80 Reddit API calls. Peak concurrency (5 concurrent) is the same as before, but requests complete faster. Reddit's 60 req/min sustained limit may be exceeded during bursts.
+12. **`after` cursor encoding changes format** — the `after` field changed from a single Reddit cursor (`t3_xxxxx`) to a JSON-encoded dict. This is backward-compatible because the frontend treats `after` as opaque, but any client that parsed the old format would break.
+13. **No connection pooling** — each `_search_oauth` call creates a new `httpx.AsyncClient()`, losing HTTP connection reuse benefits.
+14. **Client-side rate limiting only** — `app/main.py` has a `SlidingWindowRateLimiter` (60 req/min per IP) at the middleware level, but there is no coordinated rate limiting for Reddit API calls from the background service or search.
 
 ## Phase 6.0 — Backend Stability & Correctness
 

@@ -248,8 +248,8 @@ class AdaptivePreloader {
   Future<void> _executePreload(String url) async {
     log('[PRELOAD_START] url=$url active=$_inFlightPreloads');
     SlideProfiler.recordPreparingTimestamp(url, null); // TEMPORARY — Phase 7.2A
-    onUrlStarted?.call(url);
     try {
+      onUrlStarted?.call(url);
       metrics?.recordEvent(MetricEventType.imagePreparationStarted, data: {'url': url});
       SlideProfiler.recordDownloadStart(url); // TEMPORARY — Phase 7.2A
       await precacheImage(

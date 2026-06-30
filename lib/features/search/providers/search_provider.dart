@@ -5,7 +5,6 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../../../core/errors/app_error.dart';
 import '../../../core/constants/app_constants.dart';
 import '../../feed/domain/media_asset.dart';
-import '../../feed/data/feed_repository.dart';
 import '../../settings/providers/settings_provider.dart';
 import '../../slideshow/domain/metrics_collector.dart';
 import '../../slideshow/domain/slideshow_source.dart';

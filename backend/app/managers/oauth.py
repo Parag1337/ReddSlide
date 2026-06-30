@@ -187,7 +187,8 @@ class OAuthManager:
                                 await db.execute(
                                     """UPDATE oauth_tokens 
                                        SET access_token = ?, refresh_token = ?, expires_at = ?, 
-                                           last_refreshed = ?, success_count = success_count + 1, last_success = ?"""
+                                           last_refreshed = ?, success_count = success_count + 1, last_success = ?
+                                       WHERE id = (SELECT id FROM oauth_tokens LIMIT 1)"""
                                     ,
                                     (self._token, self._refresh_token_value or refresh_token, 
                                      current_time + data.get("expires_in", 3600), 

@@ -1,4 +1,3 @@
-import 'package:flutter/foundation.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../../../core/network/api_client.dart';
 import '../../../core/network/result.dart';
@@ -29,17 +28,10 @@ class FeedRepository {
     if (subreddits != null && subreddits.isNotEmpty) params['subreddits'] = subreddits;
     if (sort != null) params['sort'] = sort;
 
-    final queryString = params.entries.map((e) => '${e.key}=${e.value}').join('&');
-    debugPrint('[FeedRepository] GET ${_apiClient.baseUrl}${ApiConstants.feed}?$queryString');
-
     final result = await _apiClient.get(
       ApiConstants.feed,
       queryParameters: params,
       fromJson: (json) => FeedResponse.fromJson(json as Map<String, dynamic>),
-    );
-    result.when(
-      (data) => debugPrint('[REPOSITORY] returned=${data.items.length} hasMore=${data.hasMore} after=${data.after}'),
-      (e) => debugPrint('[REPOSITORY] error=$e'),
     );
     return result;
   }

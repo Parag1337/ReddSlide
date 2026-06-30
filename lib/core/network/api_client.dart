@@ -47,10 +47,6 @@ class ApiClient {
         queryParameters: queryParameters,
       );
 
-      final returnedItems = response.data is Map ? (response.data['items'] is List ? (response.data['items'] as List).length : -1) : -1;
-      final hasMoreVal = response.data is Map ? response.data['has_more'] : null;
-      debugPrint('[API CLIENT] GET $path status=${response.statusCode} returnedItems=$returnedItems hasMore=$hasMoreVal');
-
       if (response.statusCode == 200) {
         if (fromJson != null) {
           return Success(fromJson(response.data));

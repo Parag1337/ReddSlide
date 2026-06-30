@@ -1,4 +1,5 @@
 import '../../../core/display_quality/display_quality_mode.dart';
+import '../../../features/slideshow/domain/media_filter.dart';
 
 class SettingsModel {
   final String backendUrl;
@@ -8,6 +9,7 @@ class SettingsModel {
   final String defaultSortMode;
   final List<String> subreddits;
   final DisplayQualityMode displayQualityMode;
+  final MediaFilter mediaFilter;
 
   const SettingsModel({
     this.backendUrl = '',
@@ -17,6 +19,7 @@ class SettingsModel {
     this.defaultSortMode = 'hot',
     this.subreddits = const [],
     this.displayQualityMode = DisplayQualityMode.smart,
+    this.mediaFilter = MediaFilter.all,
   });
 
   SettingsModel copyWith({
@@ -27,6 +30,7 @@ class SettingsModel {
     String? defaultSortMode,
     List<String>? subreddits,
     DisplayQualityMode? displayQualityMode,
+    MediaFilter? mediaFilter,
   }) {
     return SettingsModel(
       backendUrl: backendUrl ?? this.backendUrl,
@@ -37,6 +41,7 @@ class SettingsModel {
       defaultSortMode: defaultSortMode ?? this.defaultSortMode,
       subreddits: subreddits ?? this.subreddits,
       displayQualityMode: displayQualityMode ?? this.displayQualityMode,
+      mediaFilter: mediaFilter ?? this.mediaFilter,
     );
   }
 
@@ -48,6 +53,7 @@ class SettingsModel {
         'defaultSortMode': defaultSortMode,
         'subreddits': subreddits,
         'displayQualityMode': displayQualityMode.toJson(),
+        'mediaFilter': mediaFilter.name,
       };
 
   factory SettingsModel.fromJson(Map<String, dynamic> json) => SettingsModel(
@@ -64,5 +70,6 @@ class SettingsModel {
         displayQualityMode: json['displayQualityMode'] != null
             ? DisplayQualityMode.fromJson(json['displayQualityMode'] as String)
             : DisplayQualityMode.smart,
+        mediaFilter: MediaFilter.fromQuery(json['mediaFilter'] as String?),
       );
 }

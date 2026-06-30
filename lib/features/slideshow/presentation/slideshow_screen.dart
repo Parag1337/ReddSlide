@@ -8,6 +8,7 @@ import 'package:dio/dio.dart';
 import 'package:url_launcher/url_launcher.dart';
 import 'package:share_plus/share_plus.dart';
 import '../../../core/constants/theme_constants.dart';
+import '../../../core/debug/trace.dart';
 import '../../../core/display_quality/display_quality_mode.dart';
 import '../../../core/extensions/context_extensions.dart';
 import '../../../core/media/media_error.dart';
@@ -48,8 +49,8 @@ class _SlideshowScreenState extends ConsumerState<SlideshowScreen> with WidgetsB
     _pageController = PageController(initialPage: widget.startIndex);
     WidgetsBinding.instance.addObserver(this);
     _setProfilerSource(); // TEMPORARY — Phase 7.2A
-    _logSource();
     Future.microtask(() {
+      if (!mounted) return;
       final notifier = ref.read(slideshowProvider(widget.source).notifier);
       final settings = ref.read(settingsProvider).valueOrNull;
 
@@ -92,19 +93,6 @@ class _SlideshowScreenState extends ConsumerState<SlideshowScreen> with WidgetsB
     );
   }
 
-  void _logSource() {
-    final desc = switch (widget.source) {
-      SubredditSource(:final subreddit) => 'SubredditSource(subreddit=$subreddit)',
-      MultiSubredditSource(:final subreddits, :final sortMode) =>
-        'MultiSubredditSource(subreddits=$subreddits, sort=$sortMode)',
-      GlobalFeedSource() => 'GlobalFeedSource()',
-      SearchSource(:final query) => 'SearchSource(query=$query)',
-      GroupSource(:final groupName, :final subreddits) =>
-        'GroupSource(group=$groupName, subreddits=$subreddits)',
-    };
-    debugPrint('[Slideshow] source=$desc');
-  }
-
   void _setProfilerSource() { // TEMPORARY — Phase 7.2A
     final tag = switch (widget.source) {
       SubredditSource() => 'subreddit',
@@ -118,6 +106,7 @@ class _SlideshowScreenState extends ConsumerState<SlideshowScreen> with WidgetsB
 
   @override
   void dispose() {
+    Trace.t('SlideshowScreen.dispose', ['pageController', _pageController.hasClients]);
     debugPrint(SlideProfiler.dumpReport()); // TEMPORARY — Phase 7.2A
     WidgetsBinding.instance.removeObserver(this);
     _pageController.dispose();
@@ -139,6 +128,7 @@ class _SlideshowScreenState extends ConsumerState<SlideshowScreen> with WidgetsB
   Widget build(BuildContext context) {
     final isLoading = ref.watch(slideshowProvider(widget.source).select((s) => s.isLoading));
     final itemsEmpty = ref.watch(slideshowProvider(widget.source).select((s) => s.items.isEmpty));
+    Trace.t('SlideshowScreen.build', ['isLoading', isLoading, 'itemsEmpty', itemsEmpty]);
 
     return Scaffold(
       backgroundColor: Colors.black,
@@ -154,6 +144,9 @@ class _SlideshowScreenState extends ConsumerState<SlideshowScreen> with WidgetsB
             isLoading: isLoading,
             itemsEmpty: itemsEmpty,
             onMediaError: _onMediaError,
+            onVideoCompleted: (url) {
+              ref.read(slideshowProvider(widget.source).notifier).galleryNext();
+            },
           ),
           Consumer(
             builder: (context, ref, _) {
@@ -232,6 +225,7 @@ class _SlideshowPageContent extends ConsumerStatefulWidget {
   final bool isLoading;
   final bool itemsEmpty;
   final void Function(MediaErrorType) onMediaError;
+  final void Function(String url)? onVideoCompleted;
 
   const _SlideshowPageContent({
     required this.source,
@@ -240,6 +234,7 @@ class _SlideshowPageContent extends ConsumerStatefulWidget {
     required this.isLoading,
     required this.itemsEmpty,
     required this.onMediaError,
+    this.onVideoCompleted,
   });
 
   @override
@@ -299,6 +294,12 @@ class _SlideshowPageContentState extends ConsumerState<_SlideshowPageContent> {
 
     _emitOpenedIfNeeded(notifier);
     SlideProfiler.recordPageViewBuild(); // TEMPORARY — Phase 7.2A
+    Trace.t('SlideshowPageContent.build', [
+      'revision', ref.watch(slideshowProvider(widget.source).select((s) => s.preparationRevision)),
+      'items', items.length,
+      'index', currentIndex,
+      'galleryIndex', gallerySubIndex,
+    ]);
 
     return PageView.builder(
       controller: widget.pageController,
@@ -312,6 +313,15 @@ class _SlideshowPageContentState extends ConsumerState<_SlideshowPageContent> {
           asset,
           galleryIndex: index == currentIndex ? gallerySubIndex : 0,
         );
+        Trace.t('PageView.itemBuilder', [
+          'page', index,
+          'assetId', asset.id,
+          'isVideo', asset.isVideo,
+          'handleState', handle.state.name,
+          'ctrl', '${handle.controller?.hashCode}',
+          'ctrlInit', '${handle.controller?.value.isInitialized}',
+          'failed', handle.preparationFailed,
+        ]);
         if (index == currentIndex && asset.id != _lastVisibleAssetId) {
           _lastVisibleAssetId = asset.id;
           _emitFirstRequestedIfNeeded(notifier, asset.id, index);
@@ -357,6 +367,7 @@ class _SlideshowPageContentState extends ConsumerState<_SlideshowPageContent> {
                   'url': url,
                 });
               },
+              onVideoCompleted: widget.onVideoCompleted,
             ),
           ),
         );

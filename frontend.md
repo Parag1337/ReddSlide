@@ -167,6 +167,11 @@ lib/
 │   │   ├── api_constants.dart             # API paths, timeouts, defaults
 │   │   ├── app_constants.dart             # Preload config, pagination, merge engine params
 │   │   └── theme_constants.dart           # Spacing, radius, duration, colors
+│   ├── debug/
+│   │   └── trace.dart                     # Structured trace logging (VT format)
+│   ├── display_quality/
+│   │   ├── display_quality_mode.dart      # DisplayQualityMode enum (smart/original/auto)
+│   │   └── image_decode_policy.dart       # ImageDecodePolicy + DecodeSize
 │   ├── errors/
 │   │   └── app_error.dart                 # Sealed error hierarchy
 │   ├── extensions/
@@ -226,21 +231,38 @@ lib/
 │       │   ├── search_media_source.dart   # SearchMediaSource — wraps search as MediaSource
 │       │   └── subreddit_media_source.dart # SubredditMediaSource — wraps feed as MediaSource
 │       ├── domain/
-│   │   ├── adaptive_preloader.dart    # Priority-queue image preloader (internal to MPE)
-│   │   ├── media_preparation_engine.dart # Preparation layer gateway (Phase 5.2)
-│   │   ├── merge_engine.dart          # Multi-subreddit merge engine
-│   │   ├── playlist_manager.dart      # Item list + index management
-│       │   ├── slideshow_source.dart      # Sealed source types + SlideshowRouteExtra
-│       │   └── slideshow_state.dart       # SlideshowState
+│       │   ├── adaptive_preloader.dart             # Priority-queue image preloader
+│       │   ├── adaptive_preloader_scheduler.dart   # Wraps AdaptivePreloader as PreparationScheduler
+│       │   ├── demand_calculator.dart              # Computes readiness need count
+│       │   ├── media_filter.dart                   # MediaFilter enum (all/images/videos)
+│       │   ├── media_preparation_engine.dart       # Preparation layer gateway (Phase 5.2)
+│       │   ├── merge_engine.dart                   # Multi-subreddit merge engine
+│       │   ├── metrics_collector.dart              # In-memory metrics (32 event types)
+│       │   ├── playlist_manager.dart               # Item list + index management
+│       │   ├── preparation_policy.dart             # DecodedAhead/Behind policy config
+│       │   ├── preparation_scheduler.dart          # Abstract interface for schedulers
+│       │   ├── prepared_media_handle.dart          # PreparedMediaHandle + MediaState enum
+│       │   ├── readiness_state.dart                # ReadinessState enum (ready/likelyReady/unavailable)
+│       │   ├── scheduler_mode.dart                 # SchedulerMode selection (adaptive/viewport)
+│       │   ├── scheduler_task.dart                 # SchedulerTask model
+│       │   ├── shadow_scheduler.dart               # ViewportScheduler with shadow metrics
+│       │   ├── slide_profiler.dart                 # TEMPORARY — Phase 7.2A instrumentation
+│       │   ├── slideshow_source.dart               # Sealed source types + SlideshowRouteExtra
+│       │   ├── slideshow_state.dart                # SlideshowState
+│       │   ├── task_planner.dart                   # Plans scheduler tasks based on window
+│       │   ├── video_preparation_service.dart      # VideoPlayerController pool lifecycle
+│       │   ├── viewport_scheduler.dart             # Ring-based priority scheduler (Phase 5.7+)
+│       │   └── viewport_scheduler_adapter.dart     # Adapter wrapping ViewportScheduler as PreparationScheduler
 │       ├── presentation/
 │       │   ├── slideshow_screen.dart      # Fullscreen slideshow
 │       │   └── widgets/
-│       │   ├── image_viewer.dart      # Zoomable image, render-only (no cache checks/prep)
-│       │   ├── media_viewer.dart      # Presentation dispatch to VideoViewer/ImageViewer
-│       │       ├── queue_indicator.dart   # Horizontal queue chips
-│       │       ├── slideshow_controls.dart
-│       │       ├── slideshow_overlay.dart
-│       │       └── video_viewer.dart      # Video player — receives pre-initialized controller from MPE
+│       │   ├── image_viewer.dart          # Zoomable image, render-only (no cache checks/prep)
+│       │   ├── media_filter_dialog.dart   # Media filter selection dialog
+│       │   ├── media_viewer.dart          # Presentation dispatch to VideoViewer/ImageViewer
+│       │   ├── queue_indicator.dart       # Horizontal queue chips
+│       │   ├── slideshow_controls.dart
+│       │   ├── slideshow_overlay.dart
+│       │   └── video_viewer.dart          # Video player — receives pre-initialized controller from MPE
 │       └── providers/
 │           └── slideshow_provider.dart    # SlideshowNotifier (refactored — uses MediaSource)
 ├── shared/
@@ -1682,6 +1704,198 @@ Reconciliation in `MediaPreparationEngine._reconcilePreparationWindow()`:
 
 ---
 
+## Core: PreparationScheduler (Abstract Interface)
+
+**Path:** `lib/features/slideshow/domain/preparation_scheduler.dart`
+
+Abstract interface for preparation schedulers. Enables pluggable scheduling strategies (adaptive vs viewport):
+
+```dart
+abstract class PreparationScheduler {
+  void onIndexChanged(int currentIndex, {int galleryIndex = 0});
+  void onPlaylistReplaced();
+  Set<String> get plannedUrls;
+  bool get isIdle;
+  bool get hasFailed;
+  void dispose();
+  // + callbacks: onUrlStarted, onUrlReady, onUrlFailed
+}
+```
+
+Two implementations exist: `AdaptivePreloaderScheduler` (wraps the legacy `AdaptivePreloader`) and `ViewportSchedulerAdapter` (wraps the new `ViewportScheduler`). The active scheduler is selected at runtime via `scheduler_mode.dart`.
+
+## Core: AdaptivePreloaderScheduler
+
+**Path:** `lib/features/slideshow/domain/adaptive_preloader_scheduler.dart`
+
+Wraps `AdaptivePreloader` to conform to the `PreparationScheduler` abstract interface. Delegates all calls directly to the underlying preloader. Used as the default scheduler.
+
+## Core: SchedulerMode
+
+**Path:** `lib/features/slideshow/domain/scheduler_mode.dart`
+
+Controls which preparation scheduler is active:
+
+```dart
+enum SchedulerMode { adaptive, viewport }
+SchedulerMode get currentSchedulerMode;  // reads SCHEDULER_MODE compile-time const
+bool get isViewportSchedulerEnabled;
+```
+
+- **`adaptive`** (default) — Legacy priority-queue-based `AdaptivePreloader` scheduling
+- **`viewport`** — New ring-based `ViewportScheduler` (enabled via `--dart-define=SCHEDULER_MODE=viewport`)
+- `MediaPreparationEngine` creates both schedulers but only designates one as `_activeScheduler`
+- If the viewport scheduler fails, the engine falls back to adaptive automatically
+
+## Core: SchedulerTask
+
+**Path:** `lib/features/slideshow/domain/scheduler_task.dart`
+
+Represents a single media preparation unit:
+
+```dart
+class SchedulerTask {
+  final String assetId;
+  final String url;
+  final int index;
+  final MediaTaskType mediaType;  // image | video
+  final int? galleryPosition;
+  final int? galleryLength;
+  final int generation;  // task generation for staleness detection
+}
+```
+
+Used by `TaskPlanner` to generate tasks and by `ViewportScheduler` to manage the work queue.
+
+## Core: TaskPlanner
+
+**Path:** `lib/features/slideshow/domain/task_planner.dart`
+
+Generates `SchedulerTask` instances for a given viewport window:
+
+```dart
+List<SchedulerTask> plan({
+  required List<MediaAsset> items,
+  required int currentIndex,
+  required int horizon,
+  required int needCount,
+  required int generation,
+  int galleryIndex = 0,
+}) → List<SchedulerTask>
+```
+
+- Skips already-prepared or in-flight URLs
+- Prioritises the current item and gallery sub-items
+- Walks forward through `horizon` items, generating one task per URL
+- Each task includes the generation number for staleness comparison
+
+## Core: ReadinessState
+
+**Path:** `lib/features/slideshow/domain/readiness_state.dart`
+
+Simple three-state enum: `ready`, `likelyReady`, `unavailable`. Used by `DemandCalculator` and `ShadowScheduler` to assess the preparation window's health.
+
+## Core: DemandCalculator
+
+**Path:** `lib/features/slideshow/domain/demand_calculator.dart`
+
+Computes how many additional items need preparation:
+
+```dart
+int computeNeedCount(List<ReadinessState> states, {required int targetBudget})
+```
+
+- `ready` items score 1.0, `likelyReady` score 0.5, `unavailable` score 0
+- Returns `targetBudget - ceil(totalScore)` (clamped to 0)
+- Used by `ViewportSchedulerAdapter` and `ShadowScheduler` to determine how many tasks to plan
+
+## Core: ViewportScheduler
+
+**Path:** `lib/features/slideshow/domain/viewport_scheduler.dart`
+
+A ring-based priority scheduler that replaces the legacy priority queue with a four-ring structure:
+
+```
+Rings (in priority order):
+  Ring.immediate (0) — Current item  
+  Ring.critical  (1) — Near-future items
+  Ring.near      (2) — Medium-range items
+  Ring.background (3) — Far-ahead / history
+```
+
+**State machine:**
+```
+idle ──► active ──► satisfied ──► sleeping
+                  ▲                  │
+                  └──────────────────┘ (on index change)
+```
+
+Key behaviours:
+- `enqueue(tasks, currentIndex, horizon)` — Clears pending tasks, allocates to rings by distance
+- `dequeue(count)` — Drains from highest-priority ring, respecting in-flight limit
+- `cancelStale(generation)` — Removes tasks from a previous generation
+- Scheduler enters `sleeping` when all items in horizon are ready, wakes on `onIndexChanged`
+- Exposes `_inFlight` tracking and `_completedOrFailed` LRU set for deduplication
+
+## Core: ViewportSchedulerAdapter
+
+**Path:** `lib/features/slideshow/domain/viewport_scheduler_adapter.dart`
+
+Wraps `ViewportScheduler` as a `PreparationScheduler`. Bridges the `MediaPreparationEngine` to the ring scheduler:
+
+```
+onIndexChanged(currentIndex)
+  └── measureWindow() → states
+  └── DemandCalculator.computeNeedCount(states, budget) → needCount
+  └── TaskPlanner.plan(items, index, horizon, needCount) → tasks
+  └── ViewportScheduler.enqueue(tasks)
+  └── ViewportScheduler.dequeue(concurrency) → tasks
+  └── For each task: precacheImage() or skip if already ready
+```
+
+- Implements `hasFailed` (returns true if scheduler encounters an error, triggering fallback)
+- Uses `_defaultPreload` (wraps `precacheImage` with `CachedNetworkImageProvider`)
+- Tracks budget, horizon, and generation for each cycle
+- Calls `_checkLoadMore()` when remaining items are low
+
+## Core: ShadowScheduler
+
+**Path:** `lib/features/slideshow/domain/shadow_scheduler.dart`
+
+A passive evaluation layer that runs `ViewportScheduler` cycles in parallel with the active scheduler (without executing any preloads). Measures what the viewport scheduler WOULD plan vs what the adaptive scheduler actually plans:
+
+```
+ShadowSchedulerConfig { horizon: 20, targetBudget: 10, minBudget: 3 }
+ShadowCycleResult {
+  adaptiveUrls, viewportUrls, agreement, generation,
+  adaptiveNeedCount, viewportNeedCount, plannedVsActual
+}
+```
+
+- `runCycle(states, items, currentIndex, adaptivePlannedUrls)` → `ShadowCycleResult`
+- Runs `DemandCalculator` + `TaskPlanner` + `ViewportScheduler.enqueue/dequeue` (dry-run)
+- Computes agreement score: intersection size / union size of planned URL sets
+- `ShadowMetricsAggregator` accumulates results across cycles for analysis
+- `SlideProfiler.recordSchedulerAgreement()` logs the agreement score
+- Used during development to validate viewport scheduler against the proven adaptive scheduler
+
+## Core: SlideProfiler (Temporary)
+
+**Path:** `lib/features/slideshow/domain/slide_profiler.dart`
+
+**TEMPORARY — Phase 7.2A instrumentation.** Marked for removal after measurements collected.
+
+Tracks per-image timeline data:
+- Queue timestamps, download start/complete, ready times, widget request times, first paint times, cache status, error details, download sizes
+- Worker sampling (in-flight vs max concurrent), queue length sampling
+- Video init start/end timestamps
+- Scheduler agreement scores, scheduler info snapshots
+- State transitions per URL
+
+`SlideProfiler.exportAll()` returns a complete `List<Map>` of all timelines and snapshots for external analysis.
+
+---
+
 ## Core: PlaylistManager
 
 **Path:** `lib/features/slideshow/domain/playlist_manager.dart`
@@ -1719,6 +1933,18 @@ Key design: `items` and `currentIndex` are managed in the `PlaylistManager` rath
 **Path:** `lib/core/media/safe_network_image.dart`
 
 A `StatefulWidget` that loads images via `CachedNetworkImageProvider` and displays using `Image.memory`. Used as thumbnail fallback in `VideoViewer`. Provides retry logic and error state handling.
+
+### MediaFilter
+
+**Path:** `lib/features/slideshow/domain/media_filter.dart`
+
+Simple enum for filtering media by type:
+
+```dart
+enum MediaFilter { all, images, videos }
+```
+
+Used in the search filter sheet and slideshow source configuration.
 
 ### MediaError
 
@@ -1787,6 +2013,8 @@ Configured in `main.dart`:
 | `search` | `/api/search` | Search media (FTS5) |
 | `searchDebug` | `/api/search/debug` | Debug search (LIKE) |
 | `searchReddit` | `/api/search/reddit` | Reddit search (backend proxy) |
+| `searchRedditProgressive` | `/api/search/reddit/progressive` | Progressive Reddit search |
+| `searchRedditPoll` | `/api/search/reddit/poll` | Poll progressive search session |
 | `health` | `/api/health` | Health check |
 | `mediaStart` | `/api/media/start` | Start slideshow |
 | `media` | `/api/media` | Media item |
@@ -1814,6 +2042,50 @@ Static utility that fixes Reddit CDN URL issues:
 | `external-i.redd.it` | `i.redd.it` |
 
 Methods: `sanitize(String)`, `sanitizeOptional(String?)`, `sanitizeAll(List<String>)`, `hasPreviewUrl(String)`
+
+### Trace System
+
+**Path:** `lib/core/debug/trace.dart`
+
+Structured trace logging utility that emits `[VT]` (Visual Timeline) formatted events:
+
+```
+[VT] seq=1 | source=MPE.onIndexChanged | index=5 | gallery=0
+[VT] seq=2 | source=VPS.prepare | url=https://... | poolSize=3
+```
+
+- `Trace.t(source, kv)` — Emit a timestamped trace with key-value pairs
+- `Trace.enabled = true/false` — Global on/off toggle
+- Used extensively in `MediaPreparationEngine`, `VideoPreparationService`, and the scheduler pipeline for debugging
+
+### Display Quality System
+
+**Path:** `lib/core/display_quality/`
+
+A centralized decode-size policy that prevents OutOfMemory errors by decoding images at screen-optimized resolution instead of full source resolution.
+
+#### DisplayQualityMode (`display_quality_mode.dart`)
+
+Enum with three modes:
+- `smart` (default) — Decodes at screen-optimized width. Virtually identical quality, ~14× less RAM.
+- `original` — Full-resolution decode for zoom quality. Higher RAM usage.
+- `auto` — Reserved for future use.
+
+#### ImageDecodePolicy (`image_decode_policy.dart`)
+
+Centralizes all decode-size decisions:
+
+```
+ImageDecodePolicy.fromContext(context, mode)
+  └── getDecodeSize() → DecodeSize(width: w, height: null)
+        └── w = (screenWidth * pixelRatio * qualityMultiplier).ceil()
+```
+
+`ResizeImage.resizeIfNeeded(width, null, provider)` constrains only the width; height auto-calculates to preserve aspect ratio. With height=null, the decoder preserves the original image proportions, eliminating the aspect ratio regression that occurred when both dimensions were constrained.
+
+#### DecodeSize
+
+Simple value class: `DecodeSize({int? width, int? height})`. Stored in `MediaPreparationEngine` and passed to widgets via `PreparedMediaHandle.decodeSize`. Widgets never create `ImageDecodePolicy` — they receive the pre-computed size from the engine.
 
 ### Debouncer
 
@@ -2077,7 +2349,7 @@ loadMore() called
 
 ### Frontend
 
-1. **No automated tests** — Only a single smoke test that checks `RedSlideApp` renders
+1. **19 test files** (126/126 pass) — Tests cover merge engine, slideshow correctness, metrics collection, scheduler integration, video preparation, viewport/shadow scheduler, task planner, demand calculator, performance benchmarks, and widget tests. Zero errors, zero warnings on `flutter analyze`.
 2. **No internationalization** — `lib/l10n/` is empty, all strings hardcoded in English
 3. **Groups feature** — Only a placeholder screen, `GroupModel` unused, `GroupSource` never instantiated
 4. **Session resume** — `resumeSessionProvider` is a stub returning `null`; `_saveSession()` is a no-op
@@ -2100,6 +2372,34 @@ loadMore() called
 21. **Feed/search decode policy inconsistent with slideshow** — Resolved in Phase 5.7I. Feed/search widgets now apply `memCacheWidth` for centralized decode policy.
 22. **No fade transition between slideshow images** — Resolved in Phase 5.7I. Added 200ms `AnimatedOpacity` fade-in on first decoded frame.
 23. **Duplicate metric recording in AdaptivePreloader** — Resolved in Phase 5.7I. Removed duplicate `imagePreparationStarted` event in `_executePreload()`.
+
+### Tests
+
+Located in `test/`:
+
+| File | Purpose |
+|------|---------|
+| `benchmark_test.dart` | Slideshow performance benchmarks |
+| `demand_calculator_test.dart` | DemandCalculator unit tests |
+| `media_preparation_engine_test.dart` | MPE pipeline integration tests |
+| `merge_engine_test.dart` | MergeEngine correctness tests |
+| `metrics_collector_test.dart` | MetricsCollector event tracking tests |
+| `performance_benchmark_test.dart` | End-to-end performance benchmarks |
+| `phase_6_2_fixes_test.dart` | Regression tests for Phase 6.2 fixes |
+| `preparation_scheduler_integration_test.dart` | Scheduler pipeline integration |
+| `qa_benchmark_test.dart` | Quality assurance benchmarks |
+| `readiness_state_test.dart` | ReadinessState computation tests |
+| `scheduler_integration_test.dart` | Scheduler integration tests |
+| `scheduler_pipeline_harness.dart` | Scheduler test harness utilities |
+| `shadow_scheduler_test.dart` | ShadowScheduler comparison tests |
+| `slideshow_correctness_test.dart` | Full slideshow flow correctness tests |
+| `task_planner_test.dart` | TaskPlanner unit tests |
+| `video_preparation_service_test.dart` | Video preparation lifecycle tests |
+| `video_viewer_test.dart` | VideoViewer widget tests |
+| `viewport_scheduler_test.dart` | ViewportScheduler ring tests |
+| `widget_test.dart` | App smoke test |
+
+Run with: `flutter test`
 
 ### Backend Referenced
 

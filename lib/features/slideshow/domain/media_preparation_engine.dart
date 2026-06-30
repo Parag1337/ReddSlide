@@ -2,6 +2,7 @@ import 'dart:developer';
 import 'package:flutter/material.dart';
 import 'package:video_player/video_player.dart';
 import '../../feed/domain/media_asset.dart';
+import '../../../core/debug/trace.dart';
 import '../../../core/display_quality/display_quality_mode.dart';
 import '../../../core/display_quality/image_decode_policy.dart';
 import 'adaptive_preloader.dart';
@@ -36,12 +37,15 @@ class MediaPreparationEngine {
   final Set<String> _failedUrls = {};
   static const int _maxConfirmedReadyUrls = 1000;
   VoidCallback? _onReadinessChanged;
+  Set<String>? _pendingEvictionUrls;
+  bool _evictionScheduled = false;
 
   final ShadowScheduler _shadowScheduler = ShadowScheduler();
   final ShadowMetricsAggregator shadowAggregator = ShadowMetricsAggregator();
 
   void _onUrlStarted(String url) {
     _preparingUrls.add(url);
+    Trace.t('MPE._onUrlStarted', ['url', url.substring(0, url.length.clamp(0, 60)), 'preparing', _preparingUrls.length]);
     _onReadinessChanged?.call();
   }
 
@@ -53,12 +57,14 @@ class MediaPreparationEngine {
       final toRemove = _confirmedReadyUrls.take(excess).toList();
       _confirmedReadyUrls.removeAll(toRemove);
     }
+    Trace.t('MPE._onUrlReady', ['url', url.substring(0, url.length.clamp(0, 60)), 'confirmed', _confirmedReadyUrls.length]);
     _onReadinessChanged?.call();
   }
 
   void _onUrlFailed(String url) {
     _preparingUrls.remove(url);
     _failedUrls.add(url);
+    Trace.t('MPE._onUrlFailed', ['url', url.substring(0, url.length.clamp(0, 60)), 'failed', _failedUrls.length]);
     _onReadinessChanged?.call();
   }
 
@@ -126,6 +132,7 @@ class MediaPreparationEngine {
   }
 
   void onIndexChanged(int currentIndex, {int galleryIndex = 0}) {
+    Trace.t('MPE.onIndexChanged', ['index', currentIndex, 'gallery', galleryIndex]);
     _checkFallback();
 
     try {
@@ -202,6 +209,7 @@ class MediaPreparationEngine {
 
   void _reconcilePreparationWindow(int currentIndex) {
     final items = _playlist.items;
+    Trace.t('MPE._reconcilePreparationWindow', ['index', currentIndex, 'items', items.length]);
     if (items.isEmpty) return;
 
     final windowStart = (currentIndex - _policy.decodedBehind).clamp(0, items.length);
@@ -216,7 +224,8 @@ class MediaPreparationEngine {
       if (item.isVideo && item.videoUrl != null) {
         final distance = (i - currentIndex).abs();
         videoUrlsInWindow.add(item.videoUrl!);
-        _videoService.prepare(item.videoUrl!, priority: distance).then((_) {}, onError: (_) {});
+        Trace.t('MPE._reconcilePreparationWindow.video', ['i', i, 'url', item.videoUrl!.substring(0, item.videoUrl!.length.clamp(0, 60)), 'dist', distance]);
+        _videoService.prepare(item.videoUrl!, headers: item.mediaHeaders, priority: distance).then((_) {}, onError: (_) {});
       }
     }
 
@@ -225,7 +234,8 @@ class MediaPreparationEngine {
     final evictedCount = beforeRetain - _preparedItemIds.length;
     _preparedItemIds.addAll(inWindow);
 
-    _videoService.evictOutsideWindow(videoUrlsInWindow);
+    _pendingEvictionUrls = videoUrlsInWindow;
+    _scheduleEviction();
 
     metrics?.recordEvent(MetricEventType.prepWindowReconciled, data: {
       'currentIndex': currentIndex,
@@ -235,6 +245,28 @@ class MediaPreparationEngine {
       'preparedItemIds': _preparedItemIds.length,
       'evictedFromIds': evictedCount,
     });
+  }
+
+  void _scheduleEviction() {
+    if (_evictionScheduled) return;
+    _evictionScheduled = true;
+    try {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        _evictionScheduled = false;
+        final urls = _pendingEvictionUrls;
+        _pendingEvictionUrls = null;
+        if (urls != null) {
+          _videoService.evictOutsideWindow(urls);
+        }
+      });
+    } catch (_) {
+      _evictionScheduled = false;
+      final urls = _pendingEvictionUrls;
+      _pendingEvictionUrls = null;
+      if (urls != null) {
+        _videoService.evictOutsideWindow(urls);
+      }
+    }
   }
 
   PreparedMediaHandle prepare(MediaAsset asset, {int galleryIndex = 0}) {
@@ -258,6 +290,7 @@ class MediaPreparationEngine {
 
     if (asset.isVideo && asset.videoUrl != null) {
       controller = _videoService.getController(asset.videoUrl!);
+      Trace.t('MPE.prepare.video', ['assetId', asset.id, 'ctrl', '${controller?.hashCode}', 'ctrlInit', '${controller?.value.isInitialized}', 'state', '${controller != null ? (_videoService.isReady(asset.videoUrl!) ? "ready" : _videoService.isPreparing(asset.videoUrl!) ? "preparing" : "unknown") : "no-entry"}']);
       preparationFailed = _videoService.hasFailed(asset.videoUrl!);
       if (preparationFailed) {
         state = MediaState.failed;
@@ -364,6 +397,8 @@ class MediaPreparationEngine {
         'reason': 'engineDisposed',
       });
     }
+    _pendingEvictionUrls = null;
+    _evictionScheduled = false;
     _adaptiveScheduler?.dispose();
     _adaptiveScheduler = null;
     _viewportScheduler?.dispose();

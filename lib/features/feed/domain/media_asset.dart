@@ -11,6 +11,7 @@ class MediaAsset {
   final String? thumbnailUrl;
   final bool isVideo;
   final bool isGallery;
+  bool get isImage => !isVideo && !isGallery;
   final bool nsfw;
   final int qualityScore;
   final int? width;
@@ -18,6 +19,7 @@ class MediaAsset {
   final int? duration;
   final List<String>? galleryUrls;
   final int? createdUtc;
+  final Map<String, String>? mediaHeaders;
 
   const MediaAsset({
     required this.id,
@@ -37,6 +39,7 @@ class MediaAsset {
     this.duration,
     this.galleryUrls,
     this.createdUtc,
+    this.mediaHeaders,
   });
 
   MediaAsset copyWith({
@@ -57,6 +60,7 @@ class MediaAsset {
     int? duration,
     List<String>? galleryUrls,
     int? createdUtc,
+    Map<String, String>? mediaHeaders,
   }) {
     return MediaAsset(
       id: id ?? this.id,
@@ -76,6 +80,7 @@ class MediaAsset {
       duration: duration ?? this.duration,
       galleryUrls: galleryUrls ?? this.galleryUrls,
       createdUtc: createdUtc ?? this.createdUtc,
+      mediaHeaders: mediaHeaders ?? this.mediaHeaders,
     );
   }
 
@@ -102,6 +107,9 @@ class MediaAsset {
             )
           : null,
       createdUtc: json['created_utc'] as int?,
+      mediaHeaders: json['video_headers'] != null
+          ? Map<String, String>.from(json['video_headers'] as Map)
+          : null,
     );
   }
 
@@ -123,5 +131,6 @@ class MediaAsset {
         'duration': duration,
         'gallery_urls': galleryUrls,
         'created_utc': createdUtc,
+        'video_headers': mediaHeaders,
       };
 }

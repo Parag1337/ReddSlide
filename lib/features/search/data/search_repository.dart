@@ -1,5 +1,4 @@
 import 'dart:async';
-import 'package:flutter/foundation.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../../../core/network/api_client.dart';
 import '../../../core/network/result.dart';
@@ -37,18 +36,11 @@ class SearchRepository {
       params['subreddits'] = subreddits.join(',');
     }
 
-    debugPrint('[SEARCH_REPOSITORY] progressive query=$query mode=$mode');
-
     final result = await _apiClient.get(
       ApiConstants.searchRedditProgressive,
       queryParameters: params,
       fromJson: (json) =>
           ProgressiveSearchResponse.fromJson(json as Map<String, dynamic>),
-    );
-    result.when(
-      (data) => debugPrint(
-          '[SEARCH_REPOSITORY] progressive returned=${data.items.length} session=${data.sessionId} done=${data.done}'),
-      (e) => debugPrint('[SEARCH_REPOSITORY] progressive error=$e'),
     );
     return result;
   }
@@ -56,18 +48,11 @@ class SearchRepository {
   Future<Result<ProgressiveSearchResponse>> pollSearchResults({
     required String sessionId,
   }) async {
-    debugPrint('[SEARCH_REPOSITORY] poll session=$sessionId');
-
     final result = await _apiClient.get(
       ApiConstants.searchRedditPoll,
       queryParameters: {'session': sessionId},
       fromJson: (json) =>
           ProgressiveSearchResponse.fromJson(json as Map<String, dynamic>),
-    );
-    result.when(
-      (data) => debugPrint(
-          '[SEARCH_REPOSITORY] poll returned=${data.items.length} done=${data.done}'),
-      (e) => debugPrint('[SEARCH_REPOSITORY] poll error=$e'),
     );
     return result;
   }
@@ -89,16 +74,10 @@ class SearchRepository {
       params['subreddits'] = subreddits.join(',');
     }
 
-    debugPrint('[SEARCH_REPOSITORY] searchReddit query=$query mode=$mode after=$after subreddits=$subreddits');
-
     final result = await _apiClient.get(
       ApiConstants.searchReddit,
       queryParameters: params,
       fromJson: (json) => FeedResponse.fromJson(json as Map<String, dynamic>),
-    );
-    result.when(
-      (data) => debugPrint('[SEARCH_REPOSITORY] returned=${data.items.length} hasMore=${data.hasMore} after=${data.after}'),
-      (e) => debugPrint('[SEARCH_REPOSITORY] error=$e'),
     );
     return result;
   }

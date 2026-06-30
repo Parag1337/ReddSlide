@@ -69,8 +69,9 @@ class ViewportScheduler {
       ring.removeWhere((t) => t.generation == oldGeneration);
     }
     _completedOrFailed.removeWhere((key) {
-      final parts = key.split(':');
-      return parts.length == 2 && int.tryParse(parts[1]) == oldGeneration;
+      final lastColon = key.lastIndexOf(':');
+      if (lastColon == -1) return false;
+      return int.tryParse(key.substring(lastColon + 1)) == oldGeneration;
     });
     _updateState();
   }

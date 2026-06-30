@@ -1,4 +1,3 @@
-import 'package:flutter/foundation.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../domain/settings_model.dart';
 import '../data/settings_repository.dart';
@@ -7,6 +6,7 @@ import '../../../core/network/api_client.dart';
 import '../../../core/network/result.dart';
 import '../../../core/constants/api_constants.dart';
 import '../../../core/errors/app_error.dart';
+import '../../../features/slideshow/domain/media_filter.dart';
 
 final settingsProvider =
     AsyncNotifierProvider<SettingsNotifier, SettingsModel>(SettingsNotifier.new);
@@ -71,6 +71,14 @@ class SettingsNotifier extends AsyncNotifier<SettingsModel> {
     await repo.saveFull(updated);
   }
 
+  Future<void> setMediaFilter(MediaFilter filter) async {
+    final current = state.value ?? const SettingsModel();
+    final updated = current.copyWith(mediaFilter: filter);
+    state = AsyncData(updated);
+    final repo = ref.read(settingsRepositoryProvider);
+    await repo.saveFull(updated);
+  }
+
   Future<void> _syncSubredditsToBackend(List<String> subreddits) async {
     final current = state.valueOrNull;
     if (current == null || current.backendUrl.isEmpty) return;
@@ -92,7 +100,6 @@ class SettingsNotifier extends AsyncNotifier<SettingsModel> {
     final repo = ref.read(settingsRepositoryProvider);
     await repo.saveFull(updated);
     _syncSubredditsToBackend(updatedSubs);
-    debugPrint('[SETTINGS] subreddits=${updated.subreddits}');
   }
 
   Future<void> removeSubreddit(String name) async {
@@ -103,7 +110,6 @@ class SettingsNotifier extends AsyncNotifier<SettingsModel> {
     final repo = ref.read(settingsRepositoryProvider);
     await repo.saveFull(updated);
     _syncSubredditsToBackend(updatedSubs);
-    debugPrint('[SETTINGS] subreddits=${updated.subreddits}');
   }
 
   Future<void> updateSubreddit(String oldName, String newName) async {

@@ -48,6 +48,7 @@ class MediaAssetResponse(BaseModel):
     duration: Optional[int] = None
     created_utc: Optional[int] = None
     gallery_urls: Optional[list[str]] = None
+    video_headers: Optional[dict] = None
 
 
 class FeedResponse(BaseModel):

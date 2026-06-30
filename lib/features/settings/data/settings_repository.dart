@@ -6,6 +6,7 @@ import '../../../core/network/result.dart';
 import '../../../core/errors/app_error.dart';
 import '../../../core/constants/api_constants.dart';
 import '../../../core/network/api_client.dart';
+import '../../../features/slideshow/domain/media_filter.dart';
 
 final settingsRepositoryProvider = Provider<SettingsRepository>((ref) {
   return SettingsRepository();
@@ -21,6 +22,7 @@ class SettingsRepository {
   Future<SettingsModel> loadFull() async {
     final prefs = await SharedPreferences.getInstance();
     final qualityRaw = prefs.getString('${_key}_display_quality');
+    final mediaFilterRaw = prefs.getString('${_key}_media_filter');
     return SettingsModel(
       backendUrl: prefs.getString('${_key}_url') ?? '',
       nsfwEnabled: prefs.getBool('${_key}_nsfw') ?? false,
@@ -31,6 +33,9 @@ class SettingsRepository {
       displayQualityMode: qualityRaw != null
           ? DisplayQualityMode.fromJson(qualityRaw)
           : DisplayQualityMode.smart,
+      mediaFilter: mediaFilterRaw != null
+          ? MediaFilter.fromQuery(mediaFilterRaw)
+          : MediaFilter.all,
     );
   }
 
@@ -44,6 +49,8 @@ class SettingsRepository {
     await prefs.setStringList('${_key}_subreddits', settings.subreddits);
     await prefs.setString(
         '${_key}_display_quality', settings.displayQualityMode.toJson());
+    await prefs.setString(
+        '${_key}_media_filter', settings.mediaFilter.name);
   }
 
   Future<Result<bool>> validateBackendUrl(String url, ApiClient client) async {

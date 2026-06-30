@@ -202,9 +202,9 @@ class ViewportSchedulerAdapter implements PreparationScheduler {
   Future<void> _executeTask(SchedulerTask task) async {
     final url = task.url;
     _inProgress.add(url);
-    _preloadStarted(url);
 
     try {
+      _preloadStarted(url);
       await _preloadFn(url, _context)
           .timeout(const Duration(milliseconds: AppConstants.imagePreloadTimeoutMs));
       _inProgress.remove(url);

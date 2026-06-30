@@ -185,7 +185,7 @@ class TestCleanupRelatedTables:
             await db.execute(
                 """INSERT INTO media_queue (reddit_post_id, position, added_at)
                    VALUES (?, ?, ?)""",
-                ("queue_old_1", 1, old_time)
+                ("queue_reddit_old", 1, old_time)
             )
             await db.commit()
 
@@ -194,7 +194,7 @@ class TestCleanupRelatedTables:
         async with get_db() as db:
             cursor = await db.execute(
                 "SELECT COUNT(*) as cnt FROM media_queue WHERE reddit_post_id = ?",
-                ("queue_old_1",)
+                ("queue_reddit_old",)
             )
             row = await cursor.fetchone()
             assert row["cnt"] == 0, "Media queue entry for old asset should be removed"
@@ -221,7 +221,7 @@ class TestCleanupRelatedTables:
             )
             await db.execute(
                 "INSERT INTO media_queue (reddit_post_id, position, added_at) VALUES (?, ?, ?)",
-                ("orphan_test_1", 5, old_time)
+                ("orphan_reddit", 5, old_time)
             )
             await db.commit()
 
@@ -238,7 +238,7 @@ class TestCleanupRelatedTables:
 
             cursor = await db.execute(
                 """SELECT COUNT(*) as cnt FROM media_queue mq
-                   WHERE mq.reddit_post_id NOT IN (SELECT id FROM media_assets)"""
+                   WHERE mq.reddit_post_id NOT IN (SELECT reddit_id FROM media_assets)"""
             )
             row = await cursor.fetchone()
             assert row["cnt"] == 0, "No orphaned media_queue after cleanup"
