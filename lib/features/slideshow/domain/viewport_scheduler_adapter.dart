@@ -36,12 +36,14 @@ class ViewportSchedulerAdapter implements PreparationScheduler {
   final Set<String> _inProgress = {};
   final Set<String> _completed = {};
   final Set<String> _failedUrls = {};
+  bool _needsGenerationCleanup = false;
 
   static const int _maxConcurrent = AppConstants.maxConcurrentPreloads;
   static const int _targetBudget = 10;
   static const int _horizon = 5;
   static const int _majorJumpThreshold = 20;
   static const int _generationExpiryMs = 30 * 1000;
+  static const int _maxFailedUrls = 500;
 
   int _generation = 0;
   int _lastIndex = -1;
@@ -86,12 +88,32 @@ class ViewportSchedulerAdapter implements PreparationScheduler {
     final needsNewGeneration = _shouldStartNewGeneration(currentIndex);
     if (needsNewGeneration) {
       _generation++;
+      _completed.clear();
+      _failedUrls.clear();
+      _needsGenerationCleanup = false;
       _generationTimer?.cancel();
       _generationTimer = Timer(
         Duration(milliseconds: _generationExpiryMs),
         () {
           if (!_failed) {
             _generation++;
+            _needsGenerationCleanup = true;
+          }
+        },
+      );
+    } else if (_needsGenerationCleanup) {
+      _needsGenerationCleanup = false;
+      _completed.clear();
+      if (_generation > 1) {
+        _scheduler.cancelGeneration(_generation - 1);
+      }
+      _generationTimer?.cancel();
+      _generationTimer = Timer(
+        Duration(milliseconds: _generationExpiryMs),
+        () {
+          if (!_failed) {
+            _generation++;
+            _needsGenerationCleanup = true;
           }
         },
       );
@@ -213,6 +235,9 @@ class ViewportSchedulerAdapter implements PreparationScheduler {
     } catch (e) {
       _inProgress.remove(url);
       _failedUrls.add(url);
+      if (_failedUrls.length > _maxFailedUrls) {
+        _failedUrls.remove(_failedUrls.first);
+      }
       _preloadFailed(url);
     } finally {
       _concurrentCount--;
@@ -250,6 +275,7 @@ class ViewportSchedulerAdapter implements PreparationScheduler {
     _inProgress.clear();
     _completed.clear();
     _failedUrls.clear();
+    _needsGenerationCleanup = false;
   }
 
   @override

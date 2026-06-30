@@ -58,7 +58,7 @@ class AdaptivePreloader {
 
   final _LruSet _preloadedUrls = _LruSet(maxSize: AppConstants.preloadedUrlSetMaxSize);
   final Set<String> _activeUrls = {};
-  final Set<String> _failedUrls = {};
+  final _LruSet _failedUrls = _LruSet(maxSize: AppConstants.preloadedUrlSetMaxSize);
   int _inFlightPreloads = 0;
   final List<_PreloadTask> _preloadQueue = [];
   final Set<String> _queuedUrls = {};

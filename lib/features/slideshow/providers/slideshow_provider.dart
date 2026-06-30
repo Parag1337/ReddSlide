@@ -45,6 +45,8 @@ class SlideshowNotifier extends StateNotifier<SlideshowState> {
   int _slideshowIntervalSeconds = AppConstants.defaultSlideshowIntervalSeconds;
   Future<void>? _inFlightLoadMore;
   bool _isNavigating = false;
+  bool _initialized = false;
+  int? _pendingStartIndex;
   final MetricsCollector metrics;
   int _preparationRevision = 0;
 
@@ -171,10 +173,24 @@ class SlideshowNotifier extends StateNotifier<SlideshowState> {
     } catch (e) {
       log('[SLIDESHOW] _initialize error=$e');
       state = state.copyWith(isLoading: false, hasMorePages: false);
+    } finally {
+      _initialized = true;
+      if (_pendingStartIndex != null) {
+        _applyStartIndex(_pendingStartIndex!);
+        _pendingStartIndex = null;
+      }
     }
   }
 
   void setStartIndex(int index) {
+    if (!_initialized) {
+      _pendingStartIndex = index;
+      return;
+    }
+    _applyStartIndex(index);
+  }
+
+  void _applyStartIndex(int index) {
     _playlist.jumpTo(index);
     state = state.copyWith(currentIndex: index);
     _notifyPreloader();
@@ -289,7 +305,7 @@ class SlideshowNotifier extends StateNotifier<SlideshowState> {
     }
   }
 
-  void galleryNext() {
+  Future<void> galleryNext() async {
     if (_playlist.isEmpty) return;
     if (_isNavigating) return;
     final asset = _playlist.current;
@@ -305,10 +321,10 @@ class SlideshowNotifier extends StateNotifier<SlideshowState> {
         return;
       }
     }
-    next();
+    await next();
   }
 
-  void galleryPrevious() {
+  Future<void> galleryPrevious() async {
     if (_playlist.isEmpty) return;
     if (_isNavigating) return;
     final asset = _playlist.current;
@@ -321,7 +337,7 @@ class SlideshowNotifier extends StateNotifier<SlideshowState> {
         return;
       }
     }
-    previous();
+    await previous();
   }
 
   Future<void> loadMore() async {

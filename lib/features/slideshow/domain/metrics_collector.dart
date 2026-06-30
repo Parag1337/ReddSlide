@@ -81,22 +81,26 @@ class MetricsCollector {
     _events.add(event);
 
     switch (type) {
+      case MetricEventType.slideshowImageVisible:
+      case MetricEventType.slideshowVideoVisible:
+        _recordSwipeLatency(event.timestamp);
       case MetricEventType.slideshowSwipeNext:
       case MetricEventType.slideshowSwipePrevious:
       case MetricEventType.slideshowSwipeJump:
         _lastSwipeTimestamp = event.timestamp;
-      case MetricEventType.slideshowImageVisible:
-      case MetricEventType.slideshowVideoVisible:
-        _recordSwipeLatency(event.timestamp);
-        if (!_hasEmittedFirstVisible) {
-          _hasEmittedFirstVisible = true;
-          _events.add(MetricEvent(type: MetricEventType.firstImageVisible, timestamp: event.timestamp, data: event.data));
-          while (_events.length > _maxEvents) {
-            _events.removeFirst();
-          }
-        }
       default:
         break;
+    }
+
+    if (!_hasEmittedFirstVisible &&
+        (type == MetricEventType.slideshowImageVisible ||
+         type == MetricEventType.slideshowVideoVisible)) {
+      _hasEmittedFirstVisible = true;
+      _events.add(MetricEvent(
+        type: MetricEventType.firstImageVisible,
+        timestamp: event.timestamp,
+        data: event.data,
+      ));
     }
 
     while (_events.length > _maxEvents) {

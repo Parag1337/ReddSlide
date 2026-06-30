@@ -301,20 +301,23 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
           ),
         ],
       ),
-    );
+    ).whenComplete(() => controller.dispose());
   }
 
   void _validateUrl(String url) async {
     if (url.isEmpty) return;
+    if (!mounted) return;
     setState(() { _isValidating = true; _healthResult = null; });
     try {
       final client = ApiClient(baseUrl: url);
       final result = await client.get('/api/health', fromJson: (json) => json);
+      if (!mounted) return;
       result.when(
         (_) => setState(() { _healthResult = 'Connected'; _isValidating = false; }),
         (e) => setState(() { _healthResult = 'Failed: $e'; _isValidating = false; }),
       );
     } catch (e) {
+      if (!mounted) return;
       setState(() { _healthResult = 'Failed: $e'; _isValidating = false; });
     }
   }
@@ -415,7 +418,7 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
           ],
         ),
       ),
-    );
+    ).whenComplete(() => nameController.dispose());
   }
 }
 

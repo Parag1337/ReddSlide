@@ -72,8 +72,10 @@ class VideoPreparationService {
     if (entry != null) {
       entry.priority = newPriority;
     }
-    _queue.removeWhere((q) => q.url == url);
-    _queue.add(_QueuedVideo(url: url, priority: newPriority));
+    if (entry == null || entry.state == VideoControllerState.notCreated || entry.state == VideoControllerState.failed) {
+      _queue.removeWhere((q) => q.url == url);
+      _queue.add(_QueuedVideo(url: url, priority: newPriority));
+    }
   }
 
   void _processNextInQueue() {
@@ -255,7 +257,9 @@ class _QueuedVideo implements Comparable<_QueuedVideo> {
 
   @override
   int compareTo(_QueuedVideo other) {
-    final cmp = priority.compareTo(other.priority);
+    var cmp = url.compareTo(other.url);
+    if (cmp != 0) return cmp;
+    cmp = priority.compareTo(other.priority);
     if (cmp != 0) return cmp;
     return _order.compareTo(other._order);
   }

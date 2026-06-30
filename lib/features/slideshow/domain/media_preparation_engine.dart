@@ -348,7 +348,7 @@ class MediaPreparationEngine {
 
   List<ReadinessState> measureWindow(int currentIndex, int horizon) {
     final items = _playlist.items;
-    if (items.isEmpty || currentIndex >= items.length) return [];
+    if (items.isEmpty || currentIndex < 0 || currentIndex >= items.length) return [];
 
     final end = (currentIndex + horizon + 1).clamp(0, items.length);
     return [for (int i = currentIndex; i < end; i++) _readinessOf(items[i])];

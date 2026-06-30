@@ -70,6 +70,11 @@ class SlideProfiler {
 
   static bool enabled = true;
 
+  static const int _maxTimelines = 500;
+  static const int _maxQueueEntries = 500;
+  static const int _maxVideoEntries = 200;
+  static const int _maxDurationSamples = 500;
+
   // === Source tagging ===
   static String _sourceType = 'unknown';
   static void setSourceType(String type) {
@@ -110,6 +115,9 @@ class SlideProfiler {
 
   static void recordQueueEnter(String url) {
     if (!enabled) return;
+    if (_queueEntryMs.length >= _maxQueueEntries) {
+      _queueEntryMs.remove(_queueEntryMs.keys.first);
+    }
     _queueEntryMs[url] = DateTime.now().millisecondsSinceEpoch;
     _totalEnqueued++;
   }
@@ -119,6 +127,9 @@ class SlideProfiler {
     _totalDequeued++;
     final enter = _queueEntryMs.remove(url);
     if (enter != null) {
+      if (_queueWaitMs.length >= _maxDurationSamples) {
+        _queueWaitMs.removeAt(0);
+      }
       _queueWaitMs.add(DateTime.now().millisecondsSinceEpoch - enter);
     }
   }
@@ -130,6 +141,10 @@ class SlideProfiler {
   static _ImageTimeline _tl(String url) {
     final existing = _timelines[url];
     if (existing != null) return existing;
+    if (_timelines.length >= _maxTimelines) {
+      final eldest = _urlOrder.removeAt(0);
+      _timelines.remove(eldest);
+    }
     final tl = _ImageTimeline(url);
     _timelines[url] = tl;
     _urlOrder.add(url);
@@ -277,6 +292,9 @@ class SlideProfiler {
     if (_videoConcurrentPreps > _videoMaxConcurrent) {
       _videoMaxConcurrent = _videoConcurrentPreps;
     }
+    if (_videoInits.length >= _maxVideoEntries) {
+      _videoInits.remove(_videoInits.keys.first);
+    }
     _videoInits[url] = _VideoTiming(url, DateTime.now().millisecondsSinceEpoch);
   }
 
@@ -287,6 +305,9 @@ class SlideProfiler {
     if (timing != null) {
       timing.endMs = DateTime.now().millisecondsSinceEpoch;
       timing.success = success;
+      if (_videoInitDurationsMs.length >= _maxVideoEntries) {
+        _videoInitDurationsMs.removeAt(0);
+      }
       _videoInitDurationsMs.add(timing.endMs! - timing.startMs);
       if (success) {
         _videoSuccessCount++;
@@ -429,6 +450,9 @@ class SlideProfiler {
         _stateReadyCount++;
         final tl = _timelines[url];
         if (tl != null && tl.preparingMs != null) {
+          if (_preparingDurationsMs.length >= _maxDurationSamples) {
+            _preparingDurationsMs.removeAt(0);
+          }
           _preparingDurationsMs
               .add(DateTime.now().millisecondsSinceEpoch - tl.preparingMs!);
         }
@@ -454,10 +478,29 @@ class SlideProfiler {
   static _SourceStats _stats() =>
       _sourceStats.putIfAbsent(_sourceType, () => _SourceStats(_sourceType));
 
-  static void recordSourceQueueWait(int ms) => _stats().queueWaitMs.add(ms);
-  static void recordSourceDownloadMs(int ms) =>
-      _stats().downloadMs.add(ms);
-  static void recordSourceDecodeMs(int ms) => _stats().decodeMs.add(ms);
+  static void recordSourceQueueWait(int ms) {
+    final s = _stats();
+    if (s.queueWaitMs.length >= _maxDurationSamples) {
+      s.queueWaitMs.removeAt(0);
+    }
+    s.queueWaitMs.add(ms);
+  }
+
+  static void recordSourceDownloadMs(int ms) {
+    final s = _stats();
+    if (s.downloadMs.length >= _maxDurationSamples) {
+      s.downloadMs.removeAt(0);
+    }
+    s.downloadMs.add(ms);
+  }
+
+  static void recordSourceDecodeMs(int ms) {
+    final s = _stats();
+    if (s.decodeMs.length >= _maxDurationSamples) {
+      s.decodeMs.removeAt(0);
+    }
+    s.decodeMs.add(ms);
+  }
   static void recordSourceCacheHit() => _stats().cacheHits++;
   static void recordSourceCacheMiss() => _stats().cacheMisses++;
 

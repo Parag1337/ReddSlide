@@ -1,3 +1,4 @@
+import asyncio
 import logging
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -35,6 +36,7 @@ class BackgroundRefreshService:
             provider_manager=self.provider_manager
         )
         self._is_running = False
+        self._cleanup_lock = asyncio.Lock()
 
     async def start(self):
         """Start background service.
@@ -136,9 +138,14 @@ class BackgroundRefreshService:
         """Clean up old assets using QueueManager's transactional cleanup.
 
         Removes gallery_items, media_queue, and media_assets older than 30 days.
+        Uses asyncio.Lock to prevent concurrent cleanup runs.
         """
-        try:
-            await self.queue_manager.cleanup_old_assets(days=30)
-            logger.info("Cleanup completed successfully")
-        except Exception as e:
-            logger.exception("Cleanup job failed: %s", e)
+        if self._cleanup_lock.locked():
+            logger.warning("Cleanup job skipped — previous run still in progress")
+            return
+        async with self._cleanup_lock:
+            try:
+                await self.queue_manager.cleanup_old_assets(days=30)
+                logger.info("Cleanup completed successfully")
+            except Exception as e:
+                logger.exception("Cleanup job failed: %s", e)

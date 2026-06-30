@@ -95,12 +95,22 @@ DEFAULT_CONCURRENCY = 5
 def _after_to_cursors(after: Optional[str]) -> dict[str, Optional[str]]:
     if not after:
         return {}
-    if isinstance(after, str) and after.startswith("t"):
-        return {"__global__": after}
+    # Try JSON decode first — covers dict and rejects primitives/arrays
     try:
-        return json.loads(after)
-    except (json.JSONDecodeError, TypeError):
+        decoded = json.loads(after)
+        if isinstance(decoded, dict):
+            validated: dict[str, Optional[str]] = {}
+            for k, v in decoded.items():
+                if isinstance(k, str) and (v is None or isinstance(v, str)):
+                    validated[k] = v
+            return validated
         return {}
+    except (json.JSONDecodeError, TypeError):
+        pass
+    # Fall back to legacy Reddit base36 cursor format
+    if after.startswith("t"):
+        return {"__global__": after}
+    return {}
 
 
 def _cursors_to_after(cursors: dict[str, Optional[str]]) -> Optional[str]:
@@ -549,7 +559,7 @@ class SearchCoordinator:
         metrics.parser = parser_stats
         return result
 
-    def _raw_to_response(self, raw: dict) -> MediaAssetResponse:
+    def _raw_to_response(self, raw: dict) -> Optional[MediaAssetResponse]:
         """Convert a single raw Reddit post dict to MediaAssetResponse."""
         parse_result = self._client._parse_post_pipeline(raw)
         if not parse_result.accepted:

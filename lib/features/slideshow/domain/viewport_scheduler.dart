@@ -69,9 +69,9 @@ class ViewportScheduler {
       ring.removeWhere((t) => t.generation == oldGeneration);
     }
     _completedOrFailed.removeWhere((key) {
-      final lastColon = key.lastIndexOf(':');
-      if (lastColon == -1) return false;
-      return int.tryParse(key.substring(lastColon + 1)) == oldGeneration;
+      final sep = key.lastIndexOf('\x00');
+      if (sep == -1) return false;
+      return int.tryParse(key.substring(sep + 1)) == oldGeneration;
     });
     _updateState();
   }
@@ -103,7 +103,7 @@ class ViewportScheduler {
     _rings[Ring.background]!.length,
   ];
 
-  String _taskKey(SchedulerTask task) => '${task.url}:${task.generation}';
+  String _taskKey(SchedulerTask task) => '${task.url}\x00${task.generation}';
 
   bool _isTracked(SchedulerTask task) {
     final key = _taskKey(task);

@@ -190,6 +190,43 @@ class TestCursors:
         decoded = _after_to_cursors(after)
         assert decoded == cursors
 
+    # B8: Cursor validation — reject invalid structures
+    def test_rejects_malformed_json(self):
+        assert _after_to_cursors("{invalid") == {}
+
+    def test_rejects_json_array(self):
+        assert _after_to_cursors('["pics", "t3_abc"]') == {}
+
+    def test_rejects_json_number(self):
+        assert _after_to_cursors("42") == {}
+
+    def test_rejects_json_boolean(self):
+        assert _after_to_cursors("true") == {}
+
+    def test_rejects_json_null(self):
+        assert _after_to_cursors("null") == {}
+
+    def test_rejects_nested_objects(self):
+        """Deeply nested objects are not valid cursor values."""
+        raw = '{"pics": {"inner": "t3_abc"}}'
+        result = _after_to_cursors(raw)
+        assert result == {}, "Nested objects should be rejected"
+
+    def test_rejects_non_string_values(self):
+        """Number, boolean, array values are rejected."""
+        raw = '{"pics": 42, "aww": true, "funny": [1,2,3]}'
+        result = _after_to_cursors(raw)
+        assert result == {}, "Non-string values should be rejected"
+
+    def test_accepts_mixed_valid_and_invalid(self):
+        """Valid string values kept, invalid ones filtered out."""
+        raw = '{"pics": "t3_abc", "aww": 42, "funny": null}'
+        result = _after_to_cursors(raw)
+        assert result == {"pics": "t3_abc", "funny": None}
+
+    def test_rejects_empty_dict(self):
+        assert _after_to_cursors("{}") == {}
+
 
 class TestDeduplication:
     @pytest.mark.asyncio
